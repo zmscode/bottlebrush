@@ -636,6 +636,7 @@ pub const Compiler = struct {
             .new_expr => |n| try self.compileNew(dst, n, node.start),
             .object_literal => |props| try self.compileObjectLiteral(dst, props, node.start),
             .array_literal => |elems| try self.compileArrayLiteral(dst, elems, node.start),
+            .regex => |raw| try self.compileRegexLiteral(dst, raw),
             .sequence => |exprs| {
                 for (exprs, 0..) |e, i| {
                     if (i + 1 < exprs.len) {
@@ -819,6 +820,20 @@ pub const Compiler = struct {
         }
         _ = try self.emit(.{ .op = .construct, .a = dst, .b = base, .c = @intCast(n.args.len) });
         self.freeTo(base);
+    }
+
+    /// A `/pattern/flags` literal → `new_regex` with the pattern and flag
+    /// strings. Flags are the trailing ASCII letters; the char before them is
+    /// the closing delimiter.
+    fn compileRegexLiteral(self: *Compiler, dst: u32, raw: []const u8) CompileError!void {
+        var end = raw.len;
+        while (end > 0 and isRegexFlagChar(raw[end - 1])) end -= 1;
+        // raw[end-1] is the closing '/'; pattern is between the delimiters.
+        const pattern = if (end >= 2) raw[1 .. end - 1] else "";
+        const flags = raw[end..];
+        const src_idx = try self.addConst(.{ .string = pattern });
+        const flags_idx = try self.addConst(.{ .string = flags });
+        _ = try self.emit(.{ .op = .new_regex, .a = dst, .b = src_idx, .c = flags_idx });
     }
 
     fn compileArrayLiteral(self: *Compiler, dst: u32, elems: []?*Node, pos: u32) CompileError!void {
@@ -1006,6 +1021,10 @@ fn appendCodepoint(gpa: std.mem.Allocator, out: *std.ArrayList(u8), cp: u21) !vo
 }
 
 // ---- operator tables -------------------------------------------------------
+
+fn isRegexFlagChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+}
 
 fn binaryOpcode(k: token.Kind) ?Op {
     return switch (k) {

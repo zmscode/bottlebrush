@@ -53,6 +53,7 @@ pub const Vm = struct {
     array_proto: ?*gc.Object = null,
     string_proto: ?*gc.Object = null,
     number_proto: ?*gc.Object = null,
+    regexp_proto: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -77,6 +78,7 @@ pub const Vm = struct {
         if (self.array_proto) |o| tracer.mark(&o.gc);
         if (self.string_proto) |o| tracer.mark(&o.gc);
         if (self.number_proto) |o| tracer.mark(&o.gc);
+        if (self.regexp_proto) |o| tracer.mark(&o.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -140,6 +142,26 @@ pub const Vm = struct {
     /// non-enumerable (as built-in methods are).
     fn defineMethod(self: *Vm, obj: *gc.Object, name: []const u8, func: gc.NativeFn, length: u32) Error!void {
         try self.defineData(obj, name, Value.fromObject(try self.makeNative(name, func, length)), true, false, true);
+    }
+
+    /// Create a RegExp object. Phase 4 stub: the pattern is *not* compiled — the
+    /// object carries `source`/`flags`/`lastIndex` and the derived flag booleans,
+    /// so construction, `instanceof RegExp`, and `toString` work, but `test`/
+    /// `exec` throw until a real matcher lands.
+    fn makeRegExp(self: *Vm, source: []const u8, flags: []const u8) Error!*gc.Object {
+        const obj = try self.newObject(self.regexp_proto);
+        try self.protect(Value.fromObject(obj));
+        defer self.unprotect();
+        const src = if (source.len == 0) "(?:)" else source;
+        try self.defineData(obj, "source", try self.makeString(src), false, false, false);
+        try self.defineData(obj, "flags", try self.makeString(flags), false, false, false);
+        try self.defineData(obj, "lastIndex", Value.fromNumber(0), true, false, false);
+        try self.defineData(obj, "global", Value.fromBool(hasFlag(flags, 'g')), false, false, false);
+        try self.defineData(obj, "ignoreCase", Value.fromBool(hasFlag(flags, 'i')), false, false, false);
+        try self.defineData(obj, "multiline", Value.fromBool(hasFlag(flags, 'm')), false, false, false);
+        try self.defineData(obj, "sticky", Value.fromBool(hasFlag(flags, 'y')), false, false, false);
+        try self.defineData(obj, "dotAll", Value.fromBool(hasFlag(flags, 's')), false, false, false);
+        return obj;
     }
 
     /// Create an Error object directly (for engine-thrown exceptions).
@@ -270,6 +292,17 @@ pub const Vm = struct {
         try self.defineMethod(math, "min", nativeMathMin, 2);
         try self.defineMethod(math, "pow", nativeMathPow, 2);
         try self.defineData(global, "Math", Value.fromObject(math), true, false, true);
+
+        // ---- RegExp (Phase 4 stub: construction only; matching throws) ----
+        const regexp_proto = try self.newObject(self.object_proto);
+        self.regexp_proto = regexp_proto;
+        try self.defineMethod(regexp_proto, "test", nativeRegExpTest, 1);
+        try self.defineMethod(regexp_proto, "exec", nativeRegExpExec, 1);
+        try self.defineMethod(regexp_proto, "toString", nativeRegExpToString, 0);
+        const regexp_ctor = try self.makeNative("RegExp", nativeRegExp, 2);
+        try self.defineData(regexp_ctor, "prototype", Value.fromObject(regexp_proto), false, false, false);
+        try self.defineData(regexp_proto, "constructor", Value.fromObject(regexp_ctor), true, false, true);
+        try self.defineData(global, "RegExp", Value.fromObject(regexp_ctor), true, false, true);
 
         // ---- global functions ----
         try self.defineMethod(global, "isNaN", nativeIsNaN, 1);
@@ -452,6 +485,7 @@ pub const Vm = struct {
 
             .new_object => regs[inst.a] = try self.newObjectValue(),
             .new_array => regs[inst.a] = Value.fromObject(try self.newArray(inst.b)),
+            .new_regex => regs[inst.a] = Value.fromObject(try self.makeRegExp(code.constants[inst.b].string, code.constants[inst.c].string)),
             .get_prop => regs[inst.a] = try self.getProperty(regs[inst.b], code.constants[inst.c].string),
             .set_prop => try self.setProperty(regs[inst.a], code.constants[inst.b].string, regs[inst.c]),
             .get_elem => {
@@ -1897,6 +1931,80 @@ fn nativeNumberIsNaN(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
     return Value.fromBool(v.isNumber() and std.math.isNan(v.asNumber()));
 }
 
+// ---- RegExp built-ins (stub) -----------------------------------------------
+
+fn hasFlag(flags: []const u8, f: u8) bool {
+    return std.mem.indexOfScalar(u8, flags, f) != null;
+}
+
+fn nativeRegExp(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const pat_v = argAt(args, 0);
+    // If the first argument is already a RegExp, copy its source.
+    var src_owned: ?[]u8 = null;
+    defer if (src_owned) |s| vm.gpa.free(s);
+    var source: []const u8 = "";
+    if (pat_v.isObject() and pat_v.asObject().prototype == vm.regexp_proto) {
+        const s = try vm.getProperty(pat_v, "source");
+        if (s.isString()) {
+            src_owned = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
+            source = src_owned.?;
+        }
+    } else if (!pat_v.isUndefined()) {
+        const s = try vm.toStringVal(pat_v);
+        try vm.protect(s);
+        defer vm.unprotect();
+        src_owned = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
+        source = src_owned.?;
+    }
+    const flags_v = argAt(args, 1);
+    var flags_owned: ?[]u8 = null;
+    defer if (flags_owned) |f| vm.gpa.free(f);
+    var flags: []const u8 = "";
+    if (!flags_v.isUndefined()) {
+        const f = try vm.toStringVal(flags_v);
+        try vm.protect(f);
+        defer vm.unprotect();
+        flags_owned = try utf16ToUtf8Alloc(vm.gpa, f.asString().units);
+        flags = flags_owned.?;
+    }
+    return Value.fromObject(try vm.makeRegExp(source, flags));
+}
+
+fn nativeRegExpTest(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    _ = args;
+    return castVm(ctx).throwTypeError("RegExp matching is not yet implemented (Phase 4 stub)");
+}
+fn nativeRegExpExec(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    _ = args;
+    return castVm(ctx).throwTypeError("RegExp matching is not yet implemented (Phase 4 stub)");
+}
+
+fn nativeRegExpToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("RegExp.prototype.toString called on non-object");
+    const src_v = try vm.getProperty(this, "source");
+    const flags_v = try vm.getProperty(this, "flags");
+    const src = try vm.toStringVal(src_v);
+    try vm.protect(src);
+    defer vm.unprotect();
+    const flags = try vm.toStringVal(flags_v);
+    try vm.protect(flags);
+    defer vm.unprotect();
+    // "/" + source + "/" + flags
+    var buf: std.ArrayList(u16) = .empty;
+    defer buf.deinit(vm.gpa);
+    try buf.append(vm.gpa, '/');
+    try buf.appendSlice(vm.gpa, src.asString().units);
+    try buf.append(vm.gpa, '/');
+    try buf.appendSlice(vm.gpa, flags.asString().units);
+    return vm.makeStringFromUtf16(buf.items);
+}
+
 fn clampIndex(n: f64, len: i64) i64 {
     if (std.math.isNan(n) or n < 0) return 0;
     if (n > @as(f64, @floatFromInt(len))) return len;
@@ -2300,6 +2408,25 @@ test "string primitive access and methods" {
     try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a'.concat('b', 'c') === 'abc' ? 1 : 0;"));
     try testing.expectEqual(@as(f64, 1), try evalNumber("return String.fromCharCode(104, 105) === 'hi' ? 1 : 0;"));
     try testing.expectEqual(@as(f64, 1), try evalNumber("return ('hi'.startsWith('h') && 'hi'.endsWith('i')) ? 1 : 0;"));
+}
+
+test "RegExp construction (stub)" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = /abc/gi;
+        \\return (re.source === "abc" && re.flags === "gi" && re.global && re.ignoreCase && !re.multiline) ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return (/x/ instanceof RegExp) ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = new RegExp("foo", "m");
+        \\return (re.source === "foo" && re.multiline && re.flags === "m") ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return /ab/g.toString() === '/ab/g' ? 1 : 0;"));
+}
+
+test "RegExp matching throws (stub, replace later)" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectError(error.JsThrow, eval(&vm, "return /x/.test('x');"));
 }
 
 test "for-of over arrays and strings" {

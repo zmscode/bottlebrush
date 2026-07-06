@@ -26,14 +26,18 @@ runtime-phase negative tests all work.
 - **Number**: `toString(radix)`/`toFixed`/`valueOf`, `Number.isInteger`/`isFinite`/
   `isNaN`, `MAX_SAFE_INTEGER`; **Math** (11 methods + PI/E); `isNaN`/`isFinite`.
 - **`for-of`** over arrays and strings.
+- **RegExp** (stub): literals `/.../flags` and `new RegExp(...)` construct with
+  `source`/`flags`/`lastIndex` + derived flag booleans, `instanceof RegExp`, and
+  `toString`. **Matching (`test`/`exec`) is not implemented yet** — it throws, to
+  be replaced by a real backtracking engine behind the same interface.
 
 The Test262 runner scores positives (run + assert), parse-negatives, and
 runtime-negatives (by thrown constructor name).
 
-Deferred to later work (each a sizable subsystem): the full iteration protocol
-(`Symbol.iterator`, generators), spread, `RegExp`, `JSON`, `Date`, `Map`/`Set`,
-TypedArrays, `Proxy`, `Symbol`, full Unicode case mapping, and per-iteration
-`let` bindings / TDZ.
+Deferred to later work (each a sizable subsystem): a real RegExp matcher, the
+full iteration protocol (`Symbol.iterator`, generators), spread, `JSON`, `Date`,
+`Map`/`Set`, TypedArrays, `Proxy`, `Symbol`, full Unicode case mapping, and
+per-iteration `let` bindings / TDZ.
 
 Earlier phases (all complete):
 
