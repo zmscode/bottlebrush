@@ -56,6 +56,7 @@ pub const Vm = struct {
     regexp_proto: ?*gc.Object = null,
     map_proto: ?*gc.Object = null,
     set_proto: ?*gc.Object = null,
+    date_proto: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -83,6 +84,7 @@ pub const Vm = struct {
         if (self.regexp_proto) |o| tracer.mark(&o.gc);
         if (self.map_proto) |o| tracer.mark(&o.gc);
         if (self.set_proto) |o| tracer.mark(&o.gc);
+        if (self.date_proto) |o| tracer.mark(&o.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -402,6 +404,38 @@ pub const Vm = struct {
         try self.defineData(set_ctor, "prototype", Value.fromObject(set_proto), false, false, false);
         try self.defineData(set_proto, "constructor", Value.fromObject(set_ctor), true, false, true);
         try self.defineData(global, "Set", Value.fromObject(set_ctor), true, false, true);
+
+        // ---- Date ----
+        const date_proto = try self.newObject(self.object_proto);
+        self.date_proto = date_proto;
+        try self.defineMethod(date_proto, "getTime", nativeDateGetTime, 0);
+        try self.defineMethod(date_proto, "valueOf", nativeDateGetTime, 0);
+        try self.defineMethod(date_proto, "setTime", nativeDateSetTime, 1);
+        try self.defineMethod(date_proto, "getFullYear", nativeDateGetFullYear, 0);
+        try self.defineMethod(date_proto, "getUTCFullYear", nativeDateGetFullYear, 0);
+        try self.defineMethod(date_proto, "getMonth", nativeDateGetMonth, 0);
+        try self.defineMethod(date_proto, "getUTCMonth", nativeDateGetMonth, 0);
+        try self.defineMethod(date_proto, "getDate", nativeDateGetDate, 0);
+        try self.defineMethod(date_proto, "getUTCDate", nativeDateGetDate, 0);
+        try self.defineMethod(date_proto, "getDay", nativeDateGetDay, 0);
+        try self.defineMethod(date_proto, "getUTCDay", nativeDateGetDay, 0);
+        try self.defineMethod(date_proto, "getHours", nativeDateGetHours, 0);
+        try self.defineMethod(date_proto, "getUTCHours", nativeDateGetHours, 0);
+        try self.defineMethod(date_proto, "getMinutes", nativeDateGetMinutes, 0);
+        try self.defineMethod(date_proto, "getUTCMinutes", nativeDateGetMinutes, 0);
+        try self.defineMethod(date_proto, "getSeconds", nativeDateGetSeconds, 0);
+        try self.defineMethod(date_proto, "getUTCSeconds", nativeDateGetSeconds, 0);
+        try self.defineMethod(date_proto, "getMilliseconds", nativeDateGetMs, 0);
+        try self.defineMethod(date_proto, "toISOString", nativeDateToISOString, 0);
+        try self.defineMethod(date_proto, "toJSON", nativeDateToISOString, 1);
+        try self.defineMethod(date_proto, "toString", nativeDateToISOString, 0);
+        const date_ctor = try self.makeNative("Date", nativeDate, 7);
+        try self.defineData(date_ctor, "prototype", Value.fromObject(date_proto), false, false, false);
+        try self.defineData(date_proto, "constructor", Value.fromObject(date_ctor), true, false, true);
+        try self.defineMethod(date_ctor, "now", nativeDateNow, 0);
+        try self.defineMethod(date_ctor, "UTC", nativeDateUTC, 7);
+        try self.defineMethod(date_ctor, "parse", nativeDateParse, 1);
+        try self.defineData(global, "Date", Value.fromObject(date_ctor), true, false, true);
 
         // ---- JSON ----
         const json = try self.newObject(self.object_proto);
@@ -2797,6 +2831,279 @@ fn nativeCollectionClear(ctx: *anyopaque, this: Value, args: []const Value) Erro
     return Value.undefined_value;
 }
 
+// ---- Date built-ins --------------------------------------------------------
+//
+// The time value (ms since the Unix epoch) is stored in a non-enumerable
+// internal property under a key that can't be written from source (leading
+// NUL). Local time is treated as UTC (no timezone support yet).
+
+const date_key = "\x00DateValue";
+
+fn dateTimeOf(vm: *Vm, this: Value) Error!f64 {
+    if (!this.isObject()) return vm.throwTypeError("this is not a Date");
+    const v = try vm.getProperty(this, date_key);
+    return if (v.isNumber()) v.asNumber() else std.math.nan(f64);
+}
+fn setDateTime(vm: *Vm, obj: *gc.Object, ms: f64) Error!void {
+    try vm.defineData(obj, date_key, Value.fromNumber(ms), true, false, false);
+}
+
+fn timeClip(t: f64) f64 {
+    if (std.math.isNan(t) or std.math.isInf(t) or @abs(t) > 8.64e15) return std.math.nan(f64);
+    return std.math.trunc(t);
+}
+
+const CivilDate = struct { y: i64, m: i64, d: i64 };
+fn civilFromDays(z_in: i64) CivilDate {
+    const z = z_in + 719468;
+    const era = @divTrunc(if (z >= 0) z else z - 146096, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
+    const y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+    const mp = @divTrunc(5 * doy + 2, 153);
+    const d = doy - @divTrunc(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
+}
+fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
+    const y = if (m <= 2) y_in - 1 else y_in;
+    const era = @divTrunc(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400;
+    const mp = if (m > 2) m - 3 else m + 9;
+    const doy = @divTrunc(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+const DateParts = struct { year: i64, month: i64, day: i64, hours: i64, minutes: i64, seconds: i64, millis: i64, weekday: i64 };
+fn msToParts(ms_f: f64) DateParts {
+    const t: i64 = @intFromFloat(std.math.floor(ms_f));
+    const day = @divFloor(t, 86400000);
+    var rem = @mod(t, 86400000);
+    const hours = @divFloor(rem, 3600000);
+    rem = @mod(rem, 3600000);
+    const minutes = @divFloor(rem, 60000);
+    rem = @mod(rem, 60000);
+    const seconds = @divFloor(rem, 1000);
+    const millis = @mod(rem, 1000);
+    const weekday = @mod(@mod(day + 4, 7) + 7, 7); // day 0 (epoch) is Thursday
+    const c = civilFromDays(day);
+    return .{ .year = c.y, .month = c.m - 1, .day = c.d, .hours = hours, .minutes = minutes, .seconds = seconds, .millis = millis, .weekday = weekday };
+}
+
+/// Assemble a time value from components (month is 0-based; overflow allowed).
+fn makeDateTime(year_in: f64, month: f64, day: f64, h: f64, mi: f64, s: f64, ms: f64) f64 {
+    for ([_]f64{ year_in, month, day, h, mi, s, ms }) |c| {
+        if (std.math.isNan(c) or std.math.isInf(c)) return std.math.nan(f64);
+    }
+    var year: i64 = @intFromFloat(std.math.trunc(year_in));
+    var mon: i64 = @intFromFloat(std.math.trunc(month));
+    year += @divFloor(mon, 12);
+    mon = @mod(mon, 12);
+    const days = daysFromCivil(year, mon + 1, 1) + @as(i64, @intFromFloat(std.math.trunc(day))) - 1;
+    const total = days * 86400000 +
+        @as(i64, @intFromFloat(std.math.trunc(h))) * 3600000 +
+        @as(i64, @intFromFloat(std.math.trunc(mi))) * 60000 +
+        @as(i64, @intFromFloat(std.math.trunc(s))) * 1000 +
+        @as(i64, @intFromFloat(std.math.trunc(ms)));
+    return @floatFromInt(total);
+}
+
+/// Current wall-clock time in ms since the Unix epoch.
+fn nowMs() f64 {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const ts = std.Io.Clock.now(.real, io);
+    const ms: i64 = @intCast(@divTrunc(ts.nanoseconds, 1_000_000));
+    return @floatFromInt(ms);
+}
+
+fn nativeDateNow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    _ = args;
+    return Value.fromNumber(nowMs());
+}
+
+fn componentsToMs(vm: *Vm, args: []const Value) Error!f64 {
+    var y = try vm.toNumber(argAt(args, 0));
+    if (y >= 0 and y <= 99 and y == std.math.trunc(y)) y += 1900;
+    const mo = try vm.toNumber(argAt(args, 1));
+    const d = if (args.len > 2) try vm.toNumber(args[2]) else 1;
+    const h = if (args.len > 3) try vm.toNumber(args[3]) else 0;
+    const mi = if (args.len > 4) try vm.toNumber(args[4]) else 0;
+    const s = if (args.len > 5) try vm.toNumber(args[5]) else 0;
+    const ms = if (args.len > 6) try vm.toNumber(args[6]) else 0;
+    return makeDateTime(y, mo, d, h, mi, s, ms);
+}
+
+fn nativeDate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    // Called without `new`: return a string for the current time.
+    if (!this.isObject() or this.asObject().prototype != vm.date_proto) {
+        var buf: [40]u8 = undefined;
+        return vm.makeString(formatIso(&buf, nowMs()));
+    }
+    const obj = this.asObject();
+    var ms: f64 = undefined;
+    if (args.len == 0) {
+        ms = nowMs();
+    } else if (args.len == 1) {
+        const a = args[0];
+        if (a.isObject() and a.asObject().prototype == vm.date_proto) {
+            ms = try dateTimeOf(vm, a);
+        } else if (a.isString()) {
+            const utf8 = try utf16ToUtf8Alloc(vm.gpa, a.asString().units);
+            defer vm.gpa.free(utf8);
+            ms = parseIsoDate(utf8);
+        } else {
+            ms = timeClip(try vm.toNumber(a));
+        }
+    } else {
+        ms = timeClip(try componentsToMs(vm, args));
+    }
+    try setDateTime(vm, obj, timeClip(ms));
+    return this;
+}
+
+fn nativeDateUTC(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    return Value.fromNumber(timeClip(try componentsToMs(vm, args)));
+}
+fn nativeDateParse(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const s = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(s);
+    defer vm.unprotect();
+    const utf8 = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
+    defer vm.gpa.free(utf8);
+    return Value.fromNumber(parseIsoDate(utf8));
+}
+
+fn nativeDateGetTime(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return Value.fromNumber(try dateTimeOf(castVm(ctx), this));
+}
+fn nativeDateSetTime(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("this is not a Date");
+    const ms = timeClip(try vm.toNumber(argAt(args, 0)));
+    try setDateTime(vm, this.asObject(), ms);
+    return Value.fromNumber(ms);
+}
+
+fn dateField(vm: *Vm, this: Value, comptime field: []const u8) Error!Value {
+    const t = try dateTimeOf(vm, this);
+    if (std.math.isNan(t)) return Value.fromNumber(std.math.nan(f64));
+    const p = msToParts(t);
+    return Value.fromNumber(@floatFromInt(@field(p, field)));
+}
+fn nativeDateGetFullYear(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "year");
+}
+fn nativeDateGetMonth(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "month");
+}
+fn nativeDateGetDate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "day");
+}
+fn nativeDateGetDay(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "weekday");
+}
+fn nativeDateGetHours(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "hours");
+}
+fn nativeDateGetMinutes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "minutes");
+}
+fn nativeDateGetSeconds(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "seconds");
+}
+fn nativeDateGetMs(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return dateField(castVm(ctx), this, "millis");
+}
+
+/// Write `val` right-aligned, zero-padded to `width` digits into `dst`.
+fn writePadded(dst: []u8, val: i64, width: usize) usize {
+    var v: u64 = @intCast(if (val < 0) 0 else val);
+    var j = width;
+    while (j > 0) {
+        j -= 1;
+        dst[j] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+    }
+    return width;
+}
+fn formatIso(buf: []u8, ms: f64) []const u8 {
+    if (std.math.isNan(ms)) return "Invalid Date";
+    const p = msToParts(ms);
+    var i: usize = 0;
+    i += writePadded(buf[i..], p.year, 4);
+    buf[i] = '-';
+    i += 1;
+    i += writePadded(buf[i..], p.month + 1, 2);
+    buf[i] = '-';
+    i += 1;
+    i += writePadded(buf[i..], p.day, 2);
+    buf[i] = 'T';
+    i += 1;
+    i += writePadded(buf[i..], p.hours, 2);
+    buf[i] = ':';
+    i += 1;
+    i += writePadded(buf[i..], p.minutes, 2);
+    buf[i] = ':';
+    i += 1;
+    i += writePadded(buf[i..], p.seconds, 2);
+    buf[i] = '.';
+    i += 1;
+    i += writePadded(buf[i..], p.millis, 3);
+    buf[i] = 'Z';
+    i += 1;
+    return buf[0..i];
+}
+fn nativeDateToISOString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const t = try dateTimeOf(vm, this);
+    if (std.math.isNan(t)) return vm.throwRangeError("Invalid time value");
+    var buf: [40]u8 = undefined;
+    return vm.makeString(formatIso(&buf, t));
+}
+
+/// Minimal ISO 8601 parser: `YYYY-MM-DD` and `YYYY-MM-DDTHH:mm:ss(.sss)?Z?`.
+fn parseIsoDate(s: []const u8) f64 {
+    const nan = std.math.nan(f64);
+    if (s.len < 10) return nan;
+    const year = std.fmt.parseInt(i64, s[0..4], 10) catch return nan;
+    if (s[4] != '-' or s[7] != '-') return nan;
+    const month = std.fmt.parseInt(i64, s[5..7], 10) catch return nan;
+    const day = std.fmt.parseInt(i64, s[8..10], 10) catch return nan;
+    var h: f64 = 0;
+    var mi: f64 = 0;
+    var sec: f64 = 0;
+    var ms: f64 = 0;
+    if (s.len >= 19 and (s[10] == 'T' or s[10] == ' ')) {
+        h = @floatFromInt(std.fmt.parseInt(i64, s[11..13], 10) catch return nan);
+        mi = @floatFromInt(std.fmt.parseInt(i64, s[14..16], 10) catch return nan);
+        sec = @floatFromInt(std.fmt.parseInt(i64, s[17..19], 10) catch return nan);
+        if (s.len >= 23 and s[19] == '.') {
+            ms = @floatFromInt(std.fmt.parseInt(i64, s[20..23], 10) catch return nan);
+        }
+    }
+    return timeClip(makeDateTime(@floatFromInt(year), @floatFromInt(month - 1), @floatFromInt(day), h, mi, sec, ms));
+}
+
 fn clampIndex(n: f64, len: i64) i64 {
     if (std.math.isNan(n) or n < 0) return 0;
     if (n > @as(f64, @floatFromInt(len))) return len;
@@ -3313,6 +3620,22 @@ test "RegExp matching throws (stub, replace later)" {
     var vm = Vm.init(testing.allocator);
     defer vm.deinit();
     try testing.expectError(error.JsThrow, eval(&vm, "return /x/.test('x');"));
+}
+
+test "Date" {
+    // 2021-06-15T12:30:45.123Z = 1623760245123 ms.
+    try testing.expectEqual(@as(f64, 1623760245123), try evalNumber("return new Date(1623760245123).getTime();"));
+    try testing.expectEqual(@as(f64, 2021), try evalNumber("return new Date(1623760245123).getFullYear();"));
+    try testing.expectEqual(@as(f64, 5), try evalNumber("return new Date(1623760245123).getMonth();")); // June = 5
+    try testing.expectEqual(@as(f64, 15), try evalNumber("return new Date(1623760245123).getDate();"));
+    try testing.expectEqual(@as(f64, 12), try evalNumber("return new Date(1623760245123).getHours();"));
+    try testing.expectEqual(@as(f64, 45), try evalNumber("return new Date(1623760245123).getSeconds();"));
+    try testing.expectEqual(@as(f64, 2), try evalNumber("return new Date(1623760245123).getDay();")); // Tuesday
+    try testing.expectEqual(@as(f64, 0), try evalNumber("return new Date(1970, 0, 1, 0, 0, 0, 0).getTime();"));
+    try testing.expectEqual(@as(f64, 1623760245123), try evalNumber("return Date.UTC(2021, 5, 15, 12, 30, 45, 123);"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return new Date(1623760245123).toISOString() === '2021-06-15T12:30:45.123Z' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1623760245123), try evalNumber("return Date.parse('2021-06-15T12:30:45.123Z');"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return (typeof Date.now() === 'number' && Date.now() > 0) ? 1 : 0;"));
 }
 
 test "spread in array literals and calls" {
