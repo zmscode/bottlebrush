@@ -9,12 +9,13 @@ const std = @import("std");
 const bb = @import("bottlebrush");
 
 const demo =
-    \\function Counter(start) { this.n = start; }
-    \\Counter.prototype.inc = function() { this.n = this.n + 1; return this; };
-    \\var c = new Counter(10);
-    \\c.inc().inc().inc();
-    \\var obj = { label: "count", value: c.n };
-    \\return obj.value;
+    \\var nums = [1, 2, 3, 4, 5, 6];
+    \\var squaredEvens = nums
+    \\  .filter(function (n) { return n % 2 === 0; })
+    \\  .map(function (n) { return n * n; });
+    \\var total = 0;
+    \\squaredEvens.forEach(function (n) { total += n; });
+    \\return total;
 ;
 
 pub fn main() !void {

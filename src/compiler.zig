@@ -552,6 +552,7 @@ pub const Compiler = struct {
             .member => |m| try self.compileMemberLoad(dst, m),
             .new_expr => |n| try self.compileNew(dst, n, node.start),
             .object_literal => |props| try self.compileObjectLiteral(dst, props, node.start),
+            .array_literal => |elems| try self.compileArrayLiteral(dst, elems, node.start),
             .sequence => |exprs| {
                 for (exprs, 0..) |e, i| {
                     if (i + 1 < exprs.len) {
@@ -735,6 +736,21 @@ pub const Compiler = struct {
         }
         _ = try self.emit(.{ .op = .construct, .a = dst, .b = base, .c = @intCast(n.args.len) });
         self.freeTo(base);
+    }
+
+    fn compileArrayLiteral(self: *Compiler, dst: u32, elems: []?*Node, pos: u32) CompileError!void {
+        _ = try self.emit(.{ .op = .new_array, .a = dst, .b = @intCast(elems.len) });
+        for (elems, 0..) |maybe, i| {
+            const elem = maybe orelse continue; // elision -> leave the hole
+            if (elem.kind == .spread) return self.fail("array spread unsupported", pos);
+            const idx_reg = self.allocReg();
+            const idx_const = try self.addConst(.{ .number = @floatFromInt(i) });
+            _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = idx_const });
+            const val_reg = self.allocReg();
+            try self.compileExprInto(val_reg, elem);
+            _ = try self.emit(.{ .op = .set_elem, .a = dst, .b = idx_reg, .c = val_reg });
+            self.freeTo(idx_reg);
+        }
     }
 
     fn compileObjectLiteral(self: *Compiler, dst: u32, props: []*Node, pos: u32) CompileError!void {

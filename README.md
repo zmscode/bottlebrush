@@ -20,10 +20,13 @@ work. Implemented so far:
   and statics `getPrototypeOf`/`create`/`defineProperty`/`getOwnPropertyDescriptor`.
 - **String / Number / Boolean** conversion functions, **Math** (abs/floor/ceil/
   round/trunc/sqrt/sign/max/min/pow + PI/E), and `isNaN`/`isFinite`.
+- **Array**: literals `[...]`, dense element storage with exotic `length`,
+  `push`/`pop`/`indexOf`/`includes`/`join`/`slice`/`concat`/`forEach`/`map`/
+  `filter`, `Array.isArray`, and `Object.keys`/`values`/`entries`.
 
-The Test262 runner scores positives (run + assert), parse-negatives, and now
-runtime-negatives (by thrown constructor name). Still ahead: arrays, the
-iteration protocol, `RegExp`, `JSON`, `Date`, `Map`/`Set`, and the full
+The Test262 runner scores positives (run + assert), parse-negatives, and
+runtime-negatives (by thrown constructor name). Still ahead: the iteration
+protocol / `for-of`, `RegExp`, `JSON`, `Date`, `Map`/`Set`, and the full
 String/Number/Array prototype method sets.
 
 Earlier phases (all complete):

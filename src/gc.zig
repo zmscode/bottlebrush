@@ -81,6 +81,11 @@ pub const Object = struct {
     callable: ?*Closure = null,
     /// [[Extensible]].
     extensible: bool = true,
+    /// Array exotic: when true, indexed elements live in `elements` and
+    /// `length` is `elements.items.len` (see the interpreter's array paths).
+    is_array: bool = false,
+    /// Dense element store for arrays (holes are represented as `undefined`).
+    elements: std.ArrayList(Value) = .empty,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -91,11 +96,13 @@ pub const Object = struct {
             if (entry.value_ptr.get) |g| g.mark(t);
             if (entry.value_ptr.set) |s| s.mark(t);
         }
+        for (self.elements.items) |v| v.mark(t);
     }
 
     pub fn deinitCell(self: *Object, gpa: std.mem.Allocator) void {
         for (self.properties.keys()) |k| gpa.free(k);
         self.properties.deinit(gpa);
+        self.elements.deinit(gpa);
     }
 };
 

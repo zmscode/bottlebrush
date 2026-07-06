@@ -78,6 +78,7 @@ pub const Op = enum(u8) {
 
     // Objects & properties
     new_object, // a=dst  (empty {} with Object.prototype)
+    new_array, // a=dst, b=length  (array with `length` holes)
     get_prop, // a=dst, b=obj reg, c=name const index
     set_prop, // a=obj reg, b=name const index, c=value reg
     get_elem, // a=dst, b=obj reg, c=key reg

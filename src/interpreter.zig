@@ -50,6 +50,7 @@ pub const Vm = struct {
     range_error_proto: ?*gc.Object = null,
     reference_error_proto: ?*gc.Object = null,
     syntax_error_proto: ?*gc.Object = null,
+    array_proto: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -71,6 +72,7 @@ pub const Vm = struct {
         if (self.range_error_proto) |o| tracer.mark(&o.gc);
         if (self.reference_error_proto) |o| tracer.mark(&o.gc);
         if (self.syntax_error_proto) |o| tracer.mark(&o.gc);
+        if (self.array_proto) |o| tracer.mark(&o.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -157,7 +159,9 @@ pub const Vm = struct {
         const object_ctor = try self.makeNative("Object", nativeObject, 1);
         try self.defineData(object_ctor, "prototype", Value.fromObject(self.object_proto.?), false, false, false);
         try self.defineData(self.object_proto.?, "constructor", Value.fromObject(object_ctor), true, false, true);
-        // Object.keys/values/entries need arrays (deferred); omitted for now.
+        try self.defineMethod(object_ctor, "keys", nativeObjectKeys, 1);
+        try self.defineMethod(object_ctor, "values", nativeObjectValues, 1);
+        try self.defineMethod(object_ctor, "entries", nativeObjectEntries, 1);
         try self.defineMethod(object_ctor, "getPrototypeOf", nativeObjectGetPrototypeOf, 1);
         try self.defineMethod(object_ctor, "create", nativeObjectCreate, 2);
         try self.defineMethod(object_ctor, "defineProperty", nativeObjectDefineProperty, 3);
@@ -181,6 +185,28 @@ pub const Vm = struct {
         self.syntax_error_proto = try self.installErrorSubtype("SyntaxError");
         _ = try self.installErrorSubtype("EvalError");
         _ = try self.installErrorSubtype("URIError");
+
+        // ---- Array ----
+        const array_proto = try self.heap.create(gc.Object);
+        array_proto.prototype = self.object_proto;
+        array_proto.is_array = true; // Array.prototype is itself an (empty) array
+        self.array_proto = array_proto;
+        try self.defineMethod(array_proto, "push", nativeArrayPush, 1);
+        try self.defineMethod(array_proto, "pop", nativeArrayPop, 0);
+        try self.defineMethod(array_proto, "indexOf", nativeArrayIndexOf, 1);
+        try self.defineMethod(array_proto, "includes", nativeArrayIncludes, 1);
+        try self.defineMethod(array_proto, "join", nativeArrayJoin, 1);
+        try self.defineMethod(array_proto, "slice", nativeArraySlice, 2);
+        try self.defineMethod(array_proto, "concat", nativeArrayConcat, 1);
+        try self.defineMethod(array_proto, "forEach", nativeArrayForEach, 1);
+        try self.defineMethod(array_proto, "map", nativeArrayMap, 1);
+        try self.defineMethod(array_proto, "filter", nativeArrayFilter, 1);
+        try self.defineMethod(array_proto, "toString", nativeArrayToString, 0);
+        const array_ctor = try self.makeNative("Array", nativeArray, 1);
+        try self.defineData(array_ctor, "prototype", Value.fromObject(array_proto), false, false, false);
+        try self.defineData(array_proto, "constructor", Value.fromObject(array_ctor), true, false, true);
+        try self.defineMethod(array_ctor, "isArray", nativeArrayIsArray, 1);
+        try self.defineData(global, "Array", Value.fromObject(array_ctor), true, false, true);
 
         // ---- String / Number / Boolean conversion functions ----
         try self.defineData(global, "String", Value.fromObject(try self.makeNative("String", nativeString, 1)), true, false, true);
@@ -383,6 +409,7 @@ pub const Vm = struct {
             },
 
             .new_object => regs[inst.a] = try self.newObjectValue(),
+            .new_array => regs[inst.a] = Value.fromObject(try self.newArray(inst.b)),
             .get_prop => regs[inst.a] = try self.getProperty(regs[inst.b], code.constants[inst.c].string),
             .set_prop => try self.setProperty(regs[inst.a], code.constants[inst.b].string, regs[inst.c]),
             .get_elem => {
@@ -498,6 +525,37 @@ pub const Vm = struct {
         return Value.fromObject(try self.newObject(self.object_proto));
     }
 
+    fn newArray(self: *Vm, len: u32) Error!*gc.Object {
+        self.maybeStress();
+        const o = try self.heap.create(gc.Object);
+        o.prototype = self.array_proto;
+        o.is_array = true;
+        if (len > 0) {
+            try o.elements.resize(self.gpa, len);
+            @memset(o.elements.items, Value.undefined_value);
+        }
+        return o;
+    }
+
+    fn setArrayElement(self: *Vm, arr: *gc.Object, i: u32, value: Value) Error!void {
+        if (i >= arr.elements.items.len) {
+            const old = arr.elements.items.len;
+            try arr.elements.resize(self.gpa, i + 1);
+            for (arr.elements.items[old..]) |*slot| slot.* = Value.undefined_value;
+        }
+        arr.elements.items[i] = value;
+    }
+
+    fn setArrayLength(self: *Vm, arr: *gc.Object, n: u32) Error!void {
+        const old = arr.elements.items.len;
+        if (n < old) {
+            arr.elements.shrinkRetainingCapacity(n);
+        } else if (n > old) {
+            try arr.elements.resize(self.gpa, n);
+            for (arr.elements.items[old..]) |*slot| slot.* = Value.undefined_value;
+        }
+    }
+
     /// Define an own data property with explicit attributes (key is duplicated).
     fn defineData(self: *Vm, obj: *gc.Object, key: []const u8, value: Value, w: bool, e: bool, c: bool) Error!void {
         const gop = try obj.properties.getOrPut(self.gpa, key);
@@ -511,6 +569,14 @@ pub const Vm = struct {
             // Primitives: only `undefined`/`null` error; others have no props yet.
             if (base.isNullish()) return self.throwTypeError("cannot read property of null or undefined");
             return Value.undefined_value;
+        }
+        // Array exotic own access (length + dense elements).
+        if (base.asObject().is_array) {
+            const arr = base.asObject();
+            if (std.mem.eql(u8, key, "length")) return Value.fromNumber(@floatFromInt(arr.elements.items.len));
+            if (arrayIndex(key)) |i| {
+                if (i < arr.elements.items.len) return arr.elements.items[i];
+            }
         }
         var obj: ?*gc.Object = base.asObject();
         while (obj) |o| {
@@ -532,6 +598,16 @@ pub const Vm = struct {
         if (!base.isObject()) {
             if (base.isNullish()) return self.throwTypeError("cannot set property of null or undefined");
             return; // silent no-op on primitives (sloppy)
+        }
+        // Array exotic own writes (length + dense elements).
+        if (base.asObject().is_array) {
+            const arr = base.asObject();
+            if (std.mem.eql(u8, key, "length")) {
+                const n = try self.toNumber(value);
+                const len: u32 = if (std.math.isNan(n) or n < 0) 0 else if (n > 4294967295) 4294967295 else @intFromFloat(n);
+                return self.setArrayLength(arr, len);
+            }
+            if (arrayIndex(key)) |i| return self.setArrayElement(arr, i, value);
         }
         const receiver = base.asObject();
         // Search prototype chain for an accessor or a non-writable data prop.
@@ -643,6 +719,13 @@ pub const Vm = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidUtf8 => try self.gpa.alloc(u16, 0), // cooked strings are valid UTF-8
         };
+        return Value.fromString(s);
+    }
+
+    fn makeStringFromUtf16(self: *Vm, units: []const u16) Error!Value {
+        self.maybeStress();
+        const s = try self.heap.create(gc.String);
+        s.units = try self.gpa.dupe(u16, units);
         return Value.fromString(s);
     }
 
@@ -1162,11 +1245,307 @@ fn nativeIsFinite(ctx: *anyopaque, this: Value, args: []const Value) Error!Value
     return Value.fromBool(!std.math.isNan(n) and !std.math.isInf(n));
 }
 
+// ---- Array built-ins -------------------------------------------------------
+
+fn isCallable(v: Value) bool {
+    return v.isObject() and v.asObject().callable != null;
+}
+
+fn thisArray(vm: *Vm, this: Value) Error!*gc.Object {
+    if (!this.isObject() or !this.asObject().is_array) {
+        return vm.throwTypeError("Array.prototype method called on a non-array");
+    }
+    return this.asObject();
+}
+
+fn nativeArray(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    if (args.len == 1 and args[0].isNumber()) {
+        const n = args[0].asNumber();
+        const len: u32 = if (n < 0 or n != std.math.floor(n) or n > 4294967295) return vm.throwRangeError("invalid array length") else @intFromFloat(n);
+        return Value.fromObject(try vm.newArray(len));
+    }
+    const arr = try vm.newArray(0);
+    try vm.protect(Value.fromObject(arr));
+    defer vm.unprotect();
+    for (args, 0..) |a, i| try vm.setArrayElement(arr, @intCast(i), a);
+    return Value.fromObject(arr);
+}
+
+fn nativeArrayIsArray(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    const v = argAt(args, 0);
+    return Value.fromBool(v.isObject() and v.asObject().is_array);
+}
+
+fn nativeArrayPush(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    for (args) |a| try arr.elements.append(vm.gpa, a);
+    return Value.fromNumber(@floatFromInt(arr.elements.items.len));
+}
+
+fn nativeArrayPop(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    return arr.elements.pop() orelse Value.undefined_value;
+}
+
+fn nativeArrayIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const target = argAt(args, 0);
+    for (arr.elements.items, 0..) |el, i| {
+        if (sameTypeStrictEq(el, target)) return Value.fromNumber(@floatFromInt(i));
+    }
+    return Value.fromNumber(-1);
+}
+
+fn nativeArrayIncludes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const target = argAt(args, 0);
+    for (arr.elements.items) |el| {
+        // SameValueZero: like strict equality but NaN matches NaN.
+        if (sameTypeStrictEq(el, target)) return Value.fromBool(true);
+        if (el.isNumber() and target.isNumber() and std.math.isNan(el.asNumber()) and std.math.isNan(target.asNumber())) {
+            return Value.fromBool(true);
+        }
+    }
+    return Value.fromBool(false);
+}
+
+fn nativeArrayJoin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const sep_v = argAt(args, 0);
+    const sep = if (sep_v.isUndefined()) try vm.makeString(",") else try vm.toStringVal(sep_v);
+    try vm.protect(sep);
+    defer vm.unprotect();
+
+    var buf: std.ArrayList(u16) = .empty;
+    defer buf.deinit(vm.gpa);
+    for (arr.elements.items, 0..) |el, i| {
+        if (i > 0) try buf.appendSlice(vm.gpa, sep.asString().units);
+        if (el.isNullish()) continue; // null/undefined join as empty
+        const s = try vm.toStringVal(el);
+        try buf.appendSlice(vm.gpa, s.asString().units);
+    }
+    return vm.makeStringFromUtf16(buf.items);
+}
+
+fn nativeArrayToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return nativeArrayJoin(ctx, this, args);
+}
+
+fn nativeArraySlice(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const len: i64 = @intCast(arr.elements.items.len);
+    const start = relativeIndex(try optNumber(vm, argAt(args, 0), 0), len);
+    const end = relativeIndex(try optNumber(vm, argAt(args, 1), @floatFromInt(len)), len);
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    var i = start;
+    while (i < end) : (i += 1) {
+        try result.elements.append(vm.gpa, arr.elements.items[@intCast(i)]);
+    }
+    return Value.fromObject(result);
+}
+
+fn nativeArrayConcat(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    for (arr.elements.items) |el| try result.elements.append(vm.gpa, el);
+    for (args) |a| {
+        if (a.isObject() and a.asObject().is_array) {
+            for (a.asObject().elements.items) |el| try result.elements.append(vm.gpa, el);
+        } else {
+            try result.elements.append(vm.gpa, a);
+        }
+    }
+    return Value.fromObject(result);
+}
+
+fn nativeArrayForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const cb = argAt(args, 0);
+    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
+    var i: u32 = 0;
+    const n: u32 = @intCast(arr.elements.items.len);
+    while (i < n) : (i += 1) {
+        if (i >= arr.elements.items.len) break;
+        const el = arr.elements.items[i];
+        _ = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
+    }
+    return Value.undefined_value;
+}
+
+fn nativeArrayMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const cb = argAt(args, 0);
+    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
+    const n: u32 = @intCast(arr.elements.items.len);
+    const result = try vm.newArray(n);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const el = if (i < arr.elements.items.len) arr.elements.items[i] else Value.undefined_value;
+        const r = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
+        try vm.setArrayElement(result, i, r);
+    }
+    return Value.fromObject(result);
+}
+
+fn nativeArrayFilter(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const arr = try thisArray(vm, this);
+    const cb = argAt(args, 0);
+    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    var i: u32 = 0;
+    const n: u32 = @intCast(arr.elements.items.len);
+    while (i < n) : (i += 1) {
+        if (i >= arr.elements.items.len) break;
+        const el = arr.elements.items[i];
+        const keep = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
+        if (toBoolean(keep)) try result.elements.append(vm.gpa, el);
+    }
+    return Value.fromObject(result);
+}
+
+fn optNumber(vm: *Vm, v: Value, default: f64) Error!f64 {
+    if (v.isUndefined()) return default;
+    return vm.toNumber(v);
+}
+
+/// Clamp a relative index (negative counts from the end) to [0, len].
+fn relativeIndex(n: f64, len: i64) i64 {
+    if (std.math.isNan(n)) return 0;
+    var idx: i64 = if (n < -9.2e18) -len else if (n > 9.2e18) len else @intFromFloat(std.math.trunc(n));
+    if (idx < 0) idx += len;
+    if (idx < 0) idx = 0;
+    if (idx > len) idx = len;
+    return idx;
+}
+
+// ---- Object.keys / values / entries ----------------------------------------
+
+/// Collect an object's own enumerable string keys in spec order (integer
+/// indices ascending, then insertion-order string keys).
+fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
+    if (obj.is_array) {
+        var i: usize = 0;
+        while (i < obj.elements.items.len) : (i += 1) {
+            var buf: [16]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+            try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
+        }
+    }
+    var it = obj.properties.iterator();
+    while (it.next()) |entry| {
+        if (!entry.value_ptr.enumerable) continue;
+        try out.append(vm.gpa, try vm.gpa.dupe(u8, entry.key_ptr.*));
+    }
+}
+
+fn nativeObjectKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const v = argAt(args, 0);
+    if (!v.isObject()) return vm.throwTypeError("Object.keys called on non-object");
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| vm.gpa.free(k);
+        keys.deinit(vm.gpa);
+    }
+    try ownEnumerableKeys(vm, v.asObject(), &keys);
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    for (keys.items) |k| {
+        const s = try vm.makeString(k);
+        try result.elements.append(vm.gpa, s);
+    }
+    return Value.fromObject(result);
+}
+
+fn nativeObjectValues(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const v = argAt(args, 0);
+    if (!v.isObject()) return vm.throwTypeError("Object.values called on non-object");
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| vm.gpa.free(k);
+        keys.deinit(vm.gpa);
+    }
+    try ownEnumerableKeys(vm, v.asObject(), &keys);
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    for (keys.items) |k| {
+        const val = try vm.getProperty(v, k);
+        try result.elements.append(vm.gpa, val);
+    }
+    return Value.fromObject(result);
+}
+
+fn nativeObjectEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const v = argAt(args, 0);
+    if (!v.isObject()) return vm.throwTypeError("Object.entries called on non-object");
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| vm.gpa.free(k);
+        keys.deinit(vm.gpa);
+    }
+    try ownEnumerableKeys(vm, v.asObject(), &keys);
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    for (keys.items) |k| {
+        const pair = try vm.newArray(2);
+        try vm.protect(Value.fromObject(pair));
+        defer vm.unprotect();
+        pair.elements.items[0] = try vm.makeString(k);
+        pair.elements.items[1] = try vm.getProperty(v, k);
+        try result.elements.append(vm.gpa, Value.fromObject(pair));
+    }
+    return Value.fromObject(result);
+}
+
 fn utf16ToUtf8Alloc(gpa: std.mem.Allocator, units: []const u16) Error![]u8 {
     return std.unicode.utf16LeToUtf8Alloc(gpa, units) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => try gpa.dupe(u8, ""),
     };
+}
+
+/// Parse a canonical array-index string (no leading zeros, < 2^32-1), else null.
+fn arrayIndex(key: []const u8) ?u32 {
+    if (key.len == 0 or key.len > 10) return null;
+    if (key.len > 1 and key[0] == '0') return null;
+    var n: u64 = 0;
+    for (key) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + (c - '0');
+    }
+    if (n >= 4294967295) return null;
+    return @intCast(n);
 }
 
 fn compareUtf16(a: []const u16, b: []const u16) i32 {
@@ -1458,6 +1837,65 @@ test "Object builtins" {
         \\Object.defineProperty(o, 'x', { value: 42, enumerable: false });
         \\return o.x;
     ));
+}
+
+test "array literals and indexing" {
+    try testing.expectEqual(@as(f64, 40), try evalNumber("var a = [10, 20, 30]; return a[0] + a[2];"));
+    try testing.expectEqual(@as(f64, 3), try evalNumber("return [1, 2, 3].length;"));
+    try testing.expectEqual(@as(f64, 4), try evalNumber("var a = []; a[3] = 9; return a.length;"));
+    try testing.expectEqual(@as(f64, 2), try evalNumber("var a = [1, 2, 3, 4]; a.length = 2; return a.length;"));
+    try testing.expectEqual(@as(f64, 3), try evalNumber("return new Array(3).length;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return Array.isArray([]) && !Array.isArray({}) ? 1 : 0;"));
+}
+
+test "array mutation methods" {
+    try testing.expectEqual(@as(f64, 5), try evalNumber("var a = [1]; a.push(2); a.push(3); return a.pop() + a.length;"));
+    try testing.expectEqual(@as(f64, 4), try evalNumber("return [1, 2].concat([3, 4]).length;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("var a = [1, 2, 3]; return (a.indexOf(2) === 1 && a.includes(3)) ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return [1, 2, 3].join('-') === '1-2-3' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("var a = [1, 2, 3, 4].slice(1, 3); return (a.length === 2 && a[0] === 2) ? 1 : 0;"));
+}
+
+test "array higher-order methods" {
+    try testing.expectEqual(@as(f64, 12), try evalNumber(
+        \\var a = [1, 2, 3].map(function (x) { return x * 2; });
+        \\return a[0] + a[1] + a[2];
+    ));
+    try testing.expectEqual(@as(f64, 2), try evalNumber(
+        \\var a = [1, 2, 3, 4].filter(function (x) { return x % 2 === 0; });
+        \\return a.length;
+    ));
+    try testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\var sum = 0;
+        \\[1, 2, 3].forEach(function (x) { sum += x; });
+        \\return sum;
+    ));
+}
+
+test "Object.keys/values/entries" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { a: 1, b: 2 };
+        \\var k = Object.keys(o);
+        \\return (k.length === 2 && k[0] === 'a' && k[1] === 'b') ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\var o = { a: 1, b: 2 };
+        \\var v = Object.values(o);
+        \\return v[0] + v[1];
+    ));
+}
+
+test "arrays under GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var a = [];
+        \\for (var i = 0; i < 20; i++) { a.push(i); }
+        \\var b = a.map(function (x) { return x + 1; });
+        \\return b[19] + a.length;
+    );
+    try testing.expectEqual(@as(f64, 40), v.asNumber()); // 20 + 20
 }
 
 test "objects under GC stress" {
