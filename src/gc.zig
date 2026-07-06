@@ -133,6 +133,11 @@ pub const Object = struct {
     proxy_handler: ?*Object = null,
     /// Generator activation state (heap-owned); null for non-generators.
     generator: ?*GeneratorState = null,
+    /// Bound-function exotic: when set, [[Call]]/[[Construct]] forward to
+    /// `bound_target` with `bound_this` prepended to the bound args (which live
+    /// in `elements`).
+    bound_target: ?Value = null,
+    bound_this: Value = Value.undefined_value,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -152,6 +157,8 @@ pub const Object = struct {
             g.this_value.mark(t);
             for (g.regs) |v| v.mark(t);
         }
+        if (self.bound_target) |bt| bt.mark(t);
+        self.bound_this.mark(t);
     }
 
     pub fn deinitCell(self: *Object, gpa: std.mem.Allocator) void {
@@ -188,6 +195,10 @@ pub const Closure = struct {
     /// Non-null for built-ins; when set, the interpreter dispatches here
     /// instead of running bytecode.
     native: ?NativeFn = null,
+    /// Whether this function implements [[Construct]] (is `new`-able). User
+    /// function declarations/expressions are constructors; generators, arrows,
+    /// and most built-in functions are not.
+    constructor: bool = false,
 
     pub fn trace(self: *Closure, t: *Tracer) void {
         if (self.env) |e| t.mark(&e.gc);

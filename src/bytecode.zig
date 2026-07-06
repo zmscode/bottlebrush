@@ -84,11 +84,14 @@ pub const Op = enum(u8) {
     set_prop, // a=obj reg, b=name const index, c=value reg
     get_elem, // a=dst, b=obj reg, c=key reg
     set_elem, // a=obj reg, b=key reg, c=value reg
+    delete_prop, // a=dst (bool), b=obj reg, c=name const
+    delete_elem, // a=dst (bool), b=obj reg, c=key reg
     load_this, // a=dst
     arr_push, // a=array reg, b=value reg  (append one)
     arr_spread, // a=array reg, b=iterable reg  (append all elements)
     iter_init, // a=dst iterator, b=iterable reg  (GetIterator)
     iter_next, // a=dst result{value,done}, b=iterator reg  (IteratorNext)
+    enum_keys, // a=dst array, b=object reg  (enumerable keys, for for-in)
     gen_yield, // a=dst (resumed value), b=yielded value reg
 
     // Functions
@@ -140,6 +143,9 @@ pub const CodeBlock = struct {
     is_generator: bool = false,
     /// Slots in this block's own environment record.
     num_env_slots: u32 = 0,
+    /// Env slot to receive the `arguments` object on entry; null for arrow
+    /// functions and the top-level script (which have no own `arguments`).
+    arguments_slot: ?u32 = null,
     code: []Inst = &.{},
     constants: []Const = &.{},
     children: []*CodeBlock = &.{},

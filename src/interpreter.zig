@@ -170,6 +170,13 @@ pub const Vm = struct {
         return obj;
     }
 
+    /// Mark a native function object as a constructor (implements [[Construct]])
+    /// and return it, so ctor definitions can wrap `makeNative` inline.
+    fn asCtor(obj: *gc.Object) *gc.Object {
+        obj.callable.?.constructor = true;
+        return obj;
+    }
+
     /// Define a method (native function) on `obj`, writable + configurable,
     /// non-enumerable (as built-in methods are).
     fn defineMethod(self: *Vm, obj: *gc.Object, name: []const u8, func: gc.NativeFn, length: u32) Error!void {
@@ -253,13 +260,24 @@ pub const Vm = struct {
         try self.defineMethod(gen_proto, "return", nativeGeneratorReturn, 1);
         try self.defineMethod(gen_proto, "throw", nativeGeneratorThrow, 1);
 
+        // ---- Function.prototype methods + Function constructor ----
+        const fn_proto = self.function_proto.?;
+        try self.defineMethod(fn_proto, "call", nativeFunctionCall, 1);
+        try self.defineMethod(fn_proto, "apply", nativeFunctionApply, 2);
+        try self.defineMethod(fn_proto, "bind", nativeFunctionBind, 1);
+        const function_ctor = asCtor(try self.makeNative("Function", nativeFunctionCtor, 1));
+        try self.defineData(function_ctor, "prototype", Value.fromObject(fn_proto), false, false, false);
+        try self.defineData(fn_proto, "constructor", Value.fromObject(function_ctor), true, false, true);
+        try self.defineData(global, "Function", Value.fromObject(function_ctor), true, false, true);
+
         // ---- Object.prototype methods + Object constructor ----
         try self.defineMethod(self.object_proto.?, "hasOwnProperty", nativeHasOwnProperty, 1);
         try self.defineMethod(self.object_proto.?, "toString", nativeObjectToString, 0);
         try self.defineMethod(self.object_proto.?, "valueOf", nativeObjectValueOf, 0);
         try self.defineMethod(self.object_proto.?, "isPrototypeOf", nativeIsPrototypeOf, 1);
+        try self.defineMethod(self.object_proto.?, "propertyIsEnumerable", nativePropertyIsEnumerable, 1);
 
-        const object_ctor = try self.makeNative("Object", nativeObject, 1);
+        const object_ctor = asCtor(try self.makeNative("Object", nativeObject, 1));
         try self.defineData(object_ctor, "prototype", Value.fromObject(self.object_proto.?), false, false, false);
         try self.defineData(self.object_proto.?, "constructor", Value.fromObject(object_ctor), true, false, true);
         try self.defineMethod(object_ctor, "keys", nativeObjectKeys, 1);
@@ -269,6 +287,7 @@ pub const Vm = struct {
         try self.defineMethod(object_ctor, "create", nativeObjectCreate, 2);
         try self.defineMethod(object_ctor, "defineProperty", nativeObjectDefineProperty, 3);
         try self.defineMethod(object_ctor, "getOwnPropertyDescriptor", nativeObjectGetOwnPropertyDescriptor, 2);
+        try self.defineMethod(object_ctor, "getOwnPropertyNames", nativeObjectGetOwnPropertyNames, 1);
         try self.defineData(global, "Object", Value.fromObject(object_ctor), true, false, true);
 
         // ---- Error hierarchy ----
@@ -277,7 +296,7 @@ pub const Vm = struct {
         try self.defineData(error_proto, "name", try self.makeString("Error"), true, false, true);
         try self.defineData(error_proto, "message", try self.makeString(""), true, false, true);
         try self.defineMethod(error_proto, "toString", nativeErrorToString, 0);
-        const error_ctor = try self.makeNative("Error", nativeError, 1);
+        const error_ctor = asCtor(try self.makeNative("Error", nativeError, 1));
         try self.defineData(error_ctor, "prototype", Value.fromObject(error_proto), false, false, false);
         try self.defineData(error_proto, "constructor", Value.fromObject(error_ctor), true, false, true);
         try self.defineData(global, "Error", Value.fromObject(error_ctor), true, false, true);
@@ -309,7 +328,7 @@ pub const Vm = struct {
         try self.defineMethod(array_proto, "entries", nativeIterableEntries, 0);
         try self.defineData(array_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
         try self.defineMethod(array_proto, "toString", nativeArrayToString, 0);
-        const array_ctor = try self.makeNative("Array", nativeArray, 1);
+        const array_ctor = asCtor(try self.makeNative("Array", nativeArray, 1));
         try self.defineData(array_ctor, "prototype", Value.fromObject(array_proto), false, false, false);
         try self.defineData(array_proto, "constructor", Value.fromObject(array_ctor), true, false, true);
         try self.defineMethod(array_ctor, "isArray", nativeArrayIsArray, 1);
@@ -335,7 +354,7 @@ pub const Vm = struct {
         try self.defineData(string_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("[Symbol.iterator]", nativeIterableValues, 0)), true, false, true);
         try self.defineMethod(string_proto, "toString", nativeStringToString, 0);
         try self.defineMethod(string_proto, "valueOf", nativeStringToString, 0);
-        const string_ctor = try self.makeNative("String", nativeString, 1);
+        const string_ctor = asCtor(try self.makeNative("String", nativeString, 1));
         try self.defineData(string_ctor, "prototype", Value.fromObject(string_proto), false, false, false);
         try self.defineData(string_proto, "constructor", Value.fromObject(string_ctor), true, false, true);
         try self.defineMethod(string_ctor, "fromCharCode", nativeStringFromCharCode, 1);
@@ -347,7 +366,7 @@ pub const Vm = struct {
         try self.defineMethod(number_proto, "toFixed", nativeNumberToFixed, 1);
         try self.defineMethod(number_proto, "toString", nativeNumberToString, 1);
         try self.defineMethod(number_proto, "valueOf", nativeNumberValueOf, 0);
-        const number_ctor = try self.makeNative("Number", nativeNumber, 1);
+        const number_ctor = asCtor(try self.makeNative("Number", nativeNumber, 1));
         try self.defineData(number_ctor, "prototype", Value.fromObject(number_proto), false, false, false);
         try self.defineData(number_proto, "constructor", Value.fromObject(number_ctor), true, false, true);
         try self.defineData(number_ctor, "MAX_SAFE_INTEGER", Value.fromNumber(9007199254740991), false, false, false);
@@ -363,7 +382,7 @@ pub const Vm = struct {
         try self.defineMethod(number_ctor, "isNaN", nativeNumberIsNaN, 1);
         try self.defineData(global, "Number", Value.fromObject(number_ctor), true, false, true);
 
-        try self.defineData(global, "Boolean", Value.fromObject(try self.makeNative("Boolean", nativeBoolean, 1)), true, false, true);
+        try self.defineData(global, "Boolean", Value.fromObject(asCtor(try self.makeNative("Boolean", nativeBoolean, 1))), true, false, true);
 
         // ---- Math ----
         const math = try self.newObject(self.object_proto);
@@ -418,7 +437,7 @@ pub const Vm = struct {
         try self.defineMethod(regexp_proto, "test", nativeRegExpTest, 1);
         try self.defineMethod(regexp_proto, "exec", nativeRegExpExec, 1);
         try self.defineMethod(regexp_proto, "toString", nativeRegExpToString, 0);
-        const regexp_ctor = try self.makeNative("RegExp", nativeRegExp, 2);
+        const regexp_ctor = asCtor(try self.makeNative("RegExp", nativeRegExp, 2));
         try self.defineData(regexp_ctor, "prototype", Value.fromObject(regexp_proto), false, false, false);
         try self.defineData(regexp_proto, "constructor", Value.fromObject(regexp_ctor), true, false, true);
         try self.defineData(global, "RegExp", Value.fromObject(regexp_ctor), true, false, true);
@@ -437,7 +456,7 @@ pub const Vm = struct {
         try self.defineMethod(map_proto, "values", nativeIterableValues, 0);
         try self.defineData(map_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("entries", nativeIterableEntries, 0)), true, false, true);
         try self.defineGetter(map_proto, "size", nativeMapSize);
-        const map_ctor = try self.makeNative("Map", nativeMap, 0);
+        const map_ctor = asCtor(try self.makeNative("Map", nativeMap, 0));
         try self.defineData(map_ctor, "prototype", Value.fromObject(map_proto), false, false, false);
         try self.defineData(map_proto, "constructor", Value.fromObject(map_ctor), true, false, true);
         try self.defineData(global, "Map", Value.fromObject(map_ctor), true, false, true);
@@ -455,7 +474,7 @@ pub const Vm = struct {
         try self.defineMethod(set_proto, "entries", nativeIterableEntries, 0);
         try self.defineData(set_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
         try self.defineGetter(set_proto, "size", nativeSetSize);
-        const set_ctor = try self.makeNative("Set", nativeSet, 0);
+        const set_ctor = asCtor(try self.makeNative("Set", nativeSet, 0));
         try self.defineData(set_ctor, "prototype", Value.fromObject(set_proto), false, false, false);
         try self.defineData(set_proto, "constructor", Value.fromObject(set_ctor), true, false, true);
         try self.defineData(global, "Set", Value.fromObject(set_ctor), true, false, true);
@@ -484,7 +503,7 @@ pub const Vm = struct {
         try self.defineMethod(date_proto, "toISOString", nativeDateToISOString, 0);
         try self.defineMethod(date_proto, "toJSON", nativeDateToISOString, 1);
         try self.defineMethod(date_proto, "toString", nativeDateToISOString, 0);
-        const date_ctor = try self.makeNative("Date", nativeDate, 7);
+        const date_ctor = asCtor(try self.makeNative("Date", nativeDate, 7));
         try self.defineData(date_ctor, "prototype", Value.fromObject(date_proto), false, false, false);
         try self.defineData(date_proto, "constructor", Value.fromObject(date_ctor), true, false, true);
         try self.defineMethod(date_ctor, "now", nativeDateNow, 0);
@@ -495,7 +514,7 @@ pub const Vm = struct {
         // ---- ArrayBuffer + TypedArrays ----
         const ab_proto = try self.newObject(self.object_proto);
         self.arraybuffer_proto = ab_proto;
-        const ab_ctor = try self.makeNative("ArrayBuffer", nativeArrayBuffer, 1);
+        const ab_ctor = asCtor(try self.makeNative("ArrayBuffer", nativeArrayBuffer, 1));
         try self.defineData(ab_ctor, "prototype", Value.fromObject(ab_proto), false, false, false);
         try self.defineData(ab_proto, "constructor", Value.fromObject(ab_ctor), true, false, true);
         try self.defineData(global, "ArrayBuffer", Value.fromObject(ab_ctor), true, false, true);
@@ -525,7 +544,7 @@ pub const Vm = struct {
         };
         inline for (ta_types) |t| {
             const proto = try self.newObject(self.typed_array_proto);
-            const ctor = try self.makeNative(t[0], typedArrayConstructor(t[1]), 3);
+            const ctor = asCtor(try self.makeNative(t[0], typedArrayConstructor(t[1]), 3));
             try self.defineData(ctor, "prototype", Value.fromObject(proto), false, false, false);
             try self.defineData(proto, "constructor", Value.fromObject(ctor), true, false, true);
             const bpe: f64 = @floatFromInt(gc.bytesPerElement(t[1]));
@@ -553,7 +572,7 @@ pub const Vm = struct {
         try self.defineMethod(dv_proto, "setUint32", dataViewSet(u32, false, false), 2);
         try self.defineMethod(dv_proto, "setFloat32", dataViewSet(f32, true, false), 2);
         try self.defineMethod(dv_proto, "setFloat64", dataViewSet(f64, true, false), 2);
-        const dv_ctor = try self.makeNative("DataView", nativeDataView, 1);
+        const dv_ctor = asCtor(try self.makeNative("DataView", nativeDataView, 1));
         try self.defineData(dv_ctor, "prototype", Value.fromObject(dv_proto), false, false, false);
         try self.defineData(dv_proto, "constructor", Value.fromObject(dv_ctor), true, false, true);
         try self.defineData(global, "DataView", Value.fromObject(dv_ctor), true, false, true);
@@ -570,9 +589,9 @@ pub const Vm = struct {
         try self.defineMethod(symbol_ctor, "for", nativeSymbolFor, 1);
         try self.defineMethod(symbol_ctor, "keyFor", nativeSymbolKeyFor, 1);
         const well_known = [_][]const u8{
-            "iterator",  "asyncIterator", "hasInstance", "isConcatSpreadable",
-            "match",     "replace",       "search",      "split",
-            "species",   "toPrimitive",   "toStringTag", "unscopables",
+            "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable",
+            "match",    "replace",       "search",      "split",
+            "species",  "toPrimitive",   "toStringTag", "unscopables",
         };
         inline for (well_known) |name| {
             const sym = if (comptime std.mem.eql(u8, name, "iterator"))
@@ -584,7 +603,7 @@ pub const Vm = struct {
         try self.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 
         // ---- Proxy + Reflect ----
-        const proxy_ctor = try self.makeNative("Proxy", nativeProxy, 2);
+        const proxy_ctor = asCtor(try self.makeNative("Proxy", nativeProxy, 2));
         try self.defineData(global, "Proxy", Value.fromObject(proxy_ctor), true, false, true);
 
         const reflect = try self.newObject(self.object_proto);
@@ -613,7 +632,7 @@ pub const Vm = struct {
         const proto = try self.newObject(self.error_proto);
         try self.defineData(proto, "name", try self.makeString(name), true, false, true);
         try self.defineData(proto, "message", try self.makeString(""), true, false, true);
-        const ctor = try self.makeNative(name, nativeError, 1);
+        const ctor = asCtor(try self.makeNative(name, nativeError, 1));
         try self.defineData(ctor, "prototype", Value.fromObject(proto), false, false, false);
         try self.defineData(proto, "constructor", Value.fromObject(ctor), true, false, true);
         try self.defineData(self.global_object.?, name, Value.fromObject(ctor), true, false, true);
@@ -643,6 +662,14 @@ pub const Vm = struct {
         const name_v = self.getProperty(ctor, "name") catch return null;
         if (!name_v.isString()) return null;
         return utf16ToUtf8Alloc(gpa, name_v.asString().units) catch return null;
+    }
+
+    pub fn pendingErrorMessage(self: *Vm, gpa: std.mem.Allocator) ?[]u8 {
+        const exc = self.pending_exception orelse return null;
+        if (!exc.isObject()) return null;
+        const msg_v = self.getProperty(exc, "message") catch return null;
+        if (!msg_v.isString()) return null;
+        return utf16ToUtf8Alloc(gpa, msg_v.asString().units) catch return null;
     }
 
     fn createEnv(self: *Vm, parent: ?*gc.Environment, n: u32) Error!*gc.Environment {
@@ -809,11 +836,18 @@ pub const Vm = struct {
                 defer self.gpa.free(key);
                 try self.setProperty(regs[inst.a], key, regs[inst.c]);
             },
+            .delete_prop => regs[inst.a] = Value.fromBool(self.deleteProperty(regs[inst.b], code.constants[inst.c].string)),
+            .delete_elem => {
+                const key = try self.toPropertyKey(regs[inst.c]);
+                defer self.gpa.free(key);
+                regs[inst.a] = Value.fromBool(self.deleteProperty(regs[inst.b], key));
+            },
             .load_this => regs[inst.a] = this_value,
             .arr_push => try regs[inst.a].asObject().elements.append(self.gpa, regs[inst.b]),
             .arr_spread => try self.spreadInto(regs[inst.a].asObject(), regs[inst.b]),
             .iter_init => regs[inst.a] = try self.getIterator(regs[inst.b]),
             .iter_next => regs[inst.a] = try self.iteratorNext(regs[inst.b]),
+            .enum_keys => regs[inst.a] = Value.fromObject(try self.enumKeys(regs[inst.b])),
             .gen_yield => return Step{ .yielded = regs[inst.b] },
 
             .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env),
@@ -862,6 +896,7 @@ pub const Vm = struct {
         const clo = try self.heap.create(gc.Closure);
         clo.code = child;
         clo.env = env;
+        clo.constructor = !child.is_generator; // generators aren't `new`-able
         const fn_obj = try self.heap.create(gc.Object);
         fn_obj.callable = clo;
         fn_obj.prototype = self.function_proto;
@@ -872,6 +907,16 @@ pub const Vm = struct {
         try self.defineData(fn_obj, "prototype", Value.fromObject(proto), true, false, false);
         try self.defineData(proto, "constructor", Value.fromObject(fn_obj), true, false, true);
         return Value.fromObject(fn_obj);
+    }
+
+    /// Allocate `bound ++ call` into a fresh gpa buffer. The individual Values
+    /// remain reachable via their owners (the bound function / caller frame),
+    /// so only the backing memory needs to be freed by the caller.
+    fn concatBoundArgs(self: *Vm, bound: []const Value, call: []const Value) Error![]Value {
+        const buf = try self.gpa.alloc(Value, bound.len + call.len);
+        @memcpy(buf[0..bound.len], bound);
+        @memcpy(buf[bound.len..], call);
+        return buf;
     }
 
     fn callValue(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!Value {
@@ -889,6 +934,13 @@ pub const Vm = struct {
                 }
                 return self.callValue(Value.fromObject(target), this_value, args);
             }
+            // Bound function: forward to the target with bound this + bound args.
+            if (callee.asObject().bound_target) |target| {
+                const o = callee.asObject();
+                const combined = try self.concatBoundArgs(o.elements.items, args);
+                defer self.gpa.free(combined);
+                return self.callValue(target, o.bound_this, combined);
+            }
         }
         if (!callee.isObject() or callee.asObject().callable == null) {
             return self.throwTypeError("value is not a function");
@@ -904,12 +956,36 @@ pub const Vm = struct {
         const code: *const bc.CodeBlock = @ptrCast(@alignCast(clo.code));
         // Calling a generator function creates (but does not run) a generator.
         if (code.is_generator) return self.makeGenerator(code, clo.env, this_value, args);
+        // Build `arguments` before the env exists (createEnv can GC, and the
+        // env isn't rooted yet — so root the object across it).
+        var args_obj: ?Value = null;
+        if (code.arguments_slot != null) {
+            args_obj = Value.fromObject(try self.makeArgumentsObject(args));
+            try self.protect(args_obj.?);
+        }
+        defer if (args_obj != null) self.unprotect();
         const env = try self.createEnv(clo.env, code.num_env_slots);
         var i: u32 = 0;
         while (i < code.num_params) : (i += 1) {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
         }
+        if (code.arguments_slot) |slot| env.slots[slot] = args_obj.?;
         return self.execute(code, env, this_value);
+    }
+
+    /// Build an `arguments` object: an ordinary object with own indexed
+    /// properties for each argument plus a writable, non-enumerable `length`.
+    fn makeArgumentsObject(self: *Vm, args: []const Value) Error!*gc.Object {
+        const obj = try self.newObject(self.object_proto);
+        try self.protect(Value.fromObject(obj));
+        defer self.unprotect();
+        for (args, 0..) |a, idx| {
+            var b: [16]u8 = undefined;
+            const s = std.fmt.bufPrint(&b, "{d}", .{idx}) catch unreachable;
+            try self.defineData(obj, s, a, true, true, true);
+        }
+        try self.defineData(obj, "length", Value.fromNumber(@floatFromInt(args.len)), true, false, true);
+        return obj;
     }
 
     /// The `new` operator: create an ordinary object inheriting the
@@ -930,8 +1006,15 @@ pub const Vm = struct {
                 }
                 return self.constructValue(Value.fromObject(target), args);
             }
+            // Bound function: construct the target with the bound args prepended.
+            if (callee.asObject().bound_target) |target| {
+                const o = callee.asObject();
+                const combined = try self.concatBoundArgs(o.elements.items, args);
+                defer self.gpa.free(combined);
+                return self.constructValue(target, combined);
+            }
         }
-        if (!callee.isObject() or callee.asObject().callable == null) {
+        if (!isConstructorValue(callee)) {
             return self.throwTypeError("value is not a constructor");
         }
         const proto_val = try self.getProperty(callee, "prototype");
@@ -949,11 +1032,18 @@ pub const Vm = struct {
         const obj = try self.newObject(self.generator_proto);
         try self.protect(Value.fromObject(obj));
         defer self.unprotect();
+        var args_obj: ?Value = null;
+        if (code.arguments_slot != null) {
+            args_obj = Value.fromObject(try self.makeArgumentsObject(args));
+            try self.protect(args_obj.?);
+        }
+        defer if (args_obj != null) self.unprotect();
         const env = try self.createEnv(closure_env, code.num_env_slots);
         var i: u32 = 0;
         while (i < code.num_params) : (i += 1) {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
         }
+        if (code.arguments_slot) |slot| env.slots[slot] = args_obj.?;
         // From here on: only gpa allocations (no GC), so env/regs/state stay live.
         const regs = try self.gpa.alloc(Value, code.num_registers);
         @memset(regs, Value.undefined_value);
@@ -1068,6 +1158,40 @@ pub const Vm = struct {
             if (toBoolean(try self.getProperty(r, "done"))) break;
             try dst.elements.append(self.gpa, try self.getProperty(r, "value"));
         }
+    }
+
+    /// Collect the enumerable string keys of an object and its prototype chain
+    /// (deduplicated), as an array — for `for-in`.
+    fn enumKeys(self: *Vm, base: Value) Error!*gc.Object {
+        const arr = try self.newArray(0);
+        if (!base.isObject()) return arr;
+        try self.protect(Value.fromObject(arr));
+        defer self.unprotect();
+
+        var seen = std.StringHashMap(void).init(self.gpa);
+        defer seen.deinit();
+
+        var o: ?*gc.Object = base.asObject();
+        while (o) |cur| {
+            if (cur.is_array) {
+                var i: usize = 0;
+                while (i < cur.elements.items.len) : (i += 1) {
+                    var b: [16]u8 = undefined;
+                    const s = std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable;
+                    try arr.elements.append(self.gpa, try self.makeString(s)); // array indices are unique
+                }
+            }
+            var it = cur.properties.iterator();
+            while (it.next()) |entry| {
+                if (!entry.value_ptr.enumerable) continue;
+                const k = entry.key_ptr.*;
+                if (k.len > 0 and k[0] == 0) continue; // internal/symbol keys
+                if ((try seen.getOrPut(k)).found_existing) continue;
+                try arr.elements.append(self.gpa, try self.makeString(k));
+            }
+            o = cur.prototype;
+        }
+        return arr;
     }
 
     // ---- iteration protocol ------------------------------------------------
@@ -1328,6 +1452,24 @@ pub const Vm = struct {
             obj = o.prototype;
         }
         return Value.undefined_value;
+    }
+
+    /// [[Delete]]: remove an own property. Returns false only when the property
+    /// exists and is non-configurable (per the spec), true otherwise.
+    fn deleteProperty(self: *Vm, base: Value, key: []const u8) bool {
+        if (!base.isObject()) return true;
+        const o = base.asObject();
+        if (o.is_array) {
+            if (arrayIndex(key)) |i| {
+                if (i < o.elements.items.len) o.elements.items[i] = Value.undefined_value; // hole
+                return true;
+            }
+        }
+        if (o.properties.getPtr(key)) |desc| {
+            if (!desc.configurable) return false;
+            if (o.properties.fetchOrderedRemove(key)) |kv| self.gpa.free(kv.key);
+        }
+        return true;
     }
 
     fn hasProperty(self: *Vm, obj: *gc.Object, key: []const u8) bool {
@@ -2315,6 +2457,18 @@ fn isCallable(v: Value) bool {
     return v.isObject() and v.asObject().callable != null;
 }
 
+/// IsConstructor: true iff `v` is a callable object that implements
+/// [[Construct]]. A proxy defers to its target/handler, so treat it as a
+/// constructor here and let `constructValue` validate.
+fn isConstructorValue(v: Value) bool {
+    if (!v.isObject()) return false;
+    const obj = v.asObject();
+    if (obj.proxy_target != null) return true;
+    if (obj.bound_target) |bt| return isConstructorValue(bt);
+    const clo = obj.callable orelse return false;
+    return clo.constructor;
+}
+
 fn thisArray(vm: *Vm, this: Value) Error!*gc.Object {
     if (!this.isObject() or !this.asObject().is_array) {
         return vm.throwTypeError("Array.prototype method called on a non-array");
@@ -2567,6 +2721,63 @@ fn nativeObjectValues(ctx: *anyopaque, this: Value, args: []const Value) Error!V
         try result.elements.append(vm.gpa, val);
     }
     return Value.fromObject(result);
+}
+
+/// All own string-keyed property names (enumerable and not), skipping symbol
+/// and internal-slot keys. Array indices and `length` are included for arrays.
+fn ownPropertyNames(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
+    if (obj.is_array) {
+        var i: usize = 0;
+        while (i < obj.elements.items.len) : (i += 1) {
+            var buf: [16]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+            try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
+        }
+    }
+    var it = obj.properties.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (k.len > 0 and k[0] == 0) continue; // internal slots + symbol keys
+        try out.append(vm.gpa, try vm.gpa.dupe(u8, k));
+    }
+    if (obj.is_array) try out.append(vm.gpa, try vm.gpa.dupe(u8, "length"));
+}
+
+fn nativeObjectGetOwnPropertyNames(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const v = argAt(args, 0);
+    if (!v.isObject()) return vm.throwTypeError("Object.getOwnPropertyNames called on non-object");
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| vm.gpa.free(k);
+        keys.deinit(vm.gpa);
+    }
+    try ownPropertyNames(vm, v.asObject(), &keys);
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    for (keys.items) |k| {
+        const s = try vm.makeString(k);
+        try result.elements.append(vm.gpa, s);
+    }
+    return Value.fromObject(result);
+}
+
+fn nativePropertyIsEnumerable(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return Value.fromBool(false);
+    const key = try vm.toPropertyKey(argAt(args, 0));
+    defer vm.gpa.free(key);
+    const o = this.asObject();
+    if (o.properties.get(key)) |desc| return Value.fromBool(desc.enumerable);
+    // Array indices are enumerable own properties when in range.
+    if (o.is_array) {
+        if (std.fmt.parseInt(usize, key, 10)) |idx| {
+            if (idx < o.elements.items.len) return Value.fromBool(true);
+        } else |_| {}
+    }
+    return Value.fromBool(false);
 }
 
 fn nativeObjectEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -4219,9 +4430,60 @@ fn nativeReflectConstruct(ctx: *anyopaque, this: Value, args: []const Value) Err
     _ = this;
     const vm = castVm(ctx);
     const target = argAt(args, 0);
+    if (!isConstructorValue(target)) return vm.throwTypeError("Reflect.construct target is not a constructor");
+    // newTarget defaults to target; when supplied it must also be a constructor.
+    if (args.len >= 3 and !isConstructorValue(args[2])) {
+        return vm.throwTypeError("Reflect.construct newTarget is not a constructor");
+    }
     const args_arr = argAt(args, 1);
     const list: []const Value = if (args_arr.isObject() and args_arr.asObject().is_array) args_arr.asObject().elements.items else &.{};
     return vm.constructValue(target, list);
+}
+
+// ---- Function.prototype ----------------------------------------------------
+
+fn nativeFunctionCall(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.call called on non-function");
+    const this_arg = argAt(args, 0);
+    const rest: []const Value = if (args.len > 1) args[1..] else &.{};
+    return vm.callValue(this, this_arg, rest);
+}
+
+fn nativeFunctionApply(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.apply called on non-function");
+    const this_arg = argAt(args, 0);
+    const args_arr = argAt(args, 1);
+    const list: []const Value = if (args_arr.isObject() and args_arr.asObject().is_array) args_arr.asObject().elements.items else &.{};
+    return vm.callValue(this, this_arg, list);
+}
+
+fn nativeFunctionBind(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.bind called on non-function");
+    const bound = try vm.makeNative("bound", nativeBoundTrampoline, 0);
+    try vm.protect(Value.fromObject(bound));
+    defer vm.unprotect();
+    bound.bound_target = this;
+    bound.bound_this = argAt(args, 0);
+    if (args.len > 1) for (args[1..]) |a| try bound.elements.append(vm.gpa, a);
+    return Value.fromObject(bound);
+}
+
+/// A bound function's [[Call]]/[[Construct]] are intercepted in `callValue`/
+/// `constructValue`; this native is never actually dispatched.
+fn nativeBoundTrampoline(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    _ = args;
+    return castVm(ctx).throwTypeError("bound function dispatched without interception");
+}
+
+/// The dynamic `Function(...)` code-evaluating constructor is not supported.
+fn nativeFunctionCtor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    _ = args;
+    return castVm(ctx).throwTypeError("dynamic Function() is not supported");
 }
 
 fn clampIndex(n: f64, len: i64) i64 {

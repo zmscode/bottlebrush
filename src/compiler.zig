@@ -48,6 +48,7 @@ const FnState = struct {
     name: []const u8,
     is_generator: bool = false,
     num_params: u32 = 0,
+    arguments_slot: ?u32 = null,
     env_slot_count: u32 = 0,
     reg_top: u32 = 0,
     max_regs: u32 = 0,
@@ -205,6 +206,7 @@ pub const Compiler = struct {
         body: *Node,
         is_expression_body: bool,
         is_generator: bool,
+        is_arrow: bool,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
         var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator };
@@ -230,6 +232,16 @@ pub const Compiler = struct {
         }
         fs.num_params = @intCast(params.len);
 
+        // Ordinary (non-arrow) functions get an implicit `arguments` binding,
+        // materialized at run time. Skip the top-level script (parent == null)
+        // and any function that already binds the name as a parameter.
+        if (!is_arrow and parent_fs != null) {
+            const top = &fs.blocks.items[fs.blocks.items.len - 1];
+            if (!top.names.contains("arguments")) {
+                fs.arguments_slot = try self.declare("arguments");
+            }
+        }
+
         if (is_expression_body) {
             const r = try self.compileExprToNew(body);
             _ = try self.emit(.{ .op = .ret, .a = r });
@@ -254,7 +266,7 @@ pub const Compiler = struct {
         for (body) |stmt| {
             if (stmt.kind == .function_decl) {
                 const f = stmt.kind.function_decl;
-                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, self.fs);
+                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, self.fs);
                 const idx: u32 = @intCast(self.fs.children.items.len);
                 try self.fs.children.append(self.gpa, child);
                 const r = self.allocReg();
@@ -274,6 +286,7 @@ pub const Compiler = struct {
             .num_registers = fs.max_regs,
             .num_env_slots = fs.env_slot_count,
             .is_generator = fs.is_generator,
+            .arguments_slot = fs.arguments_slot,
             .code = try self.arena.dupe(Inst, fs.code.items),
             .constants = try self.dupeConstants(fs.constants.items),
             .children = try self.arena.dupe(*bc.CodeBlock, fs.children.items),
@@ -324,6 +337,7 @@ pub const Compiler = struct {
             .do_while_stmt => |s| try self.compileDoWhile(s),
             .for_stmt => |s| try self.compileFor(s),
             .for_of_stmt => |s| try self.compileForOf(s),
+            .for_in_stmt => |s| try self.compileForIn(s),
             .switch_stmt => |s| try self.compileSwitch(s),
             .return_stmt => |arg| {
                 const r = if (arg) |a| try self.compileExprToNew(a) else blk: {
@@ -473,6 +487,63 @@ pub const Compiler = struct {
         if (jf) |j| self.patchTarget(j, self.here());
         try self.patchBreaks(&ctx, self.here());
         try self.patchContinues(&ctx, cont_target);
+    }
+
+    /// `for (LHS in RHS) body`: enumerate the enumerable keys of RHS into an
+    /// array and loop over it by index, binding each key.
+    fn compileForIn(self: *Compiler, s: anytype) CompileError!void {
+        try self.pushBlock();
+        defer self.popBlock();
+
+        const target = try self.forHeadTarget(s.left);
+
+        const keys_reg = self.allocReg();
+        {
+            const src_reg = self.allocReg();
+            try self.compileExprInto(src_reg, s.right);
+            _ = try self.emit(.{ .op = .enum_keys, .a = keys_reg, .b = src_reg });
+            self.freeTo(src_reg + 1);
+        }
+        const idx_reg = self.allocReg();
+        const zero = try self.addConst(.{ .number = 0 });
+        _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = zero });
+
+        var ctx = LoopCtx{};
+        const prev_loop = self.loop;
+        const prev_break = self.break_target;
+        self.loop = &ctx;
+        self.break_target = &ctx;
+        defer self.loop = prev_loop;
+        defer self.break_target = prev_break;
+
+        const top = self.here();
+        const len_reg = self.allocReg();
+        const len_name = try self.addConst(.{ .string = "length" });
+        _ = try self.emit(.{ .op = .get_prop, .a = len_reg, .b = keys_reg, .c = len_name });
+        const cond_reg = self.allocReg();
+        _ = try self.emit(.{ .op = .ge, .a = cond_reg, .b = idx_reg, .c = len_reg });
+        const jexit = try self.emit(.{ .op = .jump_if_true, .a = cond_reg });
+        self.freeTo(len_reg);
+
+        const key_reg = self.allocReg();
+        _ = try self.emit(.{ .op = .get_elem, .a = key_reg, .b = keys_reg, .c = idx_reg });
+        try self.emitAssignTarget(target, key_reg);
+        self.freeTo(key_reg);
+
+        try self.compileStmt(s.body);
+
+        const cont_target = self.here();
+        const one_reg = self.allocReg();
+        const one = try self.addConst(.{ .number = 1 });
+        _ = try self.emit(.{ .op = .load_const, .a = one_reg, .b = one });
+        _ = try self.emit(.{ .op = .add, .a = idx_reg, .b = idx_reg, .c = one_reg });
+        self.freeTo(one_reg);
+        _ = try self.emit(.{ .op = .jump, .a = top });
+
+        self.patchTarget(jexit, self.here());
+        try self.patchBreaks(&ctx, self.here());
+        try self.patchContinues(&ctx, cont_target);
+        self.freeTo(keys_reg);
     }
 
     /// `for (LHS of RHS) body` using the iteration protocol: get an iterator
@@ -762,7 +833,7 @@ pub const Compiler = struct {
     }
 
     fn compileUnary(self: *Compiler, dst: u32, u: anytype, pos: u32) CompileError!void {
-        if (u.op == .kw_delete) return self.fail("delete unsupported", pos);
+        if (u.op == .kw_delete) return self.compileDelete(dst, u.operand);
         // `typeof <free identifier>` must yield "undefined", not ReferenceError.
         if (u.op == .kw_typeof and u.operand.kind == .ident) {
             const name = u.operand.kind.ident;
@@ -787,6 +858,28 @@ pub const Compiler = struct {
             else => return self.fail("unsupported unary operator", pos),
         };
         _ = try self.emit(.{ .op = op, .a = dst, .b = dst });
+    }
+
+    /// `delete obj.prop` / `delete obj[expr]`. Deleting a non-member reference
+    /// (e.g. a plain identifier) evaluates to `true` (a Phase-4 simplification;
+    /// sloppy-mode `delete x` on a declared binding should be `false`).
+    fn compileDelete(self: *Compiler, dst: u32, operand: *Node) CompileError!void {
+        if (operand.kind == .member and !operand.kind.member.optional) {
+            const m = operand.kind.member;
+            const obj_reg = self.allocReg();
+            try self.compileExprInto(obj_reg, m.object);
+            if (m.computed) {
+                const key_reg = self.allocReg();
+                try self.compileExprInto(key_reg, m.property);
+                _ = try self.emit(.{ .op = .delete_elem, .a = dst, .b = obj_reg, .c = key_reg });
+            } else {
+                const name_idx = try self.propNameConst(m.property);
+                _ = try self.emit(.{ .op = .delete_prop, .a = dst, .b = obj_reg, .c = name_idx });
+            }
+            self.freeTo(obj_reg);
+            return;
+        }
+        _ = try self.emit(.{ .op = .load_true, .a = dst });
     }
 
     fn compileUpdate(self: *Compiler, dst: u32, u: anytype, pos: u32) CompileError!void {
@@ -1116,6 +1209,7 @@ pub const Compiler = struct {
             f.body,
             f.flags.expression_body,
             f.flags.is_generator,
+            f.flags.is_arrow,
             self.fs,
         );
         const idx: u32 = @intCast(self.fs.children.items.len);
@@ -1290,7 +1384,7 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
     const dummy_body = try c.arena.create(Node);
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
-    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, null) catch |e| switch (e) {
+    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;

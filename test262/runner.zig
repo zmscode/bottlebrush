@@ -21,6 +21,7 @@ const compiler = bottlebrush.compiler;
 
 const default_path = "test262/fixtures";
 const trace_files = false; // set true to print FAIL paths when debugging
+const trace_skips = false; // set true to print a reason tag for each SKIP
 const harness_path = "test262/harness";
 const max_file_bytes = std.Io.Limit.limited(64 * 1024 * 1024);
 
@@ -36,32 +37,42 @@ const Runner = struct {
         "Math.sumPrecise", "Symbol",         "Symbol.iterator", "Symbol.toStringTag",
         "generators",      "async-iteration", "TypedArray",      "BigInt",
         "Proxy",           "Reflect",         "WeakRef",         "tail-call-optimization",
+        "Float16Array",
     };
 
-    fn hasUnsupportedFeature(meta: frontmatter.Meta) bool {
+    fn unsupportedFeature(meta: frontmatter.Meta) ?[]const u8 {
         for (meta.features) |f| {
             for (unsupported_features) |u| {
-                if (std.mem.eql(u8, f, u)) return true;
+                if (std.mem.eql(u8, f, u)) return u;
             }
         }
-        return false;
+        return null;
     }
 
     /// Run one test file to an outcome.
     fn classify(self: *Runner, source: []const u8, meta: frontmatter.Meta) report.Outcome {
-        if (hasUnsupportedFeature(meta)) return .skip;
+        if (unsupportedFeature(meta)) |f| {
+            if (trace_skips) std.debug.print("SKIP feature:{s}\n", .{f});
+            return .skip;
+        }
         if (meta.negative) |neg| {
             switch (neg.phase) {
                 .parse => return self.scoreParseNegative(source, meta),
                 .resolution, .runtime => {
-                    if (meta.flags.is_async or meta.flags.module) return .skip;
+                    if (meta.flags.is_async or meta.flags.module) {
+                        if (trace_skips) std.debug.print("SKIP async-or-module\n", .{});
+                        return .skip;
+                    }
                     // Expect a throw whose constructor name matches.
                     return self.runTest(source, meta, neg.type_name);
                 },
             }
         }
         // Features the engine doesn't support yet.
-        if (meta.flags.is_async or meta.flags.module) return .skip;
+        if (meta.flags.is_async or meta.flags.module) {
+            if (trace_skips) std.debug.print("SKIP async-or-module\n", .{});
+            return .skip;
+        }
         return self.runTest(source, meta, null);
     }
 
@@ -81,19 +92,28 @@ const Runner = struct {
     /// negative test, `expected_error` is the constructor name that must be
     /// thrown; for a positive test it is null (any throw is a failure).
     fn runTest(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8) report.Outcome {
-        const combined = self.buildSource(source, meta) catch return .skip;
+        const combined = self.buildSource(source, meta) catch {
+            if (trace_skips) std.debug.print("SKIP missing-include\n", .{});
+            return .skip;
+        };
         defer self.gpa.free(combined);
 
         const pr = parser.parse(self.gpa, combined, .script) catch return .skip;
         var ast_tree = switch (pr) {
-            .syntax_error => return .skip, // parser gap, not a conformance failure
+            .syntax_error => |d| {
+                if (trace_skips) std.debug.print("SKIP parse-gap: {s}\n", .{d.message});
+                return .skip;
+            },
             .ok => |a| a,
         };
         defer ast_tree.deinit();
 
         const cr = compiler.compile(self.gpa, ast_tree.root, combined) catch return .skip;
         var program = switch (cr) {
-            .compile_error => return .skip, // unsupported construct, not a failure
+            .compile_error => |d| {
+                if (trace_skips) std.debug.print("SKIP compile-gap: {s}\n", .{d.message});
+                return .skip;
+            },
             .ok => |p| p,
         };
         defer program.deinit();
@@ -113,11 +133,26 @@ const Runner = struct {
                 // test uses a global/built-in we don't implement yet -> SKIP
                 // rather than count it as a conformance failure.
                 if (name) |n| {
-                    if (std.mem.eql(u8, n, "ReferenceError")) return .skip;
+                    if (std.mem.eql(u8, n, "ReferenceError")) {
+                        if (trace_skips) {
+                            const msg = vm.pendingErrorMessage(self.gpa);
+                            defer if (msg) |m| self.gpa.free(m);
+                            std.debug.print("SKIP reference-error: {s}\n", .{msg orelse "?"});
+                        }
+                        return .skip;
+                    }
+                }
+                if (trace_files) {
+                    const msg = vm.pendingErrorMessage(self.gpa);
+                    defer if (msg) |m| self.gpa.free(m);
+                    std.debug.print("FAILMSG [{s}] {s}\n", .{ name orelse "?", msg orelse "?" });
                 }
                 return .fail;
             },
-            else => return .skip, // OOM / engine limit
+            else => {
+                if (trace_skips) std.debug.print("SKIP engine-limit\n", .{});
+                return .skip; // OOM / engine limit
+            },
         };
         // Completed without throwing.
         return if (expected_error != null) .fail else .pass;
@@ -227,7 +262,8 @@ fn printReport(path: []const u8, board: report.Scoreboard) void {
         \\  fail:    {d}
         \\  skip:    {d}
         \\  ran:     {d}
-        \\  PASS:    {d:.2}%
+        \\  PASS (of all):      {d:.2}%
+        \\  PASS (of executed): {d:.2}%
         \\
         \\
     , .{
@@ -238,10 +274,11 @@ fn printReport(path: []const u8, board: report.Scoreboard) void {
         board.skip,
         board.ran(),
         board.passRate(),
+        board.executedRate(),
     });
 
     std.debug.print(
-        "{{\"pass\":{d},\"fail\":{d},\"skip\":{d},\"files\":{d},\"pass_rate\":{d:.4}}}\n",
-        .{ board.pass, board.fail, board.skip, board.files, board.passRate() },
+        "{{\"pass\":{d},\"fail\":{d},\"skip\":{d},\"files\":{d},\"pass_rate\":{d:.4},\"executed_rate\":{d:.4}}}\n",
+        .{ board.pass, board.fail, board.skip, board.files, board.passRate(), board.executedRate() },
     );
 }

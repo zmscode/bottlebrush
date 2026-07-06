@@ -39,8 +39,18 @@ pub const Scoreboard = struct {
         return self.pass + self.fail + self.skip;
     }
 
-    /// Pass rate over *executed* tests, as a percentage. 0 when nothing ran.
+    /// Pass rate over *all discovered* tests (skips count against it), as a
+    /// percentage. This is the headline number: skipping a test never inflates
+    /// it. 0 when nothing was discovered.
     pub fn passRate(self: Scoreboard) f64 {
+        const t = self.total();
+        if (t == 0) return 0;
+        return @as(f64, @floatFromInt(self.pass)) / @as(f64, @floatFromInt(t)) * 100.0;
+    }
+
+    /// Pass rate over only *executed* (pass or fail) tests, as a percentage.
+    /// Reported alongside `passRate` for context. 0 when nothing ran.
+    pub fn executedRate(self: Scoreboard) f64 {
         const r = self.ran();
         if (r == 0) return 0;
         return @as(f64, @floatFromInt(self.pass)) / @as(f64, @floatFromInt(r)) * 100.0;
@@ -65,7 +75,10 @@ test "records and rates" {
     b.record(.skip);
     try std.testing.expectEqual(@as(usize, 5), b.total());
     try std.testing.expectEqual(@as(usize, 4), b.ran());
-    try std.testing.expectEqual(@as(f64, 75), b.passRate());
+    // Headline rate counts the skip against us: 3 / 5 = 60%.
+    try std.testing.expectEqual(@as(f64, 60), b.passRate());
+    // Executed-only rate ignores the skip: 3 / 4 = 75%.
+    try std.testing.expectEqual(@as(f64, 75), b.executedRate());
 }
 
 test "all-skip yields zero percent, not divide-by-zero" {
@@ -73,5 +86,6 @@ test "all-skip yields zero percent, not divide-by-zero" {
     b.record(.skip);
     b.record(.skip);
     try std.testing.expectEqual(@as(f64, 0), b.passRate());
+    try std.testing.expectEqual(@as(f64, 0), b.executedRate());
     try std.testing.expectEqual(@as(usize, 0), b.ran());
 }
