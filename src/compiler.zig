@@ -318,6 +318,7 @@ pub const Compiler = struct {
             .while_stmt => |s| try self.compileWhile(s),
             .do_while_stmt => |s| try self.compileDoWhile(s),
             .for_stmt => |s| try self.compileFor(s),
+            .for_of_stmt => |s| try self.compileForOf(s),
             .return_stmt => |arg| {
                 const r = if (arg) |a| try self.compileExprToNew(a) else blk: {
                     const rr = self.allocReg();
@@ -457,6 +458,88 @@ pub const Compiler = struct {
         if (jf) |j| self.patchTarget(j, self.here());
         try self.patchBreaks(&ctx, self.here());
         try self.patchContinues(&ctx, cont_target);
+    }
+
+    /// `for (LHS of RHS) body` desugared to index iteration over `length` +
+    /// element access. This covers arrays and strings; the full iteration
+    /// protocol (Symbol.iterator) is deferred.
+    fn compileForOf(self: *Compiler, s: anytype) CompileError!void {
+        try self.pushBlock();
+        defer self.popBlock();
+
+        // Resolve the loop-variable assignment target once.
+        const target = try self.forHeadTarget(s.left);
+
+        const iter_reg = self.allocReg();
+        try self.compileExprInto(iter_reg, s.right);
+        const idx_reg = self.allocReg();
+        const zero = try self.addConst(.{ .number = 0 });
+        _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = zero });
+
+        var ctx = LoopCtx{};
+        const prev = self.loop;
+        self.loop = &ctx;
+        defer self.loop = prev;
+
+        const top = self.here();
+        // if (idx >= iter.length) break
+        const len_reg = self.allocReg();
+        const len_name = try self.addConst(.{ .string = "length" });
+        _ = try self.emit(.{ .op = .get_prop, .a = len_reg, .b = iter_reg, .c = len_name });
+        const cond_reg = self.allocReg();
+        _ = try self.emit(.{ .op = .ge, .a = cond_reg, .b = idx_reg, .c = len_reg });
+        const jexit = try self.emit(.{ .op = .jump_if_true, .a = cond_reg });
+        self.freeTo(len_reg);
+
+        // elem = iter[idx]; assign to the loop variable
+        const elem_reg = self.allocReg();
+        _ = try self.emit(.{ .op = .get_elem, .a = elem_reg, .b = iter_reg, .c = idx_reg });
+        try self.emitAssignTarget(target, elem_reg);
+        self.freeTo(elem_reg);
+
+        try self.compileStmt(s.body);
+
+        const cont_target = self.here();
+        const one_reg = self.allocReg();
+        const one = try self.addConst(.{ .number = 1 });
+        _ = try self.emit(.{ .op = .load_const, .a = one_reg, .b = one });
+        _ = try self.emit(.{ .op = .add, .a = idx_reg, .b = idx_reg, .c = one_reg });
+        self.freeTo(one_reg);
+        _ = try self.emit(.{ .op = .jump, .a = top });
+
+        self.patchTarget(jexit, self.here());
+        try self.patchBreaks(&ctx, self.here());
+        try self.patchContinues(&ctx, cont_target);
+        self.freeTo(iter_reg);
+    }
+
+    const ForTarget = union(enum) {
+        local: Binding,
+        global: u32, // name const index
+    };
+
+    fn forHeadTarget(self: *Compiler, left: *Node) CompileError!ForTarget {
+        switch (left.kind) {
+            .var_decl => |vd| {
+                const id = vd.decls[0].kind.variable_declarator.id;
+                if (id.kind != .ident) return self.fail("destructuring for-of target unsupported", id.start);
+                const name = id.kind.ident;
+                const slot = if (vd.kind == .keyword_var) (self.resolve(name) orelse unreachable).slot else try self.declare(name);
+                return .{ .local = .{ .depth = 0, .slot = slot } };
+            },
+            .ident => |name| {
+                if (self.resolve(name)) |bind| return .{ .local = bind };
+                return .{ .global = try self.addConst(.{ .string = name }) };
+            },
+            else => return self.fail("for-of target unsupported", left.start),
+        }
+    }
+
+    fn emitAssignTarget(self: *Compiler, target: ForTarget, src: u32) CompileError!void {
+        switch (target) {
+            .local => |b| _ = try self.emit(.{ .op = .set_var, .a = b.depth, .b = b.slot, .c = src }),
+            .global => |idx| _ = try self.emit(.{ .op = .set_global, .a = idx, .b = src }),
+        }
     }
 
     fn compileTry(self: *Compiler, s: anytype) CompileError!void {

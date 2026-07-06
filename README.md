@@ -6,28 +6,34 @@ driven by [Test262](https://github.com/tc39/test262) conformance from day one.
 See [plan.md](plan.md) for the architecture and [phase/](phase/) for the
 per-phase build plans.
 
-## Status: Phase 4 — Standard library (core built-ins)
+## Status: Phase 4 — Standard library (practical core complete)
 
-The engine now has native (Zig-implemented) built-ins and **real `Error`
-objects**. `assert.throws`, `instanceof`, and runtime-phase negative tests all
-work. Implemented so far:
+The engine has native (Zig-implemented) built-ins, real `Error` objects, arrays,
+strings with a prototype, and `for-of`. `assert.throws`, `instanceof`, and
+runtime-phase negative tests all work.
 
 - **Native function** mechanism (a `Closure` can dispatch to Zig).
 - **Error** + `TypeError`/`RangeError`/`ReferenceError`/`SyntaxError`/`EvalError`/
-  `URIError`, with a real prototype chain; engine-thrown errors are now Error
-  objects (so `e instanceof TypeError`, `e.name`, `e.message` work).
-- **Object**: constructor, `hasOwnProperty`/`toString`/`valueOf`/`isPrototypeOf`,
-  and statics `getPrototypeOf`/`create`/`defineProperty`/`getOwnPropertyDescriptor`.
-- **String / Number / Boolean** conversion functions, **Math** (abs/floor/ceil/
-  round/trunc/sqrt/sign/max/min/pow + PI/E), and `isNaN`/`isFinite`.
-- **Array**: literals `[...]`, dense element storage with exotic `length`,
-  `push`/`pop`/`indexOf`/`includes`/`join`/`slice`/`concat`/`forEach`/`map`/
-  `filter`, `Array.isArray`, and `Object.keys`/`values`/`entries`.
+  `URIError` (real prototype chain; engine throws are now Error objects).
+- **Object**: constructor, prototype methods, and statics `getPrototypeOf`/
+  `create`/`defineProperty`/`getOwnPropertyDescriptor`/`keys`/`values`/`entries`.
+- **Array**: literals, dense storage + exotic `length`, `push`/`pop`/`indexOf`/
+  `includes`/`join`/`slice`/`concat`/`forEach`/`map`/`filter`, `Array.isArray`.
+- **String**: primitive property access (`length`, indexing) + `String.prototype`
+  (`charAt`/`charCodeAt`/`indexOf`/`includes`/`startsWith`/`endsWith`/`slice`/
+  `substring`/`toUpperCase`/`toLowerCase`/`trim`/`repeat`/`concat`/`split`),
+  `String.fromCharCode`.
+- **Number**: `toString(radix)`/`toFixed`/`valueOf`, `Number.isInteger`/`isFinite`/
+  `isNaN`, `MAX_SAFE_INTEGER`; **Math** (11 methods + PI/E); `isNaN`/`isFinite`.
+- **`for-of`** over arrays and strings.
 
 The Test262 runner scores positives (run + assert), parse-negatives, and
-runtime-negatives (by thrown constructor name). Still ahead: the iteration
-protocol / `for-of`, `RegExp`, `JSON`, `Date`, `Map`/`Set`, and the full
-String/Number/Array prototype method sets.
+runtime-negatives (by thrown constructor name).
+
+Deferred to later work (each a sizable subsystem): the full iteration protocol
+(`Symbol.iterator`, generators), spread, `RegExp`, `JSON`, `Date`, `Map`/`Set`,
+TypedArrays, `Proxy`, `Symbol`, full Unicode case mapping, and per-iteration
+`let` bindings / TDZ.
 
 Earlier phases (all complete):
 
