@@ -113,8 +113,10 @@ pub const Object = struct {
     elements: std.ArrayList(Value) = .empty,
     /// ArrayBuffer backing bytes (owned); null for non-buffers.
     buffer_data: ?[]u8 = null,
-    /// TypedArray view metadata; null for non-typed-arrays.
+    /// TypedArray view metadata; null for non-typed-arrays. Also used by
+    /// DataView (with `is_dataview` set), where `ta.length` is a byte count.
     ta: ?TypedArrayView = null,
+    is_dataview: bool = false,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);

@@ -59,6 +59,7 @@ pub const Vm = struct {
     date_proto: ?*gc.Object = null,
     arraybuffer_proto: ?*gc.Object = null,
     typed_array_proto: ?*gc.Object = null,
+    dataview_proto: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -89,6 +90,7 @@ pub const Vm = struct {
         if (self.date_proto) |o| tracer.mark(&o.gc);
         if (self.arraybuffer_proto) |o| tracer.mark(&o.gc);
         if (self.typed_array_proto) |o| tracer.mark(&o.gc);
+        if (self.dataview_proto) |o| tracer.mark(&o.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -480,6 +482,30 @@ pub const Vm = struct {
             try self.defineData(proto, "BYTES_PER_ELEMENT", Value.fromNumber(bpe), false, false, false);
             try self.defineData(global, t[0], Value.fromObject(ctor), true, false, true);
         }
+
+        // ---- DataView ----
+        const dv_proto = try self.newObject(self.object_proto);
+        self.dataview_proto = dv_proto;
+        try self.defineMethod(dv_proto, "getInt8", dataViewGet(i8, false, true), 1);
+        try self.defineMethod(dv_proto, "getUint8", dataViewGet(u8, false, true), 1);
+        try self.defineMethod(dv_proto, "getInt16", dataViewGet(i16, false, false), 1);
+        try self.defineMethod(dv_proto, "getUint16", dataViewGet(u16, false, false), 1);
+        try self.defineMethod(dv_proto, "getInt32", dataViewGet(i32, false, false), 1);
+        try self.defineMethod(dv_proto, "getUint32", dataViewGet(u32, false, false), 1);
+        try self.defineMethod(dv_proto, "getFloat32", dataViewGet(f32, true, false), 1);
+        try self.defineMethod(dv_proto, "getFloat64", dataViewGet(f64, true, false), 1);
+        try self.defineMethod(dv_proto, "setInt8", dataViewSet(i8, false, true), 2);
+        try self.defineMethod(dv_proto, "setUint8", dataViewSet(u8, false, true), 2);
+        try self.defineMethod(dv_proto, "setInt16", dataViewSet(i16, false, false), 2);
+        try self.defineMethod(dv_proto, "setUint16", dataViewSet(u16, false, false), 2);
+        try self.defineMethod(dv_proto, "setInt32", dataViewSet(i32, false, false), 2);
+        try self.defineMethod(dv_proto, "setUint32", dataViewSet(u32, false, false), 2);
+        try self.defineMethod(dv_proto, "setFloat32", dataViewSet(f32, true, false), 2);
+        try self.defineMethod(dv_proto, "setFloat64", dataViewSet(f64, true, false), 2);
+        const dv_ctor = try self.makeNative("DataView", nativeDataView, 1);
+        try self.defineData(dv_ctor, "prototype", Value.fromObject(dv_proto), false, false, false);
+        try self.defineData(dv_proto, "constructor", Value.fromObject(dv_ctor), true, false, true);
+        try self.defineData(global, "DataView", Value.fromObject(dv_ctor), true, false, true);
 
         // ---- JSON ----
         const json = try self.newObject(self.object_proto);
@@ -907,14 +933,21 @@ pub const Vm = struct {
         }
         // TypedArray exotic own access (indexed elements + view properties).
         if (base.asObject().ta) |ta| {
-            if (arrayIndex(key)) |i| {
-                if (i < ta.length) return readTypedElement(ta, i);
-                return Value.undefined_value;
+            if (base.asObject().is_dataview) {
+                // DataView: byte-count `byteLength`, no indexed access.
+                if (std.mem.eql(u8, key, "byteLength")) return Value.fromNumber(@floatFromInt(ta.length));
+                if (std.mem.eql(u8, key, "byteOffset")) return Value.fromNumber(@floatFromInt(ta.offset));
+                if (std.mem.eql(u8, key, "buffer")) return Value.fromObject(ta.buffer);
+            } else {
+                if (arrayIndex(key)) |i| {
+                    if (i < ta.length) return readTypedElement(ta, i);
+                    return Value.undefined_value;
+                }
+                if (std.mem.eql(u8, key, "length")) return Value.fromNumber(@floatFromInt(ta.length));
+                if (std.mem.eql(u8, key, "byteLength")) return Value.fromNumber(@floatFromInt(ta.length * gc.bytesPerElement(ta.kind)));
+                if (std.mem.eql(u8, key, "byteOffset")) return Value.fromNumber(@floatFromInt(ta.offset));
+                if (std.mem.eql(u8, key, "buffer")) return Value.fromObject(ta.buffer);
             }
-            if (std.mem.eql(u8, key, "length")) return Value.fromNumber(@floatFromInt(ta.length));
-            if (std.mem.eql(u8, key, "byteLength")) return Value.fromNumber(@floatFromInt(ta.length * gc.bytesPerElement(ta.kind)));
-            if (std.mem.eql(u8, key, "byteOffset")) return Value.fromNumber(@floatFromInt(ta.offset));
-            if (std.mem.eql(u8, key, "buffer")) return Value.fromObject(ta.buffer);
         }
         // ArrayBuffer byteLength.
         if (base.asObject().buffer_data) |buf| {
@@ -951,11 +984,13 @@ pub const Vm = struct {
             }
             if (arrayIndex(key)) |i| return self.setArrayElement(arr, i, value);
         }
-        // TypedArray exotic indexed write.
+        // TypedArray exotic indexed write (not for DataView).
         if (base.asObject().ta) |ta| {
-            if (arrayIndex(key)) |i| {
-                if (i < ta.length) writeTypedElement(ta, i, try self.toNumber(value));
-                return;
+            if (!base.asObject().is_dataview) {
+                if (arrayIndex(key)) |i| {
+                    if (i < ta.length) writeTypedElement(ta, i, try self.toNumber(value));
+                    return;
+                }
             }
         }
         const receiver = base.asObject();
@@ -3526,6 +3561,84 @@ fn nativeTAIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Valu
     return Value.fromNumber(-1);
 }
 
+// ---- DataView --------------------------------------------------------------
+
+fn nativeDataView(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("Constructor DataView requires 'new'");
+    const buf_v = argAt(args, 0);
+    if (!buf_v.isObject() or buf_v.asObject().buffer_data == null or buf_v.asObject().ta != null) {
+        return vm.throwTypeError("First argument to DataView constructor must be an ArrayBuffer");
+    }
+    const buffer = buf_v.asObject();
+    const total = buffer.buffer_data.?.len;
+    const offset: u32 = @intFromFloat(@max(0, try optNumber(vm, argAt(args, 1), 0)));
+    if (offset > total) return vm.throwRangeError("Start offset is outside the bounds of the buffer");
+    const length: u32 = if (args.len > 2 and !args[2].isUndefined())
+        @intFromFloat(@max(0, try vm.toNumber(args[2])))
+    else
+        @intCast(total - offset);
+    if (offset + length > total) return vm.throwRangeError("Invalid DataView length");
+    const obj = this.asObject();
+    obj.ta = .{ .buffer = buffer, .offset = offset, .length = length, .kind = .u8 };
+    obj.is_dataview = true;
+    return this;
+}
+
+fn thisDataView(vm: *Vm, this: Value) Error!gc.TypedArrayView {
+    if (!this.isObject() or !this.asObject().is_dataview) return vm.throwTypeError("not a DataView");
+    return this.asObject().ta.?;
+}
+
+/// DataView.prototype.get<Type>(byteOffset, littleEndian?). `single_byte`
+/// types ignore the endianness argument; DataView defaults to big-endian.
+fn dataViewGet(comptime T: type, comptime is_float: bool, comptime single_byte: bool) gc.NativeFn {
+    return struct {
+        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+            const vm = castVm(ctx);
+            const dv = try thisDataView(vm, this);
+            const off: u32 = @intFromFloat(@max(0, try vm.toNumber(argAt(args, 0))));
+            const size = @sizeOf(T);
+            if (off + size > dv.length) return vm.throwRangeError("Offset is outside the bounds of the DataView");
+            const endian: std.builtin.Endian = if (single_byte or toBoolean(argAt(args, 1))) .little else .big;
+            const bytes = dv.buffer.buffer_data.?;
+            const p = bytes[dv.offset + off ..][0..size];
+            if (is_float) {
+                const Bits = if (T == f32) u32 else u64;
+                const raw = std.mem.readInt(Bits, p, endian);
+                return Value.fromNumber(@as(T, @bitCast(raw)));
+            }
+            return Value.fromNumber(@floatFromInt(std.mem.readInt(T, p, endian)));
+        }
+    }.call;
+}
+
+fn dataViewSet(comptime T: type, comptime is_float: bool, comptime single_byte: bool) gc.NativeFn {
+    return struct {
+        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+            const vm = castVm(ctx);
+            const dv = try thisDataView(vm, this);
+            const off: u32 = @intFromFloat(@max(0, try vm.toNumber(argAt(args, 0))));
+            const size = @sizeOf(T);
+            if (off + size > dv.length) return vm.throwRangeError("Offset is outside the bounds of the DataView");
+            const n = try vm.toNumber(argAt(args, 1));
+            const endian: std.builtin.Endian = if (single_byte or toBoolean(argAt(args, 2))) .little else .big;
+            const bytes = dv.buffer.buffer_data.?;
+            const p = bytes[dv.offset + off ..][0..size];
+            if (is_float) {
+                const Bits = if (T == f32) u32 else u64;
+                const casted: T = @floatCast(n);
+                std.mem.writeInt(Bits, p, @bitCast(casted), endian);
+            } else {
+                const bits: u32 = @bitCast(doubleToInt32(n));
+                const UT = std.meta.Int(.unsigned, @bitSizeOf(T));
+                std.mem.writeInt(UT, p, @truncate(bits), endian);
+            }
+            return Value.undefined_value;
+        }
+    }.call;
+}
+
 fn clampIndex(n: f64, len: i64) i64 {
     if (std.math.isNan(n) or n < 0) return 0;
     if (n > @as(f64, @floatFromInt(len))) return len;
@@ -4139,6 +4252,41 @@ test "TypedArrays under GC stress" {
         \\return total;
     );
     try testing.expectEqual(@as(f64, 45), v.asNumber()); // 0+1+...+9
+}
+
+test "DataView" {
+    // Big-endian (default) vs little-endian round-trip.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var dv = new DataView(new ArrayBuffer(8));
+        \\dv.setInt32(0, 305419896); // 0x12345678
+        \\return dv.getInt32(0) === 305419896 ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var dv = new DataView(new ArrayBuffer(8));
+        \\dv.setInt32(0, 1, true); // little-endian
+        \\return (dv.getUint8(0) === 1 && dv.getUint8(3) === 0) ? 1 : 0;
+    ));
+    // Endianness is observable byte-by-byte (big-endian default).
+    try testing.expectEqual(@as(f64, 18), try evalNumber(
+        \\var dv = new DataView(new ArrayBuffer(4));
+        \\dv.setInt32(0, 305419896); // 0x12345678, big-endian
+        \\return dv.getUint8(0); // 0x12 = 18
+    ));
+    // Float round-trip.
+    try testing.expectEqual(@as(f64, 3.5), try evalNumber(
+        \\var dv = new DataView(new ArrayBuffer(8));
+        \\dv.setFloat64(0, 3.5);
+        \\return dv.getFloat64(0);
+    ));
+    // Shares the underlying ArrayBuffer with a typed array.
+    try testing.expectEqual(@as(f64, 255), try evalNumber(
+        \\var buf = new ArrayBuffer(4);
+        \\var u8 = new Uint8Array(buf);
+        \\var dv = new DataView(buf);
+        \\dv.setUint8(0, 255);
+        \\return u8[0];
+    ));
+    try testing.expectEqual(@as(f64, 8), try evalNumber("return new DataView(new ArrayBuffer(8)).byteLength;"));
 }
 
 test "Date" {
