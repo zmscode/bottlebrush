@@ -85,10 +85,13 @@ pub const Op = enum(u8) {
     get_elem, // a=dst, b=obj reg, c=key reg
     set_elem, // a=obj reg, b=key reg, c=value reg
     load_this, // a=dst
+    arr_push, // a=array reg, b=value reg  (append one)
+    arr_spread, // a=array reg, b=iterable reg  (append all elements)
 
     // Functions
     new_closure, // a=dst, b=child code-block index
     call, // a=dst, b=base reg, c=argc  (this=base, callee=base+1, args=base+2..)
+    call_apply, // a=dst, b=base reg  (this=base, callee=base+1, args array=base+2)
     construct, // a=dst, b=callee reg, c=argc  (args in callee+1 .. callee+argc)
     ret, // a=src
 

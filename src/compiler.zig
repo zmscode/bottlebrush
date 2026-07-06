@@ -909,17 +909,47 @@ pub const Compiler = struct {
     }
 
     fn compileArrayLiteral(self: *Compiler, dst: u32, elems: []?*Node, pos: u32) CompileError!void {
-        _ = try self.emit(.{ .op = .new_array, .a = dst, .b = @intCast(elems.len) });
-        for (elems, 0..) |maybe, i| {
-            const elem = maybe orelse continue; // elision -> leave the hole
-            if (elem.kind == .spread) return self.fail("array spread unsupported", pos);
-            const idx_reg = self.allocReg();
-            const idx_const = try self.addConst(.{ .number = @floatFromInt(i) });
-            _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = idx_const });
-            const val_reg = self.allocReg();
-            try self.compileExprInto(val_reg, elem);
-            _ = try self.emit(.{ .op = .set_elem, .a = dst, .b = idx_reg, .c = val_reg });
-            self.freeTo(idx_reg);
+        _ = pos;
+        var has_spread = false;
+        for (elems) |maybe| {
+            if (maybe) |e| if (e.kind == .spread) {
+                has_spread = true;
+            };
+        }
+
+        if (!has_spread) {
+            // Fast path: fixed length, indexed stores.
+            _ = try self.emit(.{ .op = .new_array, .a = dst, .b = @intCast(elems.len) });
+            for (elems, 0..) |maybe, i| {
+                const elem = maybe orelse continue; // elision -> leave the hole
+                const idx_reg = self.allocReg();
+                const idx_const = try self.addConst(.{ .number = @floatFromInt(i) });
+                _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = idx_const });
+                const val_reg = self.allocReg();
+                try self.compileExprInto(val_reg, elem);
+                _ = try self.emit(.{ .op = .set_elem, .a = dst, .b = idx_reg, .c = val_reg });
+                self.freeTo(idx_reg);
+            }
+            return;
+        }
+
+        // Spread path: build by appending.
+        _ = try self.emit(.{ .op = .new_array, .a = dst, .b = 0 });
+        for (elems) |maybe| {
+            const r = self.allocReg();
+            if (maybe) |elem| {
+                if (elem.kind == .spread) {
+                    try self.compileExprInto(r, elem.kind.spread);
+                    _ = try self.emit(.{ .op = .arr_spread, .a = dst, .b = r });
+                } else {
+                    try self.compileExprInto(r, elem);
+                    _ = try self.emit(.{ .op = .arr_push, .a = dst, .b = r });
+                }
+            } else {
+                _ = try self.emit(.{ .op = .load_undefined, .a = r }); // elision -> undefined
+                _ = try self.emit(.{ .op = .arr_push, .a = dst, .b = r });
+            }
+            self.freeTo(r);
         }
     }
 
@@ -976,7 +1006,12 @@ pub const Compiler = struct {
 
     fn compileCall(self: *Compiler, dst: u32, c: anytype, pos: u32) CompileError!void {
         if (c.optional) return self.fail("optional call unsupported", pos);
-        // Call layout: base=receiver (this), base+1=callee, base+2..=args.
+        var has_spread = false;
+        for (c.args) |arg| {
+            if (arg.kind == .spread) has_spread = true;
+        }
+
+        // Call layout: base=receiver (this), base+1=callee.
         const base = self.allocReg();
         if (c.callee.kind == .member and !c.callee.kind.member.optional) {
             // Method call: receiver is the object; callee is obj.prop.
@@ -998,13 +1033,31 @@ pub const Compiler = struct {
             const funcreg = self.allocReg(); // base+1
             try self.compileExprInto(funcreg, c.callee);
         }
-        // Arguments at base+2, base+3, ...
-        for (c.args) |arg| {
-            if (arg.kind == .spread) return self.fail("spread arguments unsupported", pos);
-            const ar = self.allocReg();
-            try self.compileExprInto(ar, arg);
+
+        if (!has_spread) {
+            // Arguments contiguous at base+2, base+3, ...
+            for (c.args) |arg| {
+                const ar = self.allocReg();
+                try self.compileExprInto(ar, arg);
+            }
+            _ = try self.emit(.{ .op = .call, .a = dst, .b = base, .c = @intCast(c.args.len) });
+        } else {
+            // Build an argument array (base+2), then apply.
+            const args_arr = self.allocReg(); // base+2
+            _ = try self.emit(.{ .op = .new_array, .a = args_arr, .b = 0 });
+            for (c.args) |arg| {
+                const r = self.allocReg();
+                if (arg.kind == .spread) {
+                    try self.compileExprInto(r, arg.kind.spread);
+                    _ = try self.emit(.{ .op = .arr_spread, .a = args_arr, .b = r });
+                } else {
+                    try self.compileExprInto(r, arg);
+                    _ = try self.emit(.{ .op = .arr_push, .a = args_arr, .b = r });
+                }
+                self.freeTo(r);
+            }
+            _ = try self.emit(.{ .op = .call_apply, .a = dst, .b = base });
         }
-        _ = try self.emit(.{ .op = .call, .a = dst, .b = base, .c = @intCast(c.args.len) });
         self.freeTo(base);
     }
 

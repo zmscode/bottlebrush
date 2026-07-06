@@ -604,6 +604,8 @@ pub const Vm = struct {
                 try self.setProperty(regs[inst.a], key, regs[inst.c]);
             },
             .load_this => regs[inst.a] = this_value,
+            .arr_push => try regs[inst.a].asObject().elements.append(self.gpa, regs[inst.b]),
+            .arr_spread => try self.spreadInto(regs[inst.a].asObject(), regs[inst.b]),
 
             .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env),
             .call => {
@@ -611,6 +613,12 @@ pub const Vm = struct {
                 const callee = regs[inst.b + 1];
                 const args = regs[inst.b + 2 .. inst.b + 2 + inst.c];
                 regs[inst.a] = try self.callValue(callee, receiver, args);
+            },
+            .call_apply => {
+                const receiver = regs[inst.b];
+                const callee = regs[inst.b + 1];
+                const args_arr = regs[inst.b + 2];
+                regs[inst.a] = try self.callValue(callee, receiver, args_arr.asObject().elements.items);
             },
             .construct => {
                 const callee = regs[inst.b];
@@ -704,6 +712,36 @@ pub const Vm = struct {
     }
     fn newObjectValue(self: *Vm) Error!Value {
         return Value.fromObject(try self.newObject(self.object_proto));
+    }
+
+    /// Append the iterated elements of `src` to array `dst`. Covers arrays,
+    /// strings, and Sets/Maps; the general Symbol.iterator protocol is deferred.
+    fn spreadInto(self: *Vm, dst: *gc.Object, src: Value) Error!void {
+        if (src.isString()) {
+            for (src.asString().units) |u| {
+                try dst.elements.append(self.gpa, try self.makeStringFromUtf16(&[_]u16{u}));
+            }
+            return;
+        }
+        if (src.isObject()) {
+            const o = src.asObject();
+            if (o.is_array or o.collection == .set) {
+                // Copy first (spreading into dst may equal src's backing).
+                for (o.elements.items) |v| try dst.elements.append(self.gpa, v);
+                return;
+            }
+            if (o.collection == .map) {
+                var i: usize = 0;
+                while (i + 1 < o.elements.items.len) : (i += 2) {
+                    const pair = try self.newArray(2);
+                    pair.elements.items[0] = o.elements.items[i];
+                    pair.elements.items[1] = o.elements.items[i + 1];
+                    try dst.elements.append(self.gpa, Value.fromObject(pair));
+                }
+                return;
+            }
+        }
+        return self.throwTypeError("value is not iterable");
     }
 
     fn newArray(self: *Vm, len: u32) Error!*gc.Object {
@@ -3275,6 +3313,27 @@ test "RegExp matching throws (stub, replace later)" {
     var vm = Vm.init(testing.allocator);
     defer vm.deinit();
     try testing.expectError(error.JsThrow, eval(&vm, "return /x/.test('x');"));
+}
+
+test "spread in array literals and calls" {
+    try testing.expectEqual(@as(f64, 15), try evalNumber(
+        \\var a = [1, 2, 3];
+        \\var b = [0, ...a, 4, 5];
+        \\return b[0] + b[1] + b[2] + b[3] + b[4] + b[5]; // 0+1+2+3+4+5
+    ));
+    try testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\function add(a, b, c) { return a + b + c; }
+        \\var nums = [1, 2, 3];
+        \\return add(...nums);
+    ));
+    try testing.expectEqual(@as(f64, 10), try evalNumber(
+        \\function add4(a, b, c, d) { return a + b + c + d; }
+        \\return add4(1, ...[2, 3], 4); // mixed spread + normal args
+    ));
+    // Spread a string into an array (per code unit).
+    try testing.expectEqual(@as(f64, 3), try evalNumber("return [...'abc'].length;"));
+    // Spread a Set.
+    try testing.expectEqual(@as(f64, 3), try evalNumber("return [...new Set([1, 2, 2, 3])].length;"));
 }
 
 test "switch statements" {
