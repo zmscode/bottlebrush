@@ -84,6 +84,16 @@ pub fn bytesPerElement(k: TAKind) u32 {
     };
 }
 
+/// The saved, resumable state of a generator activation.
+pub const GeneratorState = struct {
+    code: *const anyopaque, // *const bytecode.CodeBlock
+    env: *Environment,
+    regs: []Value,
+    this_value: Value,
+    pc: u32 = 0,
+    status: enum(u8) { start, suspended, executing, completed } = .start,
+};
+
 /// A typed-array view over an ArrayBuffer.
 pub const TypedArrayView = struct {
     buffer: *Object, // the backing ArrayBuffer object
@@ -121,6 +131,8 @@ pub const Object = struct {
     /// on `proxy_handler`, with `proxy_target` as the underlying object.
     proxy_target: ?*Object = null,
     proxy_handler: ?*Object = null,
+    /// Generator activation state (heap-owned); null for non-generators.
+    generator: ?*GeneratorState = null,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -135,6 +147,11 @@ pub const Object = struct {
         if (self.ta) |ta| t.mark(&ta.buffer.gc);
         if (self.proxy_target) |p| t.mark(&p.gc);
         if (self.proxy_handler) |h| t.mark(&h.gc);
+        if (self.generator) |g| {
+            t.mark(&g.env.gc);
+            g.this_value.mark(t);
+            for (g.regs) |v| v.mark(t);
+        }
     }
 
     pub fn deinitCell(self: *Object, gpa: std.mem.Allocator) void {
@@ -142,6 +159,10 @@ pub const Object = struct {
         self.properties.deinit(gpa);
         self.elements.deinit(gpa);
         if (self.buffer_data) |b| gpa.free(b);
+        if (self.generator) |g| {
+            gpa.free(g.regs);
+            gpa.destroy(g);
+        }
     }
 };
 

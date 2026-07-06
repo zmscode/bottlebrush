@@ -246,6 +246,13 @@ pub const Vm = struct {
         try self.defineMethod(iter_proto, "next", nativeIteratorNext, 0);
         try self.defineData(iter_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("[Symbol.iterator]", nativeIterSelf, 0)), true, false, true);
 
+        // %GeneratorPrototype% inherits %IteratorPrototype% (so generators are iterable).
+        const gen_proto = try self.newObject(self.iterator_proto);
+        self.generator_proto = gen_proto;
+        try self.defineMethod(gen_proto, "next", nativeGeneratorNext, 1);
+        try self.defineMethod(gen_proto, "return", nativeGeneratorReturn, 1);
+        try self.defineMethod(gen_proto, "throw", nativeGeneratorThrow, 1);
+
         // ---- Object.prototype methods + Object constructor ----
         try self.defineMethod(self.object_proto.?, "hasOwnProperty", nativeHasOwnProperty, 1);
         try self.defineMethod(self.object_proto.?, "toString", nativeObjectToString, 0);
@@ -895,6 +902,8 @@ pub const Vm = struct {
             return native(@ptrCast(self), this_value, args);
         }
         const code: *const bc.CodeBlock = @ptrCast(@alignCast(clo.code));
+        // Calling a generator function creates (but does not run) a generator.
+        if (code.is_generator) return self.makeGenerator(code, clo.env, this_value, args);
         const env = try self.createEnv(clo.env, code.num_env_slots);
         var i: u32 = 0;
         while (i < code.num_params) : (i += 1) {
@@ -934,6 +943,102 @@ pub const Vm = struct {
         return if (result.isObject()) result else Value.fromObject(this_obj);
     }
 
+    // ---- generators --------------------------------------------------------
+
+    fn makeGenerator(self: *Vm, code: *const bc.CodeBlock, closure_env: ?*gc.Environment, this_value: Value, args: []const Value) Error!Value {
+        const obj = try self.newObject(self.generator_proto);
+        try self.protect(Value.fromObject(obj));
+        defer self.unprotect();
+        const env = try self.createEnv(closure_env, code.num_env_slots);
+        var i: u32 = 0;
+        while (i < code.num_params) : (i += 1) {
+            env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
+        }
+        // From here on: only gpa allocations (no GC), so env/regs/state stay live.
+        const regs = try self.gpa.alloc(Value, code.num_registers);
+        @memset(regs, Value.undefined_value);
+        const state = try self.gpa.create(gc.GeneratorState);
+        state.* = .{ .code = code, .env = env, .regs = regs, .this_value = this_value };
+        obj.generator = state;
+        return Value.fromObject(obj);
+    }
+
+    /// Resume a generator. mode: 0=next(v), 1=return(v), 2=throw(v). Returns an
+    /// iterator-result object (or throws for mode 2 propagation).
+    fn generatorResume(self: *Vm, this: Value, sent: Value, mode: u8) Error!Value {
+        if (!this.isObject() or this.asObject().generator == null) return self.throwTypeError("not a generator");
+        const g = this.asObject().generator.?;
+        if (g.status == .executing) return self.throwTypeError("generator is already running");
+
+        if (g.status == .completed) {
+            if (mode == 2) {
+                self.pending_exception = sent;
+                return error.JsThrow;
+            }
+            return self.makeIterResult(if (mode == 1) sent else Value.undefined_value, true);
+        }
+
+        const code: *const bc.CodeBlock = @ptrCast(@alignCast(g.code));
+        var frame = Frame{ .code = code, .env = g.env, .regs = g.regs, .this_value = g.this_value, .pc = g.pc };
+
+        if (g.status == .start) {
+            if (mode == 1) {
+                g.status = .completed;
+                return self.makeIterResult(sent, true);
+            }
+            if (mode == 2) {
+                g.status = .completed;
+                self.pending_exception = sent;
+                return error.JsThrow;
+            }
+            // mode 0: begin at pc 0 (the initial `next` value is discarded).
+        } else {
+            // Suspended at a `gen_yield`. Resume based on mode.
+            const yield_dst = code.code[g.pc].a;
+            if (mode == 1) {
+                g.status = .completed;
+                return self.makeIterResult(sent, true);
+            } else if (mode == 2) {
+                // Inject a throw at the yield point (respect an enclosing catch).
+                if (self.findHandler(code, g.pc)) |h| {
+                    frame.regs[h.catch_reg] = sent;
+                    frame.pc = h.target_pc;
+                } else {
+                    g.status = .completed;
+                    self.pending_exception = sent;
+                    return error.JsThrow;
+                }
+            } else {
+                // next(v): the yield expression evaluates to `sent`.
+                frame.regs[yield_dst] = sent;
+                frame.pc += 1;
+            }
+        }
+
+        if (self.depth >= max_call_depth) return self.throwRangeError("maximum call stack size exceeded");
+        self.depth += 1;
+        defer self.depth -= 1;
+        g.status = .executing;
+        try self.frames.append(self.gpa, &frame);
+        defer _ = self.frames.pop();
+
+        const result = self.runLoop(&frame) catch |e| {
+            g.status = .completed;
+            return e;
+        };
+        switch (result) {
+            .yielded => |v| {
+                g.pc = frame.pc;
+                g.status = .suspended;
+                return self.makeIterResult(v, false);
+            },
+            .returned => |v| {
+                g.status = .completed;
+                return self.makeIterResult(v, true);
+            },
+        }
+    }
+
     // ---- object model ------------------------------------------------------
 
     fn newObject(self: *Vm, prototype: ?*gc.Object) Error!*gc.Object {
@@ -946,34 +1051,23 @@ pub const Vm = struct {
         return Value.fromObject(try self.newObject(self.object_proto));
     }
 
-    /// Append the iterated elements of `src` to array `dst`. Covers arrays,
-    /// strings, and Sets/Maps; the general Symbol.iterator protocol is deferred.
+    /// Append the iterated elements of `src` to array `dst`. Arrays copy
+    /// directly; everything else goes through the @@iterator protocol (so Sets,
+    /// Maps, generators, and custom iterables all work).
     fn spreadInto(self: *Vm, dst: *gc.Object, src: Value) Error!void {
-        if (src.isString()) {
-            for (src.asString().units) |u| {
-                try dst.elements.append(self.gpa, try self.makeStringFromUtf16(&[_]u16{u}));
-            }
+        if (src.isObject() and src.asObject().is_array) {
+            // Copy first (spreading into dst may alias src's backing).
+            for (src.asObject().elements.items) |v| try dst.elements.append(self.gpa, v);
             return;
         }
-        if (src.isObject()) {
-            const o = src.asObject();
-            if (o.is_array or o.collection == .set) {
-                // Copy first (spreading into dst may equal src's backing).
-                for (o.elements.items) |v| try dst.elements.append(self.gpa, v);
-                return;
-            }
-            if (o.collection == .map) {
-                var i: usize = 0;
-                while (i + 1 < o.elements.items.len) : (i += 2) {
-                    const pair = try self.newArray(2);
-                    pair.elements.items[0] = o.elements.items[i];
-                    pair.elements.items[1] = o.elements.items[i + 1];
-                    try dst.elements.append(self.gpa, Value.fromObject(pair));
-                }
-                return;
-            }
+        const iter = try self.getIterator(src);
+        try self.protect(iter);
+        defer self.unprotect();
+        while (true) {
+            const r = try self.iteratorNext(iter);
+            if (toBoolean(try self.getProperty(r, "done"))) break;
+            try dst.elements.append(self.gpa, try self.getProperty(r, "value"));
         }
-        return self.throwTypeError("value is not iterable");
     }
 
     // ---- iteration protocol ------------------------------------------------
@@ -3344,6 +3438,16 @@ fn nativeIterSelf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value
     _ = args;
     return this;
 }
+
+fn nativeGeneratorNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return castVm(ctx).generatorResume(this, argAt(args, 0), 0);
+}
+fn nativeGeneratorReturn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return castVm(ctx).generatorResume(this, argAt(args, 0), 1);
+}
+fn nativeGeneratorThrow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return castVm(ctx).generatorResume(this, argAt(args, 0), 2);
+}
 fn nativeIterableValues(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = args;
     return castVm(ctx).makeIterator(this, 0);
@@ -4912,6 +5016,80 @@ test "switch statements" {
         \\switch (1) { case 1: x += 1; case 2: x += 2; break; case 3: x += 100; }
         \\return x;
     ));
+}
+
+test "generators" {
+    // Basic yielding, consumed by for-of.
+    try testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\function* g() { yield 1; yield 2; yield 3; }
+        \\var sum = 0;
+        \\for (var x of g()) sum += x;
+        \\return sum;
+    ));
+    // Manual next().
+    try testing.expectEqual(@as(f64, 30), try evalNumber(
+        \\function* g() { yield 10; yield 20; }
+        \\var it = g();
+        \\return it.next().value + it.next().value;
+    ));
+    // done flag.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function* g() { yield 1; }
+        \\var it = g();
+        \\it.next();
+        \\return it.next().done ? 1 : 0;
+    ));
+    // Local state across yields (a loop inside the generator).
+    try testing.expectEqual(@as(f64, 10), try evalNumber(
+        \\function* range(n) { for (var i = 0; i < n; i++) yield i; }
+        \\var s = 0;
+        \\for (var x of range(5)) s += x;
+        \\return s;
+    ));
+    // Sent value: `x = yield v` receives next()'s argument.
+    try testing.expectEqual(@as(f64, 42), try evalNumber(
+        \\function* g() { var x = yield 1; return x; }
+        \\var it = g();
+        \\it.next();
+        \\return it.next(42).value;
+    ));
+    // return value becomes the final {value, done:true}.
+    try testing.expectEqual(@as(f64, 99), try evalNumber(
+        \\function* g() { yield 1; return 99; }
+        \\var it = g();
+        \\it.next();
+        \\return it.next().value;
+    ));
+    // yield* delegation.
+    try testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\function* inner() { yield 1; yield 2; }
+        \\function* outer() { yield 0; yield* inner(); yield 3; }
+        \\var s = 0;
+        \\for (var x of outer()) s += x;
+        \\return s;
+    ));
+    // Generators are spreadable.
+    try testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\function* g() { yield 1; yield 2; yield 3; }
+        \\return [...g()].length;
+    ));
+}
+
+test "generators under GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\function* fib() {
+        \\  var a = 0, b = 1;
+        \\  while (true) { yield a; var t = a + b; a = b; b = t; }
+        \\}
+        \\var it = fib();
+        \\var sum = 0;
+        \\for (var i = 0; i < 10; i++) sum += it.next().value;
+        \\return sum;
+    );
+    try testing.expectEqual(@as(f64, 88), v.asNumber()); // 0+1+1+2+3+5+8+13+21+34
 }
 
 test "iteration protocol" {

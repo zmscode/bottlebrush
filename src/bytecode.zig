@@ -137,6 +137,7 @@ pub const CodeBlock = struct {
     name: []const u8,
     num_params: u32 = 0,
     num_registers: u32 = 0,
+    is_generator: bool = false,
     /// Slots in this block's own environment record.
     num_env_slots: u32 = 0,
     code: []Inst = &.{},

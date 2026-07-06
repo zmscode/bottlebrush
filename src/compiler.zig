@@ -46,6 +46,7 @@ const Block = struct {
 const FnState = struct {
     parent: ?*FnState,
     name: []const u8,
+    is_generator: bool = false,
     num_params: u32 = 0,
     env_slot_count: u32 = 0,
     reg_top: u32 = 0,
@@ -203,9 +204,10 @@ pub const Compiler = struct {
         params: []*Node,
         body: *Node,
         is_expression_body: bool,
+        is_generator: bool,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
-        var fs = FnState{ .parent = parent_fs, .name = name };
+        var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator };
         const prev = self.fs;
         self.fs = &fs;
         defer self.fs = prev;
@@ -252,7 +254,7 @@ pub const Compiler = struct {
         for (body) |stmt| {
             if (stmt.kind == .function_decl) {
                 const f = stmt.kind.function_decl;
-                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, self.fs);
+                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, self.fs);
                 const idx: u32 = @intCast(self.fs.children.items.len);
                 try self.fs.children.append(self.gpa, child);
                 const r = self.allocReg();
@@ -271,6 +273,7 @@ pub const Compiler = struct {
             .num_params = fs.num_params,
             .num_registers = fs.max_regs,
             .num_env_slots = fs.env_slot_count,
+            .is_generator = fs.is_generator,
             .code = try self.arena.dupe(Inst, fs.code.items),
             .constants = try self.dupeConstants(fs.constants.items),
             .children = try self.arena.dupe(*bc.CodeBlock, fs.children.items),
@@ -716,6 +719,7 @@ pub const Compiler = struct {
             },
             .call => |c| try self.compileCall(dst, c, node.start),
             .function => |f| try self.compileFunctionExpr(dst, f),
+            .yield_expr => |y| try self.compileYield(dst, y),
             else => return self.fail("unsupported expression", node.start),
         }
     }
@@ -1058,12 +1062,60 @@ pub const Compiler = struct {
         self.freeTo(base);
     }
 
+    fn compileYield(self: *Compiler, dst: u32, y: anytype) CompileError!void {
+        if (y.delegate) return self.compileYieldStar(dst, y);
+        const val_reg = self.allocReg();
+        if (y.argument) |arg| {
+            try self.compileExprInto(val_reg, arg);
+        } else {
+            _ = try self.emit(.{ .op = .load_undefined, .a = val_reg });
+        }
+        // Yields regs[val_reg]; on resume, regs[dst] receives the sent value.
+        _ = try self.emit(.{ .op = .gen_yield, .a = dst, .b = val_reg });
+        self.freeTo(val_reg);
+    }
+
+    /// `yield* iterable`: yield every value the inner iterable produces, then
+    /// evaluate to its final `{done:true}` value. (Sent values and throw/return
+    /// are not forwarded into the inner iterator yet.)
+    fn compileYieldStar(self: *Compiler, dst: u32, y: anytype) CompileError!void {
+        const iter_reg = self.allocReg();
+        {
+            const src_reg = self.allocReg();
+            try self.compileExprInto(src_reg, y.argument.?);
+            _ = try self.emit(.{ .op = .iter_init, .a = iter_reg, .b = src_reg });
+            self.freeTo(src_reg + 1);
+        }
+        const result_reg = self.allocReg();
+        const top = self.here();
+        _ = try self.emit(.{ .op = .iter_next, .a = result_reg, .b = iter_reg });
+        const done_reg = self.allocReg();
+        const done_name = try self.addConst(.{ .string = "done" });
+        _ = try self.emit(.{ .op = .get_prop, .a = done_reg, .b = result_reg, .c = done_name });
+        const jdone = try self.emit(.{ .op = .jump_if_true, .a = done_reg });
+        self.freeTo(result_reg + 1);
+
+        const val_reg = self.allocReg();
+        const value_name = try self.addConst(.{ .string = "value" });
+        _ = try self.emit(.{ .op = .get_prop, .a = val_reg, .b = result_reg, .c = value_name });
+        const scratch = self.allocReg();
+        _ = try self.emit(.{ .op = .gen_yield, .a = scratch, .b = val_reg });
+        self.freeTo(val_reg);
+        _ = try self.emit(.{ .op = .jump, .a = top });
+
+        self.patchTarget(jdone, self.here());
+        // dst = result.value (the completion value of the delegated iterator)
+        _ = try self.emit(.{ .op = .get_prop, .a = dst, .b = result_reg, .c = value_name });
+        self.freeTo(iter_reg);
+    }
+
     fn compileFunctionExpr(self: *Compiler, dst: u32, f: ast.Function) CompileError!void {
         const child = try self.compileFunction(
             f.name orelse "",
             f.params,
             f.body,
             f.flags.expression_body,
+            f.flags.is_generator,
             self.fs,
         );
         const idx: u32 = @intCast(self.fs.children.items.len);
@@ -1238,7 +1290,7 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
     const dummy_body = try c.arena.create(Node);
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
-    const root = c.compileFunction("<script>", &.{}, dummy_body, false, null) catch |e| switch (e) {
+    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;
