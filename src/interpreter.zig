@@ -60,6 +60,11 @@ pub const Vm = struct {
     arraybuffer_proto: ?*gc.Object = null,
     typed_array_proto: ?*gc.Object = null,
     dataview_proto: ?*gc.Object = null,
+    symbol_proto: ?*gc.Object = null,
+    /// Global symbol registry (Symbol.for / Symbol.keyFor).
+    symbol_registry: std.ArrayList(SymbolReg) = .empty,
+
+    const SymbolReg = struct { key: []u8, sym: *gc.Symbol };
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -67,6 +72,8 @@ pub const Vm = struct {
     pub fn deinit(self: *Vm) void {
         self.frames.deinit(self.gpa);
         self.temp_roots.deinit(self.gpa);
+        for (self.symbol_registry.items) |r| self.gpa.free(r.key);
+        self.symbol_registry.deinit(self.gpa);
         self.heap.deinit();
     }
 
@@ -91,6 +98,8 @@ pub const Vm = struct {
         if (self.arraybuffer_proto) |o| tracer.mark(&o.gc);
         if (self.typed_array_proto) |o| tracer.mark(&o.gc);
         if (self.dataview_proto) |o| tracer.mark(&o.gc);
+        if (self.symbol_proto) |o| tracer.mark(&o.gc);
+        for (self.symbol_registry.items) |r| tracer.mark(&r.sym.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -507,6 +516,27 @@ pub const Vm = struct {
         try self.defineData(dv_proto, "constructor", Value.fromObject(dv_ctor), true, false, true);
         try self.defineData(global, "DataView", Value.fromObject(dv_ctor), true, false, true);
 
+        // ---- Symbol ----
+        const symbol_proto = try self.newObject(self.object_proto);
+        self.symbol_proto = symbol_proto;
+        try self.defineMethod(symbol_proto, "toString", nativeSymbolToString, 0);
+        try self.defineMethod(symbol_proto, "valueOf", nativeSymbolValueOf, 0);
+        try self.defineGetter(symbol_proto, "description", nativeSymbolDescription);
+        const symbol_ctor = try self.makeNative("Symbol", nativeSymbol, 0);
+        try self.defineData(symbol_ctor, "prototype", Value.fromObject(symbol_proto), false, false, false);
+        try self.defineData(symbol_proto, "constructor", Value.fromObject(symbol_ctor), true, false, true);
+        try self.defineMethod(symbol_ctor, "for", nativeSymbolFor, 1);
+        try self.defineMethod(symbol_ctor, "keyFor", nativeSymbolKeyFor, 1);
+        const well_known = [_][]const u8{
+            "iterator",  "asyncIterator", "hasInstance", "isConcatSpreadable",
+            "match",     "replace",       "search",      "split",
+            "species",   "toPrimitive",   "toStringTag", "unscopables",
+        };
+        inline for (well_known) |name| {
+            try self.defineData(symbol_ctor, name, try self.makeSymbol("Symbol." ++ name), false, false, false);
+        }
+        try self.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
+
         // ---- JSON ----
         const json = try self.newObject(self.object_proto);
         try self.defineMethod(json, "stringify", nativeJSONStringify, 3);
@@ -921,6 +951,7 @@ pub const Vm = struct {
             }
             // Number/boolean primitives: consult their prototype.
             if (base.isNumber()) return self.getFromProto(self.number_proto, base, key);
+            if (base.isSymbol()) return self.getFromProto(self.symbol_proto, base, key);
             return Value.undefined_value;
         }
         // Array exotic own access (length + dense elements).
@@ -1079,6 +1110,14 @@ pub const Vm = struct {
         if (v.isString()) {
             return utf16ToUtf8Alloc(self.gpa, v.asString().units);
         }
+        if (v.isSymbol()) {
+            // Encode a symbol as a NUL-prefixed internal key (by identity), so
+            // symbol-keyed properties reuse the string map but stay out of
+            // string enumeration (which skips NUL-prefixed keys).
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "\x00S{x}", .{@intFromPtr(v.asSymbol())}) catch unreachable;
+            return self.gpa.dupe(u8, s);
+        }
         var buf: [64]u8 = undefined;
         const s = self.primitiveToUtf8(v, &buf) catch "?";
         return self.gpa.dupe(u8, s);
@@ -1128,6 +1167,18 @@ pub const Vm = struct {
         const s = try self.heap.create(gc.String);
         s.units = try self.gpa.dupe(u16, units);
         return Value.fromString(s);
+    }
+
+    fn makeSymbol(self: *Vm, description: ?[]const u8) Error!Value {
+        self.maybeStress();
+        const s = try self.heap.create(gc.Symbol);
+        if (description) |d| {
+            s.description = std.unicode.utf8ToUtf16LeAlloc(self.gpa, d) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidUtf8 => try self.gpa.alloc(u16, 0),
+            };
+        }
+        return Value.fromSymbol(s);
     }
 
     // ---- coercions ---------------------------------------------------------
@@ -2195,7 +2246,9 @@ fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) 
     var it = obj.properties.iterator();
     while (it.next()) |entry| {
         if (!entry.value_ptr.enumerable) continue;
-        try out.append(vm.gpa, try vm.gpa.dupe(u8, entry.key_ptr.*));
+        const k = entry.key_ptr.*;
+        if (k.len > 0 and k[0] == 0) continue; // internal slots + symbol keys
+        try out.append(vm.gpa, try vm.gpa.dupe(u8, k));
     }
 }
 
@@ -3639,6 +3692,82 @@ fn dataViewSet(comptime T: type, comptime is_float: bool, comptime single_byte: 
     }.call;
 }
 
+// ---- Symbol built-ins ------------------------------------------------------
+
+fn nativeSymbol(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    // Symbol is not a constructor.
+    if (this.isObject() and this.asObject().prototype == vm.symbol_proto) {
+        return vm.throwTypeError("Symbol is not a constructor");
+    }
+    const desc_v = argAt(args, 0);
+    if (desc_v.isUndefined()) return vm.makeSymbol(null);
+    const s = try vm.toStringVal(desc_v);
+    try vm.protect(s);
+    defer vm.unprotect();
+    const utf8 = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
+    defer vm.gpa.free(utf8);
+    return vm.makeSymbol(utf8);
+}
+
+fn nativeSymbolToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isSymbol()) return vm.throwTypeError("Symbol.prototype.toString called on non-symbol");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.gpa);
+    try buf.appendSlice(vm.gpa, "Symbol(");
+    if (this.asSymbol().description) |d| {
+        const utf8 = try utf16ToUtf8Alloc(vm.gpa, d);
+        defer vm.gpa.free(utf8);
+        try buf.appendSlice(vm.gpa, utf8);
+    }
+    try buf.append(vm.gpa, ')');
+    return vm.makeString(buf.items);
+}
+
+fn nativeSymbolValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isSymbol()) return vm.throwTypeError("Symbol.prototype.valueOf called on non-symbol");
+    return this;
+}
+
+fn nativeSymbolDescription(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isSymbol()) return vm.throwTypeError("Symbol.prototype.description called on non-symbol");
+    if (this.asSymbol().description) |d| return vm.makeStringFromUtf16(d);
+    return Value.undefined_value;
+}
+
+fn nativeSymbolFor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const s = try vm.toStringVal(argAt(args, 0));
+    try vm.protect(s);
+    defer vm.unprotect();
+    const key = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
+    defer vm.gpa.free(key);
+    for (vm.symbol_registry.items) |r| {
+        if (std.mem.eql(u8, r.key, key)) return Value.fromSymbol(r.sym);
+    }
+    const sym_val = try vm.makeSymbol(key);
+    try vm.symbol_registry.append(vm.gpa, .{ .key = try vm.gpa.dupe(u8, key), .sym = sym_val.asSymbol() });
+    return sym_val;
+}
+
+fn nativeSymbolKeyFor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const s = argAt(args, 0);
+    if (!s.isSymbol()) return vm.throwTypeError("Symbol.keyFor requires a symbol argument");
+    for (vm.symbol_registry.items) |r| {
+        if (r.sym == s.asSymbol()) return vm.makeString(r.key);
+    }
+    return Value.undefined_value;
+}
+
 fn clampIndex(n: f64, len: i64) i64 {
     if (std.math.isNan(n) or n < 0) return 0;
     if (n > @as(f64, @floatFromInt(len))) return len;
@@ -4252,6 +4381,47 @@ test "TypedArrays under GC stress" {
         \\return total;
     );
     try testing.expectEqual(@as(f64, 45), v.asNumber()); // 0+1+...+9
+}
+
+test "Symbol" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return typeof Symbol() === 'symbol' ? 1 : 0;"));
+    // Each Symbol is unique.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return (Symbol('x') === Symbol('x')) ? 0 : 1;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("var s = Symbol('desc'); return s === s ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return Symbol('hi').toString() === 'Symbol(hi)' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return Symbol('hi').description === 'hi' ? 1 : 0;"));
+    // Symbol.for registry.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return (Symbol.for('k') === Symbol.for('k')) ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return Symbol.keyFor(Symbol.for('key')) === 'key' ? 1 : 0;"));
+    // Well-known symbols exist.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return typeof Symbol.iterator === 'symbol' ? 1 : 0;"));
+}
+
+test "Symbol-keyed properties" {
+    // Symbol keys work and are distinct from string keys.
+    try testing.expectEqual(@as(f64, 42), try evalNumber(
+        \\var s = Symbol('k');
+        \\var o = {};
+        \\o[s] = 42;
+        \\return o[s];
+    ));
+    // Symbol keys are excluded from Object.keys / for-in / JSON.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { a: 1 };
+        \\o[Symbol('hidden')] = 99;
+        \\return (Object.keys(o).length === 1 && Object.keys(o)[0] === 'a') ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { a: 1 };
+        \\o[Symbol.iterator] = 5;
+        \\return JSON.stringify(o) === '{"a":1}' ? 1 : 0;
+    ));
+    // Well-known symbols usable as keys, retrievable.
+    try testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\var o = {};
+        \\o[Symbol.iterator] = 7;
+        \\return o[Symbol.iterator];
+    ));
 }
 
 test "DataView" {
