@@ -541,7 +541,7 @@ pub const Compiler = struct {
             },
             .bool_literal => |b| _ = try self.emit(.{ .op = if (b) .load_true else .load_false, .a = dst }),
             .null_literal => _ = try self.emit(.{ .op = .load_null, .a = dst }),
-            .this_expr => _ = try self.emit(.{ .op = .load_undefined, .a = dst }), // Phase 2: this = undefined
+            .this_expr => _ = try self.emit(.{ .op = .load_this, .a = dst }),
             .ident => |name| try self.compileIdentLoad(dst, name, node.start),
             .binary => |b| try self.compileBinary(dst, b),
             .logical => |b| try self.compileLogical(dst, b),
@@ -549,6 +549,9 @@ pub const Compiler = struct {
             .update => |u| try self.compileUpdate(dst, u, node.start),
             .assignment => |a| try self.compileAssignment(dst, a, node.start),
             .conditional => |c| try self.compileConditional(dst, c),
+            .member => |m| try self.compileMemberLoad(dst, m),
+            .new_expr => |n| try self.compileNew(dst, n, node.start),
+            .object_literal => |props| try self.compileObjectLiteral(dst, props, node.start),
             .sequence => |exprs| {
                 for (exprs, 0..) |e, i| {
                     if (i + 1 < exprs.len) {
@@ -638,7 +641,10 @@ pub const Compiler = struct {
     }
 
     fn compileAssignment(self: *Compiler, dst: u32, a: anytype, pos: u32) CompileError!void {
-        if (a.target.kind != .ident) return self.fail("assignment target must be an identifier", pos);
+        if (a.target.kind == .member) {
+            return self.compileMemberStore(dst, a, pos);
+        }
+        if (a.target.kind != .ident) return self.fail("assignment target must be an identifier or member", pos);
         const name = a.target.kind.ident;
         const bind = self.resolve(name) orelse return self.fail("undeclared identifier", pos);
 
@@ -656,6 +662,90 @@ pub const Compiler = struct {
         _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = dst });
     }
 
+    fn compileMemberStore(self: *Compiler, dst: u32, a: anytype, pos: u32) CompileError!void {
+        if (a.op != .assign) return self.fail("compound member assignment unsupported", pos);
+        const m = a.target.kind.member;
+        const objreg = self.allocReg();
+        try self.compileExprInto(objreg, m.object);
+        if (m.computed) {
+            const keyreg = self.allocReg();
+            try self.compileExprInto(keyreg, m.property);
+            try self.compileExprInto(dst, a.value);
+            _ = try self.emit(.{ .op = .set_elem, .a = objreg, .b = keyreg, .c = dst });
+        } else {
+            const name_idx = try self.propNameConst(m.property);
+            try self.compileExprInto(dst, a.value);
+            _ = try self.emit(.{ .op = .set_prop, .a = objreg, .b = name_idx, .c = dst });
+        }
+        self.freeTo(objreg);
+    }
+
+    fn compileMemberLoad(self: *Compiler, dst: u32, m: anytype) CompileError!void {
+        if (m.optional) return self.fail("optional chaining unsupported", 0);
+        const objreg = self.allocReg();
+        try self.compileExprInto(objreg, m.object);
+        if (m.computed) {
+            const keyreg = self.allocReg();
+            try self.compileExprInto(keyreg, m.property);
+            _ = try self.emit(.{ .op = .get_elem, .a = dst, .b = objreg, .c = keyreg });
+        } else {
+            const name_idx = try self.propNameConst(m.property);
+            _ = try self.emit(.{ .op = .get_prop, .a = dst, .b = objreg, .c = name_idx });
+        }
+        self.freeTo(objreg);
+    }
+
+    fn compileNew(self: *Compiler, dst: u32, n: anytype, pos: u32) CompileError!void {
+        const base = self.allocReg();
+        try self.compileExprInto(base, n.callee);
+        for (n.args) |arg| {
+            if (arg.kind == .spread) return self.fail("spread arguments unsupported", pos);
+            const ar = self.allocReg();
+            try self.compileExprInto(ar, arg);
+        }
+        _ = try self.emit(.{ .op = .construct, .a = dst, .b = base, .c = @intCast(n.args.len) });
+        self.freeTo(base);
+    }
+
+    fn compileObjectLiteral(self: *Compiler, dst: u32, props: []*Node, pos: u32) CompileError!void {
+        _ = try self.emit(.{ .op = .new_object, .a = dst });
+        for (props) |p| {
+            const prop = p.kind.property;
+            switch (prop.kind) {
+                .spread => return self.fail("object spread unsupported", pos),
+                .get, .set => return self.fail("object literal accessors unsupported", pos),
+                .init, .method => {},
+            }
+            const value = prop.value orelse return self.fail("invalid object property", pos);
+            if (prop.computed) {
+                const keyreg = self.allocReg();
+                try self.compileExprInto(keyreg, prop.key);
+                const valreg = self.allocReg();
+                try self.compileExprInto(valreg, value);
+                _ = try self.emit(.{ .op = .set_elem, .a = dst, .b = keyreg, .c = valreg });
+                self.freeTo(keyreg);
+            } else {
+                const name_idx = try self.propNameConst(prop.key);
+                const valreg = self.allocReg();
+                try self.compileExprInto(valreg, value);
+                _ = try self.emit(.{ .op = .set_prop, .a = dst, .b = name_idx, .c = valreg });
+                self.freeTo(valreg);
+            }
+        }
+    }
+
+    /// A constant-pool index for a non-computed property name.
+    fn propNameConst(self: *Compiler, key: *Node) CompileError!u32 {
+        const name: []const u8 = switch (key.kind) {
+            .ident => |n| n,
+            .private_name => |n| n,
+            .string => |raw| try self.cookString(raw),
+            .number => |num| num.raw,
+            else => return self.fail("unsupported property key", key.start),
+        };
+        return self.addConst(.{ .string = name });
+    }
+
     fn compileConditional(self: *Compiler, dst: u32, c: anytype) CompileError!void {
         const cr = self.allocReg();
         try self.compileExprInto(cr, c.cond);
@@ -670,17 +760,35 @@ pub const Compiler = struct {
 
     fn compileCall(self: *Compiler, dst: u32, c: anytype, pos: u32) CompileError!void {
         if (c.optional) return self.fail("optional call unsupported", pos);
-        // Compile callee + args into fresh contiguous registers at the top.
+        // Call layout: base=receiver (this), base+1=callee, base+2..=args.
         const base = self.allocReg();
-        try self.compileExprInto(base, c.callee);
+        if (c.callee.kind == .member and !c.callee.kind.member.optional) {
+            // Method call: receiver is the object; callee is obj.prop.
+            const m = c.callee.kind.member;
+            try self.compileExprInto(base, m.object);
+            const funcreg = self.allocReg(); // base+1
+            if (m.computed) {
+                const keyreg = self.allocReg(); // base+2 (temporary)
+                try self.compileExprInto(keyreg, m.property);
+                _ = try self.emit(.{ .op = .get_elem, .a = funcreg, .b = base, .c = keyreg });
+                self.freeTo(funcreg + 1); // free keyreg; keep receiver + callee
+            } else {
+                const name_idx = try self.propNameConst(m.property);
+                _ = try self.emit(.{ .op = .get_prop, .a = funcreg, .b = base, .c = name_idx });
+            }
+        } else {
+            // Plain call: receiver is undefined.
+            _ = try self.emit(.{ .op = .load_undefined, .a = base });
+            const funcreg = self.allocReg(); // base+1
+            try self.compileExprInto(funcreg, c.callee);
+        }
+        // Arguments at base+2, base+3, ...
         for (c.args) |arg| {
             if (arg.kind == .spread) return self.fail("spread arguments unsupported", pos);
             const ar = self.allocReg();
             try self.compileExprInto(ar, arg);
         }
-        _ = try self.emit(.{ .op = .call, .a = base, .b = base, .c = @intCast(c.args.len) });
-        // Result is in `base`; move to dst and free the call region.
-        if (base != dst) _ = try self.emit(.{ .op = .move, .a = dst, .b = base });
+        _ = try self.emit(.{ .op = .call, .a = dst, .b = base, .c = @intCast(c.args.len) });
         self.freeTo(base);
     }
 
@@ -925,15 +1033,16 @@ test "compiles control flow and functions" {
 }
 
 test "reports unsupported constructs" {
+    const src = "var [a, b] = arr;"; // destructuring declarations not yet supported
     const parser = @import("parser.zig");
-    var pr = try parser.parse(testing.allocator, "var o = { a: 1 };", .script);
+    var pr = try parser.parse(testing.allocator, src, .script);
     switch (pr) {
         .syntax_error => return error.ParseFailed,
         .ok => |*a| {
             defer a.deinit();
-            var r = try compile(testing.allocator, a.root, "var o = { a: 1 };");
+            var r = try compile(testing.allocator, a.root, src);
             switch (r) {
-                .compile_error => {}, // objects not yet supported -> expected
+                .compile_error => {}, // destructuring not yet supported -> expected
                 .ok => |*p| {
                     p.deinit();
                     return error.ExpectedCompileError;

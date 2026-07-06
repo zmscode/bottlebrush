@@ -6,33 +6,36 @@ driven by [Test262](https://github.com/tc39/test262) conformance from day one.
 See [plan.md](plan.md) for the architecture and [phase/](phase/) for the
 per-phase build plans.
 
-## Status: Phase 2 — Bytecode compiler & interpreter
+## Status: Phase 3 — Object model (in progress)
 
-The engine **executes**. Source compiles to register-based bytecode and runs on
-the interpreter: arithmetic, variables, control flow, functions, recursion, and
-closures all work (`zig build run` runs a demo). Objects, arrays, and the
-standard library arrive next, which is what unlocks Test262 *positive* scoring.
+Objects work. The engine now has a real object model — prototypes, property
+descriptors, member access, `this`, `new`, method calls, and coercion via
+`ToPrimitive`/`valueOf`/`toString` — all exercised under GC stress. `zig build
+run` runs a constructor + prototype-method + method-chaining demo.
 
-- **Value** (`src/value.zig`) — tagged-union `Value` behind a stable accessor
-  API (NaN-boxing swaps in later, Phase 7).
-- **GC** (`src/gc.zig`, `src/handle.zig`) — precise mark-sweep with `Environment`
-  and `Closure` cells, a `trace` interface, and a `stress` mode the VM honors.
+Remaining for Phase 3: a global object, the `Object` built-in and error
+constructors, and wiring the real Test262 `assert.js` harness — which is what
+flips Test262 *positive* tests from SKIP to scored.
+
+Earlier phases (all complete):
+
+- **Value** (`src/value.zig`) — tagged-union `Value` behind a stable accessor API.
+- **GC** (`src/gc.zig`) — precise mark-sweep with `Environment`, `Closure`, and
+  property-bearing `Object` cells; a `trace` interface and a `stress` mode.
 - **Lexer / Parser / AST** (`src/{token,lexer,parser,ast}.zig`) — full front end.
-- **Bytecode** (`src/bytecode.zig`) — register-based ops, `CodeBlock`, disassembler.
-- **Compiler** (`src/compiler.zig`) — AST → bytecode: scope analysis, var
-  hoisting, stack-discipline register allocation, control flow via jumps,
-  functions/closures.
-- **Interpreter** (`src/interpreter.zig`) — dispatch loop, coercions, equality,
-  calls (native-stack recursion, depth-guarded), and try/catch exception
-  unwinding via handler tables. The VM is a GC root provider.
-- **Test262 harness** (`test262/`) — parse-phase negatives are scored (100% of
-  the fixture slice). Positive tests still SKIP pending objects + the harness.
+- **Bytecode / Compiler / Interpreter** — register-based VM with scope analysis,
+  var hoisting, control flow, functions/closures, and now objects: property
+  get/set (dot + computed), object literals, `this`, `new`/construct, method
+  calls, prototype chains, and `ToPrimitive` coercion. GC-safe under stress via
+  frame roots + a temp-root stack for unrooted intermediates.
+- **Test262 harness** (`test262/`) — parse-phase negatives scored (100% of the
+  fixture slice). Positive tests still SKIP pending the global object + harness.
 
-**Phase-2 simplifications** (documented inline, tightened later): one
-environment per function (no per-iteration `let` bindings, no TDZ enforcement),
-`this` is `undefined`, engine-thrown errors are strings (real `Error` objects
-need the object model), and objects/arrays/member-access/`new`/destructuring/
-generators are reported as unsupported by the compiler for now.
+**Simplifications** (documented inline, tightened later): one environment per
+function (no per-iteration `let`, no TDZ), symbol keys / arrays / accessors-in-
+object-literals / destructuring / generators not yet supported, engine-thrown
+errors are strings pending real `Error` objects, and there is no global object
+yet (top-level bindings use the environment chain).
 
 ## Requirements
 

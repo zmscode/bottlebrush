@@ -27,34 +27,69 @@ const Frame = struct {
     code: *const bc.CodeBlock,
     env: *gc.Environment,
     regs: []Value,
+    this_value: Value,
 };
 
 pub const Vm = struct {
     gpa: std.mem.Allocator,
     heap: gc.Heap,
     frames: std.ArrayList(*Frame) = .empty,
+    /// Values held alive across GC-triggering steps that aren't yet in a
+    /// register or frame (e.g. a freshly-`new`ed `this` before the constructor
+    /// frame exists). Push with `protect`, pop with `unprotect`.
+    temp_roots: std.ArrayList(Value) = .empty,
     pending_exception: ?Value = null,
     depth: u32 = 0,
+    // Realm intrinsics (created lazily by `bootstrap`).
+    object_proto: ?*gc.Object = null,
+    function_proto: ?*gc.Object = null,
+    global_object: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
     }
     pub fn deinit(self: *Vm) void {
         self.frames.deinit(self.gpa);
+        self.temp_roots.deinit(self.gpa);
         self.heap.deinit();
     }
 
     /// GC root provider. Marks all reachable roots held by the VM.
     pub fn markRoots(self: *const Vm, tracer: *gc.Tracer) void {
         if (self.pending_exception) |e| e.mark(tracer);
+        if (self.object_proto) |o| tracer.mark(&o.gc);
+        if (self.function_proto) |o| tracer.mark(&o.gc);
+        if (self.global_object) |o| tracer.mark(&o.gc);
+        for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
+            f.this_value.mark(tracer);
             for (f.regs) |v| v.mark(tracer);
         }
     }
 
+    fn protect(self: *Vm, v: Value) Error!void {
+        try self.temp_roots.append(self.gpa, v);
+    }
+    fn unprotect(self: *Vm) void {
+        _ = self.temp_roots.pop();
+    }
+
     fn maybeStress(self: *Vm) void {
         if (self.heap.stress) _ = self.heap.collect(self);
+    }
+
+    /// Create the base intrinsics if they don't exist yet.
+    fn bootstrap(self: *Vm) Error!void {
+        if (self.object_proto != null) return;
+        const obj_proto = try self.heap.create(gc.Object); // [[Prototype]] = null
+        self.object_proto = obj_proto;
+        const fn_proto = try self.heap.create(gc.Object);
+        fn_proto.prototype = obj_proto;
+        self.function_proto = fn_proto;
+        const global = try self.heap.create(gc.Object);
+        global.prototype = obj_proto;
+        self.global_object = global;
     }
 
     // ---- entry -------------------------------------------------------------
@@ -63,9 +98,10 @@ pub const Vm = struct {
     /// (the script's `return`, else undefined). On an uncaught throw returns
     /// `error.JsThrow` with `pending_exception` set.
     pub fn run(self: *Vm, program: *const bc.Program) Error!Value {
+        try self.bootstrap();
         const root = program.root;
         const env = try self.createEnv(null, root.num_env_slots);
-        return self.execute(root, env);
+        return self.execute(root, env, Value.fromObject(self.global_object.?));
     }
 
     fn createEnv(self: *Vm, parent: ?*gc.Environment, n: u32) Error!*gc.Environment {
@@ -84,19 +120,19 @@ pub const Vm = struct {
 
     const Step = union(enum) { advance, jumped, returned: Value };
 
-    fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment) Error!Value {
+    fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, this_value: Value) Error!Value {
         const regs = try self.gpa.alloc(Value, code.num_registers);
         defer self.gpa.free(regs);
         @memset(regs, Value.undefined_value);
 
-        var frame = Frame{ .code = code, .env = env, .regs = regs };
+        var frame = Frame{ .code = code, .env = env, .regs = regs, .this_value = this_value };
         try self.frames.append(self.gpa, &frame);
         defer _ = self.frames.pop();
 
         var pc: u32 = 0;
         while (true) {
             const inst = code.code[pc];
-            const step = self.exec(code, env, regs, inst, &pc) catch |e| {
+            const step = self.exec(code, env, regs, frame.this_value, inst, &pc) catch |e| {
                 if (e != error.JsThrow) return e;
                 if (self.findHandler(code, pc)) |h| {
                     regs[h.catch_reg] = self.pending_exception.?;
@@ -134,6 +170,7 @@ pub const Vm = struct {
         code: *const bc.CodeBlock,
         env: *gc.Environment,
         regs: []Value,
+        this_value: Value,
         inst: bc.Inst,
         pc: *u32,
     ) Error!Step {
@@ -199,11 +236,32 @@ pub const Vm = struct {
                 return .jumped;
             },
 
+            .new_object => regs[inst.a] = try self.newObjectValue(),
+            .get_prop => regs[inst.a] = try self.getProperty(regs[inst.b], code.constants[inst.c].string),
+            .set_prop => try self.setProperty(regs[inst.a], code.constants[inst.b].string, regs[inst.c]),
+            .get_elem => {
+                const key = try self.toPropertyKey(regs[inst.c]);
+                defer self.gpa.free(key);
+                regs[inst.a] = try self.getProperty(regs[inst.b], key);
+            },
+            .set_elem => {
+                const key = try self.toPropertyKey(regs[inst.b]);
+                defer self.gpa.free(key);
+                try self.setProperty(regs[inst.a], key, regs[inst.c]);
+            },
+            .load_this => regs[inst.a] = this_value,
+
             .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env),
             .call => {
+                const receiver = regs[inst.b];
+                const callee = regs[inst.b + 1];
+                const args = regs[inst.b + 2 .. inst.b + 2 + inst.c];
+                regs[inst.a] = try self.callValue(callee, receiver, args);
+            },
+            .construct => {
                 const callee = regs[inst.b];
                 const args = regs[inst.b + 1 .. inst.b + 1 + inst.c];
-                regs[inst.a] = try self.callValue(callee, args);
+                regs[inst.a] = try self.constructValue(callee, args);
             },
             .ret => return Step{ .returned = regs[inst.a] },
 
@@ -233,12 +291,19 @@ pub const Vm = struct {
         const clo = try self.heap.create(gc.Closure);
         clo.code = child;
         clo.env = env;
-        const obj = try self.heap.create(gc.Object);
-        obj.callable = clo;
-        return Value.fromObject(obj);
+        const fn_obj = try self.heap.create(gc.Object);
+        fn_obj.callable = clo;
+        fn_obj.prototype = self.function_proto;
+        // Every ordinary function gets a `prototype` object with a back-
+        // reference, so `new f()` has a prototype to inherit from.
+        const proto = try self.heap.create(gc.Object);
+        proto.prototype = self.object_proto;
+        try self.defineData(fn_obj, "prototype", Value.fromObject(proto), true, false, false);
+        try self.defineData(proto, "constructor", Value.fromObject(fn_obj), true, false, true);
+        return Value.fromObject(fn_obj);
     }
 
-    fn callValue(self: *Vm, callee: Value, args: []const Value) Error!Value {
+    fn callValue(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!Value {
         if (!callee.isObject() or callee.asObject().callable == null) {
             return self.throwTypeError("value is not a function");
         }
@@ -253,7 +318,116 @@ pub const Vm = struct {
         while (i < code.num_params) : (i += 1) {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
         }
-        return self.execute(code, env);
+        return self.execute(code, env, this_value);
+    }
+
+    /// The `new` operator: create an ordinary object inheriting the
+    /// constructor's `prototype`, run the constructor with it as `this`, and
+    /// return the constructor's object result or that object.
+    fn constructValue(self: *Vm, callee: Value, args: []const Value) Error!Value {
+        if (!callee.isObject() or callee.asObject().callable == null) {
+            return self.throwTypeError("value is not a constructor");
+        }
+        const proto_val = try self.getProperty(callee, "prototype");
+        const this_obj = try self.newObject(if (proto_val.isObject()) proto_val.asObject() else self.object_proto);
+        // Root `this` across the constructor call (its frame doesn't exist yet).
+        try self.protect(Value.fromObject(this_obj));
+        defer self.unprotect();
+        const result = try self.callValue(callee, Value.fromObject(this_obj), args);
+        return if (result.isObject()) result else Value.fromObject(this_obj);
+    }
+
+    // ---- object model ------------------------------------------------------
+
+    fn newObject(self: *Vm, prototype: ?*gc.Object) Error!*gc.Object {
+        self.maybeStress();
+        const o = try self.heap.create(gc.Object);
+        o.prototype = prototype;
+        return o;
+    }
+    fn newObjectValue(self: *Vm) Error!Value {
+        return Value.fromObject(try self.newObject(self.object_proto));
+    }
+
+    /// Define an own data property with explicit attributes (key is duplicated).
+    fn defineData(self: *Vm, obj: *gc.Object, key: []const u8, value: Value, w: bool, e: bool, c: bool) Error!void {
+        const gop = try obj.properties.getOrPut(self.gpa, key);
+        if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, key);
+        gop.value_ptr.* = .{ .value = value, .writable = w, .enumerable = e, .configurable = c, .is_accessor = false };
+    }
+
+    /// [[Get]] on a value: walk the prototype chain; invoke getters.
+    fn getProperty(self: *Vm, base: Value, key: []const u8) Error!Value {
+        if (!base.isObject()) {
+            // Primitives: only `undefined`/`null` error; others have no props yet.
+            if (base.isNullish()) return self.throwTypeError("cannot read property of null or undefined");
+            return Value.undefined_value;
+        }
+        var obj: ?*gc.Object = base.asObject();
+        while (obj) |o| {
+            if (o.properties.getPtr(key)) |desc| {
+                if (desc.is_accessor) {
+                    const getter = desc.get orelse return Value.undefined_value;
+                    return self.callValue(getter, base, &.{});
+                }
+                return desc.value;
+            }
+            obj = o.prototype;
+        }
+        return Value.undefined_value;
+    }
+
+    /// [[Set]] on a value: honor setters and writability; create own data
+    /// property on the receiver otherwise.
+    fn setProperty(self: *Vm, base: Value, key: []const u8, value: Value) Error!void {
+        if (!base.isObject()) {
+            if (base.isNullish()) return self.throwTypeError("cannot set property of null or undefined");
+            return; // silent no-op on primitives (sloppy)
+        }
+        const receiver = base.asObject();
+        // Search prototype chain for an accessor or a non-writable data prop.
+        var obj: ?*gc.Object = receiver;
+        while (obj) |o| {
+            if (o.properties.getPtr(key)) |desc| {
+                if (desc.is_accessor) {
+                    const setter = desc.set orelse return; // no setter -> ignore (sloppy)
+                    _ = try self.callValue(setter, base, &.{value});
+                    return;
+                }
+                if (o == receiver) {
+                    if (!desc.writable) return; // sloppy: ignore
+                    desc.value = value;
+                    return;
+                }
+                if (!desc.writable) return; // inherited non-writable shadows
+                break;
+            }
+            obj = o.prototype;
+        }
+        try self.defineData(receiver, key, value, true, true, true);
+    }
+
+    fn toPropertyKey(self: *Vm, v: Value) Error![]u8 {
+        if (v.isString()) {
+            return utf16ToUtf8Alloc(self.gpa, v.asString().units);
+        }
+        var buf: [64]u8 = undefined;
+        const s = self.primitiveToUtf8(v, &buf) catch "?";
+        return self.gpa.dupe(u8, s);
+    }
+
+    /// ToPrimitive with a number hint: try valueOf then toString (spec 7.1.1
+    /// OrdinaryToPrimitive, number-hint order).
+    fn toPrimitive(self: *Vm, v: Value) Error!Value {
+        if (!v.isObject()) return v;
+        inline for (.{ "valueOf", "toString" }) |method_name| {
+            const method = try self.getProperty(v, method_name);
+            if (method.isObject() and method.asObject().callable != null) {
+                const result = try self.callValue(method, v, &.{});
+                if (!result.isObject()) return result;
+            }
+        }
+        return self.throwTypeError("cannot convert object to primitive value");
     }
 
     // ---- constant materialization ------------------------------------------
@@ -292,7 +466,7 @@ pub const Vm = struct {
             .string => |s| stringToNumber(s.units),
             .bigint => return self.throwTypeError("cannot convert a BigInt to a number"),
             .symbol => return self.throwTypeError("cannot convert a Symbol to a number"),
-            .object => std.math.nan(f64), // no ToPrimitive yet
+            .object => try self.toNumber(try self.toPrimitive(v)),
         };
     }
 
@@ -306,12 +480,23 @@ pub const Vm = struct {
     }
 
     fn opAdd(self: *Vm, l: Value, r: Value) Error!Value {
-        if (l.isString() or r.isString()) {
-            const ls = try self.toStringValue(l);
-            const rs = try self.toStringValue(r);
-            return self.concat(ls, rs);
+        const lp = try self.toPrimitive(l);
+        try self.protect(lp);
+        defer self.unprotect();
+        const rp = try self.toPrimitive(r);
+        try self.protect(rp);
+        defer self.unprotect();
+
+        if (lp.isString() or rp.isString()) {
+            const lsv = try self.toStringVal(lp);
+            try self.protect(lsv);
+            defer self.unprotect();
+            const rsv = try self.toStringVal(rp);
+            try self.protect(rsv);
+            defer self.unprotect();
+            return self.concat(lsv.asString().units, rsv.asString().units);
         }
-        return Value.fromNumber((try self.toNumber(l)) + (try self.toNumber(r)));
+        return Value.fromNumber((try self.toNumber(lp)) + (try self.toNumber(rp)));
     }
 
     fn concat(self: *Vm, a: []const u16, b: []const u16) Error!Value {
@@ -324,19 +509,14 @@ pub const Vm = struct {
         return Value.fromString(s);
     }
 
-    /// Returns UTF-16 units for a value (borrowing existing string storage, or
-    /// producing freshly-materialized units for primitives).
-    fn toStringValue(self: *Vm, v: Value) Error![]const u16 {
-        return switch (v) {
-            .string => |s| s.units,
-            else => {
-                var buf: [64]u8 = undefined;
-                const utf8 = self.primitiveToUtf8(v, &buf) catch "?";
-                // Materialize into a temporary heap string to get u16 units.
-                const sv = try self.makeString(utf8);
-                return sv.asString().units;
-            },
-        };
+    /// ToString as a string `Value` (so callers can root it). Objects go
+    /// through ToPrimitive(string) first.
+    fn toStringVal(self: *Vm, v: Value) Error!Value {
+        const p = if (v.isObject()) try self.toPrimitive(v) else v;
+        if (p.isString()) return p;
+        var buf: [64]u8 = undefined;
+        const utf8 = self.primitiveToUtf8(p, &buf) catch "?";
+        return self.makeString(utf8);
     }
 
     fn primitiveToUtf8(self: *Vm, v: Value, buf: []u8) ![]const u8 {
@@ -509,6 +689,13 @@ fn numberToString(n: f64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch "0";
 }
 
+fn utf16ToUtf8Alloc(gpa: std.mem.Allocator, units: []const u16) Error![]u8 {
+    return std.unicode.utf16LeToUtf8Alloc(gpa, units) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => try gpa.dupe(u8, ""),
+    };
+}
+
 fn compareUtf16(a: []const u16, b: []const u16) i32 {
     const n = @min(a.len, b.len);
     var i: usize = 0;
@@ -670,4 +857,69 @@ test "runs under GC stress" {
     );
     try testing.expect(v.isNumber());
     try testing.expectEqual(@as(f64, 14), v.asNumber());
+}
+
+test "object literals and member access" {
+    try testing.expectEqual(@as(f64, 3), try evalNumber("var o = { a: 1, b: 2 }; return o.a + o.b;"));
+    try testing.expectEqual(@as(f64, 5), try evalNumber("var o = {}; o.x = 5; return o.x;"));
+    try testing.expectEqual(@as(f64, 7), try evalNumber("var o = {}; o['k'] = 7; return o['k'];"));
+    try testing.expectEqual(@as(f64, 3), try evalNumber("var o = { a: { b: 3 } }; return o.a.b;"));
+    try testing.expectEqual(@as(f64, 0), try evalNumber("var o = {}; return o.missing === undefined ? 0 : 1;"));
+}
+
+test "methods and this" {
+    try testing.expectEqual(@as(f64, 10), try evalNumber(
+        \\var o = { x: 10, getX() { return this.x; } };
+        \\return o.getX();
+    ));
+    try testing.expectEqual(@as(f64, 30), try evalNumber(
+        \\var o = { a: 10, b: 20, sum: function() { return this.a + this.b; } };
+        \\return o.sum();
+    ));
+}
+
+test "new and constructors" {
+    try testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\function Point(x) { this.x = x; }
+        \\var p = new Point(5);
+        \\return p.x;
+    ));
+    try testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\function Box(v) { this.v = v; }
+        \\Box.prototype.get = function() { return this.v; };
+        \\var b = new Box(7);
+        \\return b.get();
+    ));
+    try testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\function Counter() { this.n = 0; }
+        \\Counter.prototype.inc = function() { this.n = this.n + 1; return this; };
+        \\var c = new Counter();
+        \\c.inc().inc().inc();
+        \\return c.n;
+    ));
+}
+
+test "object toString coercion in concatenation" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    const v = try eval(&vm,
+        \\var o = { toString: function() { return "hi"; } };
+        \\return o + "!";
+    );
+    try testing.expect(v.isString());
+    try testing.expectEqualSlices(u16, &[_]u16{ 'h', 'i', '!' }, v.asString().units);
+}
+
+test "objects under GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\function Node(v) { this.v = v; this.next = null; }
+        \\var head = new Node(1);
+        \\head.next = new Node(2);
+        \\head.next.next = new Node(3);
+        \\return head.v + head.next.v + head.next.next.v;
+    );
+    try testing.expectEqual(@as(f64, 6), v.asNumber());
 }

@@ -9,10 +9,12 @@ const std = @import("std");
 const bb = @import("bottlebrush");
 
 const demo =
-    \\function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
-    \\var total = 0;
-    \\for (var i = 0; i < 10; i++) total += fib(i);
-    \\return total;
+    \\function Counter(start) { this.n = start; }
+    \\Counter.prototype.inc = function() { this.n = this.n + 1; return this; };
+    \\var c = new Counter(10);
+    \\c.inc().inc().inc();
+    \\var obj = { label: "count", value: c.n };
+    \\return obj.value;
 ;
 
 pub fn main() !void {

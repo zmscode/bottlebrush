@@ -52,15 +52,50 @@ pub const String = struct {
     pub fn trace(_: *String, _: *Tracer) void {}
 };
 
+/// A property descriptor (data or accessor). Absent accessor fields default to
+/// null; `is_accessor` selects between the data (`value`/`writable`) and
+/// accessor (`get`/`set`) shapes.
+pub const PropertyDescriptor = struct {
+    value: Value = Value.undefined_value,
+    get: ?Value = null,
+    set: ?Value = null,
+    writable: bool = true,
+    enumerable: bool = true,
+    configurable: bool = true,
+    is_accessor: bool = false,
+};
+
+/// Ordered map of own properties (insertion order drives enumeration). Keys are
+/// UTF-8, owned by the object and freed in `deinitCell`. Symbol keys are a
+/// later addition.
+pub const PropertyMap = std.StringArrayHashMapUnmanaged(PropertyDescriptor);
+
 pub const Object = struct {
     pub const gc_kind: Kind = .object;
     gc: GcHeader,
-    // Phase 3 adds the property map + prototype. Phase 2: an optional callable
-    // slot so a function is represented as an object that can be invoked.
+    /// [[Prototype]] — the prototype chain link.
+    prototype: ?*Object = null,
+    /// Own properties, in insertion order.
+    properties: PropertyMap = .empty,
+    /// [[Call]] blueprint when this object is a function; null otherwise.
     callable: ?*Closure = null,
+    /// [[Extensible]].
+    extensible: bool = true,
 
     pub fn trace(self: *Object, t: *Tracer) void {
+        if (self.prototype) |p| t.mark(&p.gc);
         if (self.callable) |c| t.mark(&c.gc);
+        var it = self.properties.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.value.mark(t);
+            if (entry.value_ptr.get) |g| g.mark(t);
+            if (entry.value_ptr.set) |s| s.mark(t);
+        }
+    }
+
+    pub fn deinitCell(self: *Object, gpa: std.mem.Allocator) void {
+        for (self.properties.keys()) |k| gpa.free(k);
+        self.properties.deinit(gpa);
     }
 };
 
@@ -217,7 +252,11 @@ pub const Heap = struct {
                 if (s.units.len != 0) self.gpa.free(s.units);
                 self.gpa.destroy(s);
             },
-            .object => self.gpa.destroy(cellFromHeader(Object, header)),
+            .object => {
+                const o = cellFromHeader(Object, header);
+                o.deinitCell(self.gpa);
+                self.gpa.destroy(o);
+            },
             .symbol => {
                 const s = cellFromHeader(Symbol, header);
                 if (s.description) |d| self.gpa.free(d);

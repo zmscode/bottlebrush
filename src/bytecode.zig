@@ -69,9 +69,18 @@ pub const Op = enum(u8) {
     jump_if_nullish, // a=cond reg, b=target (null or undefined)
     jump_if_not_nullish, // a=cond reg, b=target
 
+    // Objects & properties
+    new_object, // a=dst  (empty {} with Object.prototype)
+    get_prop, // a=dst, b=obj reg, c=name const index
+    set_prop, // a=obj reg, b=name const index, c=value reg
+    get_elem, // a=dst, b=obj reg, c=key reg
+    set_elem, // a=obj reg, b=key reg, c=value reg
+    load_this, // a=dst
+
     // Functions
     new_closure, // a=dst, b=child code-block index
-    call, // a=dst, b=callee reg, c=argc (args in callee+1 .. callee+argc)
+    call, // a=dst, b=base reg, c=argc  (this=base, callee=base+1, args=base+2..)
+    construct, // a=dst, b=callee reg, c=argc  (args in callee+1 .. callee+argc)
     ret, // a=src
 
     // Exceptions
