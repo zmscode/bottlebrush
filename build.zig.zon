@@ -1,0 +1,13 @@
+.{
+    .name = .bottlebrush,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xe52c51fdfc51e5be,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test262",
+    },
+}

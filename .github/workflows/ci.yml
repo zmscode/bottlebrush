@@ -1,0 +1,62 @@
+name: CI
+
+# Build, test, and run the Test262 speedometer. The conformance number is the
+# project's heartbeat: this job fails if the pass rate or pass count regresses
+# below the committed baseline (test262/baseline.json).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build
+
+      - name: Unit + harness tests
+        run: zig build test --summary all
+
+      - name: Test262 conformance (capture scoreboard)
+        run: |
+          # The runner prints a machine-readable JSON summary as its last line.
+          zig build test262 2>&1 | tee conformance.out
+          tail -n 1 conformance.out > conformance.json
+          cat conformance.json
+
+      - name: Guard against conformance regression
+        run: |
+          python3 - <<'PY'
+          import json
+          cur = json.load(open("conformance.json"))
+          base = json.load(open("test262/baseline.json"))
+          print(f"current : {cur}")
+          print(f"baseline: {base}")
+          regressions = []
+          if cur["pass"] < base["pass"]:
+              regressions.append(f'pass count {cur["pass"]} < baseline {base["pass"]}')
+          if cur["pass_rate"] + 1e-9 < base["pass_rate"]:
+              regressions.append(f'pass_rate {cur["pass_rate"]} < baseline {base["pass_rate"]}')
+          if regressions:
+              print("CONFORMANCE REGRESSION:")
+              for r in regressions:
+                  print("  -", r)
+              raise SystemExit(1)
+          print("OK: no conformance regression.")
+          PY
+
+      - name: Upload scoreboard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-scoreboard
+          path: conformance.json
