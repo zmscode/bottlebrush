@@ -1261,66 +1261,123 @@ pub const Vm = struct {
     /// the value has no JSON representation (undefined/function/symbol) and
     /// should be omitted. `stack` detects cycles. Indentation (`space`) is not
     /// yet supported.
-    fn jsonSerialize(self: *Vm, out: *std.ArrayList(u8), value: Value, stack: *std.ArrayList(*gc.Object)) Error!bool {
-        var v = value;
-        if (v.isObject()) {
-            const to_json = try self.getProperty(v, "toJSON");
-            if (isCallable(to_json)) v = try self.callValue(to_json, v, &.{});
+    const JsonCtx = struct {
+        out: *std.ArrayList(u8),
+        stack: *std.ArrayList(*gc.Object),
+        indent: *std.ArrayList(u8),
+        gap: []const u8,
+        replacer: Value, // callable, or undefined
+        keys_filter: ?[]const []const u8, // allowed keys (array replacer)
+    };
+
+    /// SerializeJSONProperty: read holder[key], apply toJSON + replacer, emit.
+    fn jsonSerializeProperty(self: *Vm, ctx: JsonCtx, holder: Value, key: []const u8) Error!bool {
+        var value = try self.getProperty(holder, key);
+        if (value.isObject()) {
+            const to_json = try self.getProperty(value, "toJSON");
+            if (isCallable(to_json)) {
+                const ks = try self.makeString(key);
+                try self.protect(ks);
+                defer self.unprotect();
+                value = try self.callValue(to_json, value, &.{ks});
+            }
         }
-        switch (v) {
+        if (isCallable(ctx.replacer)) {
+            const ks = try self.makeString(key);
+            try self.protect(ks);
+            defer self.unprotect();
+            value = try self.callValue(ctx.replacer, holder, &.{ ks, value });
+        }
+        return self.jsonSerializeValue(ctx, value);
+    }
+
+    fn jsonSerializeValue(self: *Vm, ctx: JsonCtx, value: Value) Error!bool {
+        switch (value) {
             .undefined, .symbol => return false,
-            .null => try out.appendSlice(self.gpa, "null"),
-            .boolean => |b| try out.appendSlice(self.gpa, if (b) "true" else "false"),
+            .null => try ctx.out.appendSlice(self.gpa, "null"),
+            .boolean => |b| try ctx.out.appendSlice(self.gpa, if (b) "true" else "false"),
             .number => |n| {
                 if (std.math.isNan(n) or std.math.isInf(n)) {
-                    try out.appendSlice(self.gpa, "null");
+                    try ctx.out.appendSlice(self.gpa, "null");
                 } else {
                     var buf: [64]u8 = undefined;
-                    try out.appendSlice(self.gpa, numberToString(n, &buf));
+                    try ctx.out.appendSlice(self.gpa, numberToString(n, &buf));
                 }
             },
             .bigint => return self.throwTypeError("Do not know how to serialize a BigInt"),
-            .string => |s| try self.jsonQuote(out, s.units),
+            .string => |s| try self.jsonQuote(ctx.out, s.units),
             .object => |o| {
                 if (o.callable != null) return false; // functions omitted
-                for (stack.items) |st| {
+                for (ctx.stack.items) |st| {
                     if (st == o) return self.throwTypeError("Converting circular structure to JSON");
                 }
-                try stack.append(self.gpa, o);
-                defer _ = stack.pop();
-                if (o.is_array) {
-                    try out.append(self.gpa, '[');
-                    for (o.elements.items, 0..) |el, i| {
-                        if (i > 0) try out.append(self.gpa, ',');
-                        if (!try self.jsonSerialize(out, el, stack)) try out.appendSlice(self.gpa, "null");
-                    }
-                    try out.append(self.gpa, ']');
-                } else {
-                    try out.append(self.gpa, '{');
-                    var keys: std.ArrayList([]const u8) = .empty;
-                    defer {
-                        for (keys.items) |k| self.gpa.free(k);
-                        keys.deinit(self.gpa);
-                    }
-                    try ownEnumerableKeys(self, o, &keys);
-                    var first = true;
-                    for (keys.items) |k| {
-                        const mark = out.items.len;
-                        if (!first) try out.append(self.gpa, ',');
-                        try self.jsonQuoteBytes(out, k);
-                        try out.append(self.gpa, ':');
-                        const val = try self.getProperty(v, k);
-                        if (try self.jsonSerialize(out, val, stack)) {
-                            first = false;
-                        } else {
-                            out.shrinkRetainingCapacity(mark); // omit this key
-                        }
-                    }
-                    try out.append(self.gpa, '}');
-                }
+                try ctx.stack.append(self.gpa, o);
+                defer _ = ctx.stack.pop();
+                if (o.is_array) try self.jsonArray(ctx, o) else try self.jsonObject(ctx, value, o);
             },
         }
         return true;
+    }
+
+    fn newlineIndent(self: *Vm, ctx: JsonCtx, to_len: usize) Error!void {
+        if (ctx.gap.len == 0) return;
+        try ctx.out.append(self.gpa, '\n');
+        try ctx.out.appendSlice(self.gpa, ctx.indent.items[0..to_len]);
+    }
+
+    fn jsonArray(self: *Vm, ctx: JsonCtx, o: *gc.Object) Error!void {
+        try ctx.out.append(self.gpa, '[');
+        const prev = ctx.indent.items.len;
+        try ctx.indent.appendSlice(self.gpa, ctx.gap);
+        const n = o.elements.items.len;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (i > 0) try ctx.out.append(self.gpa, ',');
+            try self.newlineIndent(ctx, ctx.indent.items.len);
+            var kbuf: [24]u8 = undefined;
+            const ks = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch unreachable;
+            if (!try self.jsonSerializeProperty(ctx, Value.fromObject(o), ks)) try ctx.out.appendSlice(self.gpa, "null");
+        }
+        if (n > 0) try self.newlineIndent(ctx, prev);
+        ctx.indent.shrinkRetainingCapacity(prev);
+        try ctx.out.append(self.gpa, ']');
+    }
+
+    fn jsonObject(self: *Vm, ctx: JsonCtx, holder: Value, o: *gc.Object) Error!void {
+        try ctx.out.append(self.gpa, '{');
+        const prev = ctx.indent.items.len;
+        try ctx.indent.appendSlice(self.gpa, ctx.gap);
+
+        var owned: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (owned.items) |k| self.gpa.free(k);
+            owned.deinit(self.gpa);
+        }
+        var key_list: []const []const u8 = undefined;
+        if (ctx.keys_filter) |kf| {
+            key_list = kf;
+        } else {
+            try ownEnumerableKeys(self, o, &owned);
+            key_list = owned.items;
+        }
+
+        var first = true;
+        for (key_list) |k| {
+            const mark = ctx.out.items.len;
+            if (!first) try ctx.out.append(self.gpa, ',');
+            try self.newlineIndent(ctx, ctx.indent.items.len);
+            try self.jsonQuoteBytes(ctx.out, k);
+            try ctx.out.append(self.gpa, ':');
+            if (ctx.gap.len > 0) try ctx.out.append(self.gpa, ' ');
+            if (try self.jsonSerializeProperty(ctx, holder, k)) {
+                first = false;
+            } else {
+                ctx.out.shrinkRetainingCapacity(mark); // omit this key
+            }
+        }
+        if (!first) try self.newlineIndent(ctx, prev);
+        ctx.indent.shrinkRetainingCapacity(prev);
+        try ctx.out.append(self.gpa, '}');
     }
 
     fn jsonQuote(self: *Vm, out: *std.ArrayList(u8), units: []const u16) Error!void {
@@ -1334,13 +1391,53 @@ pub const Vm = struct {
         try out.append(self.gpa, '"');
     }
 
-    fn jsonParse(self: *Vm, text: []const u8) Error!Value {
+    fn jsonParse(self: *Vm, text: []const u8, reviver: Value) Error!Value {
         var p = JsonParser{ .vm = self, .s = text, .i = 0 };
         p.skipWs();
         const v = try p.parseValue();
         p.skipWs();
         if (p.i != text.len) return self.throwSyntaxError("Unexpected non-whitespace character after JSON");
-        return v;
+        if (!isCallable(reviver)) return v;
+        // InternalizeJSONProperty over a {"": v} holder.
+        const holder = try self.newObject(self.object_proto);
+        try self.protect(Value.fromObject(holder));
+        defer self.unprotect();
+        try self.defineData(holder, "", v, true, true, true);
+        return self.internalizeJSON(Value.fromObject(holder), "", reviver);
+    }
+
+    fn internalizeJSON(self: *Vm, holder: Value, key: []const u8, reviver: Value) Error!Value {
+        const val = try self.getProperty(holder, key);
+        if (val.isObject()) {
+            const o = val.asObject();
+            if (o.is_array) {
+                var i: u32 = 0;
+                while (i < o.elements.items.len) : (i += 1) {
+                    var kbuf: [24]u8 = undefined;
+                    const ks = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch unreachable;
+                    o.elements.items[i] = try self.internalizeJSON(val, ks, reviver);
+                }
+            } else {
+                var keys: std.ArrayList([]const u8) = .empty;
+                defer {
+                    for (keys.items) |k| self.gpa.free(k);
+                    keys.deinit(self.gpa);
+                }
+                try ownEnumerableKeys(self, o, &keys);
+                for (keys.items) |k| {
+                    const new_elem = try self.internalizeJSON(val, k, reviver);
+                    if (new_elem.isUndefined()) {
+                        if (o.properties.fetchOrderedRemove(k)) |kv| self.gpa.free(kv.key);
+                    } else {
+                        try self.setProperty(val, k, new_elem);
+                    }
+                }
+            }
+        }
+        const ks = try self.makeString(key);
+        try self.protect(ks);
+        defer self.unprotect();
+        return self.callValue(reviver, holder, &.{ ks, val });
     }
 };
 
@@ -2722,12 +2819,67 @@ const JsonParser = struct {
 fn nativeJSONStringify(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = this;
     const vm = castVm(ctx);
+
+    // The `space` argument -> indentation gap (max 10).
+    const ten_spaces = "          ";
+    var gap_buf: [64]u8 = undefined;
+    var gap: []const u8 = "";
+    const space = argAt(args, 2);
+    if (space.isNumber()) {
+        const n: usize = if (space.asNumber() < 0) 0 else if (space.asNumber() > 10) 10 else @intFromFloat(space.asNumber());
+        gap = ten_spaces[0..n];
+    } else if (space.isString()) {
+        const units = space.asString().units;
+        var len: usize = 0;
+        for (units[0..@min(units.len, 10)]) |u| {
+            if (len < gap_buf.len) {
+                gap_buf[len] = if (u < 0x80) @intCast(u) else ' ';
+                len += 1;
+            }
+        }
+        gap = gap_buf[0..len];
+    }
+
+    // The `replacer` argument -> a function, or an allow-list of keys.
+    var replacer: Value = Value.undefined_value;
+    var keys_owned: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys_owned.items) |k| vm.gpa.free(k);
+        keys_owned.deinit(vm.gpa);
+    }
+    var keys_filter: ?[]const []const u8 = null;
+    const replacer_arg = argAt(args, 1);
+    if (isCallable(replacer_arg)) {
+        replacer = replacer_arg;
+    } else if (replacer_arg.isObject() and replacer_arg.asObject().is_array) {
+        for (replacer_arg.asObject().elements.items) |el| {
+            if (el.isString()) {
+                const kb = try utf16ToUtf8Alloc(vm.gpa, el.asString().units);
+                try keys_owned.append(vm.gpa, kb);
+            } else if (el.isNumber()) {
+                var nb: [24]u8 = undefined;
+                const ks = numberToString(el.asNumber(), &nb);
+                try keys_owned.append(vm.gpa, try vm.gpa.dupe(u8, ks));
+            }
+        }
+        keys_filter = keys_owned.items;
+    }
+
+    // Wrap the value in a holder for SerializeJSONProperty.
+    const holder = try vm.newObject(vm.object_proto);
+    try vm.protect(Value.fromObject(holder));
+    defer vm.unprotect();
+    try vm.defineData(holder, "", argAt(args, 0), true, true, true);
+
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(vm.gpa);
     var stack: std.ArrayList(*gc.Object) = .empty;
     defer stack.deinit(vm.gpa);
-    const written = try vm.jsonSerialize(&out, argAt(args, 0), &stack);
-    if (!written) return Value.undefined_value;
+    var indent: std.ArrayList(u8) = .empty;
+    defer indent.deinit(vm.gpa);
+    const c = Vm.JsonCtx{ .out = &out, .stack = &stack, .indent = &indent, .gap = gap, .replacer = replacer, .keys_filter = keys_filter };
+
+    if (!try vm.jsonSerializeProperty(c, Value.fromObject(holder), "")) return Value.undefined_value;
     return vm.makeString(out.items);
 }
 
@@ -2739,7 +2891,7 @@ fn nativeJSONParse(ctx: *anyopaque, this: Value, args: []const Value) Error!Valu
     defer vm.unprotect();
     const utf8 = try utf16ToUtf8Alloc(vm.gpa, text_v.asString().units);
     defer vm.gpa.free(utf8);
-    return vm.jsonParse(utf8);
+    return vm.jsonParse(utf8, argAt(args, 1));
 }
 
 // ---- Map / Set built-ins ---------------------------------------------------
@@ -3864,6 +4016,37 @@ test "JSON.parse and round-trip" {
         \\var o = { x: 1, y: [2, 3], z: "hi" };
         \\var r = JSON.parse(JSON.stringify(o));
         \\return (r.x === 1 && r.y[1] === 3 && r.z === "hi") ? 1 : 0;
+    ));
+}
+
+test "JSON.stringify space and replacer" {
+    // Indentation with a numeric space.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return JSON.stringify({ a: 1 }, null, 2) === '{\n  "a": 1\n}' ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return JSON.stringify([1, 2], null, 1) === '[\n 1,\n 2\n]' ? 1 : 0;
+    ));
+    // Replacer function.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var r = JSON.stringify({ a: 1, b: 2 }, function (k, v) { return k === 'b' ? undefined : v; });
+        \\return r === '{"a":1}' ? 1 : 0;
+    ));
+    // Replacer allow-list.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return JSON.stringify({ a: 1, b: 2, c: 3 }, ["a", "c"]) === '{"a":1,"c":3}' ? 1 : 0;
+    ));
+}
+
+test "JSON.parse reviver" {
+    try testing.expectEqual(@as(f64, 20), try evalNumber(
+        \\var o = JSON.parse('{"a":5,"b":5}', function (k, v) { return typeof v === 'number' ? v * 2 : v; });
+        \\return o.a + o.b;
+    ));
+    // Reviver returning undefined deletes the property.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = JSON.parse('{"a":1,"drop":2}', function (k, v) { return k === 'drop' ? undefined : v; });
+        \\return ('drop' in o) ? 0 : 1;
     ));
 }
 
