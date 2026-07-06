@@ -13,6 +13,8 @@
 const std = @import("std");
 const frontmatter = @import("frontmatter.zig");
 const report = @import("report.zig");
+const bottlebrush = @import("bottlebrush");
+const parser = bottlebrush.parser;
 
 const default_path = "test262/fixtures";
 const max_file_bytes = std.Io.Limit.limited(64 * 1024 * 1024);
@@ -60,26 +62,37 @@ pub fn main() !void {
         };
         defer meta.deinit(gpa);
 
-        const outcome = classify(meta);
+        const outcome = classify(gpa, source, meta);
         board.record(outcome);
     }
 
     printReport(path, board);
 }
 
-/// Phase 0 classification: nothing can run yet, so everything skips. The switch
-/// documents exactly which future phase unblocks each case.
-fn classify(meta: frontmatter.Meta) report.Outcome {
+/// Phase 1 classification: parse-phase negatives are now scored by the parser
+/// (PASS iff it reports a SyntaxError). Positive tests and runtime/resolution
+/// negatives still SKIP — they need the Phase 2 evaluator.
+fn classify(gpa: std.mem.Allocator, source: []const u8, meta: frontmatter.Meta) report.Outcome {
     if (meta.negative) |neg| {
         switch (neg.phase) {
-            // Parse-phase negatives need the Phase 1 lexer/parser.
-            .parse => return .skip, // TODO(phase-1): parse and expect SyntaxError
-            // Resolution/runtime negatives need Phase 2+ execution.
-            .resolution, .runtime => return .skip, // TODO(phase-2)
+            .parse => {
+                const source_type: bottlebrush.ast.SourceType =
+                    if (meta.flags.module) .module else .script;
+                var result = parser.parse(gpa, source, source_type) catch return .skip;
+                switch (result) {
+                    .ok => |*tree| {
+                        tree.deinit();
+                        return .fail; // expected a SyntaxError, but it parsed
+                    },
+                    .syntax_error => return .pass,
+                }
+            },
+            // Resolution/runtime negatives need execution (Phase 2+).
+            .resolution, .runtime => return .skip,
         }
     }
-    // Positive tests need the Phase 2 evaluator.
-    return .skip; // TODO(phase-2): execute and check for no exception
+    // Positive tests need the Phase 2 evaluator to know pass/fail.
+    return .skip;
 }
 
 fn printReport(path: []const u8, board: report.Scoreboard) void {
