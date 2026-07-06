@@ -6,18 +6,25 @@ driven by [Test262](https://github.com/tc39/test262) conformance from day one.
 See [plan.md](plan.md) for the architecture and [phase/](phase/) for the
 per-phase build plans.
 
-## Status: Phase 3 — Object model & harness (complete)
+## Status: Phase 4 — Standard library (core built-ins)
 
-Objects work, and **positive Test262 tests now execute against the real
-`assert.js` harness**. The engine has a full object model — prototypes,
-property descriptors, member access, `this`, `new`, method calls, `instanceof`,
-`in`, a global object, and coercion via `ToPrimitive`/`valueOf`/`toString` — all
-exercised under GC stress. The runner concatenates `sta.js` + `assert.js` +
-`includes` with each test, runs it in a fresh realm, and scores PASS/FAIL/SKIP.
-`zig build run` runs a constructor + prototype-method + method-chaining demo.
+The engine now has native (Zig-implemented) built-ins and **real `Error`
+objects**. `assert.throws`, `instanceof`, and runtime-phase negative tests all
+work. Implemented so far:
 
-Still ahead (Phase 4): the standard library — `Object`/`Array`/`String`/`Error`
-constructors, etc. — which is what lets the bulk of the corpus run.
+- **Native function** mechanism (a `Closure` can dispatch to Zig).
+- **Error** + `TypeError`/`RangeError`/`ReferenceError`/`SyntaxError`/`EvalError`/
+  `URIError`, with a real prototype chain; engine-thrown errors are now Error
+  objects (so `e instanceof TypeError`, `e.name`, `e.message` work).
+- **Object**: constructor, `hasOwnProperty`/`toString`/`valueOf`/`isPrototypeOf`,
+  and statics `getPrototypeOf`/`create`/`defineProperty`/`getOwnPropertyDescriptor`.
+- **String / Number / Boolean** conversion functions, **Math** (abs/floor/ceil/
+  round/trunc/sqrt/sign/max/min/pow + PI/E), and `isNaN`/`isFinite`.
+
+The Test262 runner scores positives (run + assert), parse-negatives, and now
+runtime-negatives (by thrown constructor name). Still ahead: arrays, the
+iteration protocol, `RegExp`, `JSON`, `Date`, `Map`/`Set`, and the full
+String/Number/Array prototype method sets.
 
 Earlier phases (all complete):
 

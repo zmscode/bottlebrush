@@ -99,17 +99,28 @@ pub const Object = struct {
     }
 };
 
-/// A function activation blueprint: compiled code plus the lexical environment
-/// captured at creation. `code` is an opaque `*const bytecode.CodeBlock`
-/// (kept opaque to avoid a gc→bytecode→value import cycle); the interpreter
-/// casts it back.
+/// The engine-wide error set (used by the interpreter and native functions).
+/// `JsThrow` means a JS exception is pending in the VM; the others are host
+/// failures.
+pub const VmError = error{ JsThrow, OutOfMemory, StackOverflow };
+
+/// A built-in function implemented in Zig. `ctx` is the `*Vm` (opaque here to
+/// avoid a gc→interpreter import cycle); the callee casts it back.
+pub const NativeFn = *const fn (ctx: *anyopaque, this: Value, args: []const Value) VmError!Value;
+
+/// A function activation blueprint: either compiled bytecode plus a captured
+/// environment, or a native Zig function. `code` is an opaque
+/// `*const bytecode.CodeBlock` (kept opaque to avoid a gc→bytecode→value import
+/// cycle); the interpreter casts it back.
 pub const Closure = struct {
     pub const gc_kind: Kind = .closure;
     gc: GcHeader,
-    /// `*const bytecode.CodeBlock` (opaque here). Set by the interpreter right
-    /// after allocation; never traced, so a brief undefined value is safe.
+    /// `*const bytecode.CodeBlock` (opaque here). Unused for native functions.
     code: *const anyopaque = undefined,
     env: ?*Environment = null,
+    /// Non-null for built-ins; when set, the interpreter dispatches here
+    /// instead of running bytecode.
+    native: ?NativeFn = null,
 
     pub fn trace(self: *Closure, t: *Tracer) void {
         if (self.env) |e| t.mark(&e.gc);

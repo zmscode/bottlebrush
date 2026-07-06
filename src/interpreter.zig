@@ -19,7 +19,7 @@ const gc = @import("gc.zig");
 const bc = @import("bytecode.zig");
 const Value = @import("value.zig").Value;
 
-pub const Error = error{ JsThrow, OutOfMemory, StackOverflow };
+pub const Error = gc.VmError;
 
 const max_call_depth = 2000;
 
@@ -44,6 +44,12 @@ pub const Vm = struct {
     object_proto: ?*gc.Object = null,
     function_proto: ?*gc.Object = null,
     global_object: ?*gc.Object = null,
+    // Error prototypes (for engine-thrown errors and `instanceof`).
+    error_proto: ?*gc.Object = null,
+    type_error_proto: ?*gc.Object = null,
+    range_error_proto: ?*gc.Object = null,
+    reference_error_proto: ?*gc.Object = null,
+    syntax_error_proto: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -60,6 +66,11 @@ pub const Vm = struct {
         if (self.object_proto) |o| tracer.mark(&o.gc);
         if (self.function_proto) |o| tracer.mark(&o.gc);
         if (self.global_object) |o| tracer.mark(&o.gc);
+        if (self.error_proto) |o| tracer.mark(&o.gc);
+        if (self.type_error_proto) |o| tracer.mark(&o.gc);
+        if (self.range_error_proto) |o| tracer.mark(&o.gc);
+        if (self.reference_error_proto) |o| tracer.mark(&o.gc);
+        if (self.syntax_error_proto) |o| tracer.mark(&o.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -98,6 +109,114 @@ pub const Vm = struct {
         try self.defineData(global, "NaN", Value.fromNumber(std.math.nan(f64)), false, false, false);
         try self.defineData(global, "Infinity", Value.fromNumber(std.math.inf(f64)), false, false, false);
         try self.defineData(global, "undefined", Value.undefined_value, false, false, false);
+
+        // Install the standard library with GC stress off, so partially-built
+        // intrinsics can't be collected mid-setup.
+        const saved_stress = self.heap.stress;
+        self.heap.stress = false;
+        defer self.heap.stress = saved_stress;
+        try self.installBuiltins();
+    }
+
+    fn makeNative(self: *Vm, name: []const u8, func: gc.NativeFn, length: u32) Error!*gc.Object {
+        const clo = try self.heap.create(gc.Closure);
+        clo.native = func;
+        clo.env = null;
+        const obj = try self.heap.create(gc.Object);
+        obj.callable = clo;
+        obj.prototype = self.function_proto;
+        try self.defineData(obj, "length", Value.fromNumber(@floatFromInt(length)), false, false, true);
+        try self.defineData(obj, "name", try self.makeString(name), false, false, true);
+        return obj;
+    }
+
+    /// Define a method (native function) on `obj`, writable + configurable,
+    /// non-enumerable (as built-in methods are).
+    fn defineMethod(self: *Vm, obj: *gc.Object, name: []const u8, func: gc.NativeFn, length: u32) Error!void {
+        try self.defineData(obj, name, Value.fromObject(try self.makeNative(name, func, length)), true, false, true);
+    }
+
+    /// Create an Error object directly (for engine-thrown exceptions).
+    fn makeError(self: *Vm, proto: ?*gc.Object, msg: []const u8) Error!*gc.Object {
+        const obj = try self.newObject(proto);
+        try self.protect(Value.fromObject(obj));
+        defer self.unprotect();
+        try self.defineData(obj, "message", try self.makeString(msg), true, false, true);
+        return obj;
+    }
+
+    fn installBuiltins(self: *Vm) Error!void {
+        const global = self.global_object.?;
+
+        // ---- Object.prototype methods + Object constructor ----
+        try self.defineMethod(self.object_proto.?, "hasOwnProperty", nativeHasOwnProperty, 1);
+        try self.defineMethod(self.object_proto.?, "toString", nativeObjectToString, 0);
+        try self.defineMethod(self.object_proto.?, "valueOf", nativeObjectValueOf, 0);
+        try self.defineMethod(self.object_proto.?, "isPrototypeOf", nativeIsPrototypeOf, 1);
+
+        const object_ctor = try self.makeNative("Object", nativeObject, 1);
+        try self.defineData(object_ctor, "prototype", Value.fromObject(self.object_proto.?), false, false, false);
+        try self.defineData(self.object_proto.?, "constructor", Value.fromObject(object_ctor), true, false, true);
+        // Object.keys/values/entries need arrays (deferred); omitted for now.
+        try self.defineMethod(object_ctor, "getPrototypeOf", nativeObjectGetPrototypeOf, 1);
+        try self.defineMethod(object_ctor, "create", nativeObjectCreate, 2);
+        try self.defineMethod(object_ctor, "defineProperty", nativeObjectDefineProperty, 3);
+        try self.defineMethod(object_ctor, "getOwnPropertyDescriptor", nativeObjectGetOwnPropertyDescriptor, 2);
+        try self.defineData(global, "Object", Value.fromObject(object_ctor), true, false, true);
+
+        // ---- Error hierarchy ----
+        const error_proto = try self.newObject(self.object_proto);
+        self.error_proto = error_proto;
+        try self.defineData(error_proto, "name", try self.makeString("Error"), true, false, true);
+        try self.defineData(error_proto, "message", try self.makeString(""), true, false, true);
+        try self.defineMethod(error_proto, "toString", nativeErrorToString, 0);
+        const error_ctor = try self.makeNative("Error", nativeError, 1);
+        try self.defineData(error_ctor, "prototype", Value.fromObject(error_proto), false, false, false);
+        try self.defineData(error_proto, "constructor", Value.fromObject(error_ctor), true, false, true);
+        try self.defineData(global, "Error", Value.fromObject(error_ctor), true, false, true);
+
+        self.type_error_proto = try self.installErrorSubtype("TypeError");
+        self.range_error_proto = try self.installErrorSubtype("RangeError");
+        self.reference_error_proto = try self.installErrorSubtype("ReferenceError");
+        self.syntax_error_proto = try self.installErrorSubtype("SyntaxError");
+        _ = try self.installErrorSubtype("EvalError");
+        _ = try self.installErrorSubtype("URIError");
+
+        // ---- String / Number / Boolean conversion functions ----
+        try self.defineData(global, "String", Value.fromObject(try self.makeNative("String", nativeString, 1)), true, false, true);
+        try self.defineData(global, "Number", Value.fromObject(try self.makeNative("Number", nativeNumber, 1)), true, false, true);
+        try self.defineData(global, "Boolean", Value.fromObject(try self.makeNative("Boolean", nativeBoolean, 1)), true, false, true);
+
+        // ---- Math ----
+        const math = try self.newObject(self.object_proto);
+        try self.defineData(math, "PI", Value.fromNumber(std.math.pi), false, false, false);
+        try self.defineData(math, "E", Value.fromNumber(std.math.e), false, false, false);
+        try self.defineMethod(math, "abs", nativeMathAbs, 1);
+        try self.defineMethod(math, "floor", nativeMathFloor, 1);
+        try self.defineMethod(math, "ceil", nativeMathCeil, 1);
+        try self.defineMethod(math, "round", nativeMathRound, 1);
+        try self.defineMethod(math, "trunc", nativeMathTrunc, 1);
+        try self.defineMethod(math, "sqrt", nativeMathSqrt, 1);
+        try self.defineMethod(math, "sign", nativeMathSign, 1);
+        try self.defineMethod(math, "max", nativeMathMax, 2);
+        try self.defineMethod(math, "min", nativeMathMin, 2);
+        try self.defineMethod(math, "pow", nativeMathPow, 2);
+        try self.defineData(global, "Math", Value.fromObject(math), true, false, true);
+
+        // ---- global functions ----
+        try self.defineMethod(global, "isNaN", nativeIsNaN, 1);
+        try self.defineMethod(global, "isFinite", nativeIsFinite, 1);
+    }
+
+    fn installErrorSubtype(self: *Vm, name: []const u8) Error!*gc.Object {
+        const proto = try self.newObject(self.error_proto);
+        try self.defineData(proto, "name", try self.makeString(name), true, false, true);
+        try self.defineData(proto, "message", try self.makeString(""), true, false, true);
+        const ctor = try self.makeNative(name, nativeError, 1);
+        try self.defineData(ctor, "prototype", Value.fromObject(proto), false, false, false);
+        try self.defineData(proto, "constructor", Value.fromObject(ctor), true, false, true);
+        try self.defineData(self.global_object.?, name, Value.fromObject(ctor), true, false, true);
+        return proto;
     }
 
     // ---- entry -------------------------------------------------------------
@@ -110,6 +229,19 @@ pub const Vm = struct {
         const root = program.root;
         const env = try self.createEnv(null, root.num_env_slots);
         return self.execute(root, env, Value.fromObject(self.global_object.?));
+    }
+
+    /// If a JS exception is pending and is an Error-like object, return its
+    /// constructor's `name` as newly-allocated UTF-8 (caller frees), else null.
+    /// Used by the Test262 runner to score runtime-phase negative tests.
+    pub fn pendingErrorName(self: *Vm, gpa: std.mem.Allocator) ?[]u8 {
+        const exc = self.pending_exception orelse return null;
+        if (!exc.isObject()) return null;
+        const ctor = self.getProperty(exc, "constructor") catch return null;
+        if (!ctor.isObject()) return null;
+        const name_v = self.getProperty(ctor, "name") catch return null;
+        if (!name_v.isString()) return null;
+        return utf16ToUtf8Alloc(gpa, name_v.asString().units) catch return null;
     }
 
     fn createEnv(self: *Vm, parent: ?*gc.Environment, n: u32) Error!*gc.Environment {
@@ -326,6 +458,9 @@ pub const Vm = struct {
         defer self.depth -= 1;
 
         const clo = callee.asObject().callable.?;
+        if (clo.native) |native| {
+            return native(@ptrCast(self), this_value, args);
+        }
         const code: *const bc.CodeBlock = @ptrCast(@alignCast(clo.code));
         const env = try self.createEnv(clo.env, code.num_env_slots);
         var i: u32 = 0;
@@ -437,7 +572,7 @@ pub const Vm = struct {
             return self.getProperty(Value.fromObject(global), name);
         }
         if (for_typeof) return Value.undefined_value;
-        return self.throwWith("ReferenceError", name);
+        return self.throwReferenceError(name);
     }
 
     fn instanceOf(self: *Vm, lhs: Value, rhs: Value) Error!bool {
@@ -649,17 +784,23 @@ pub const Vm = struct {
 
     // ---- error throwing (placeholder string errors) ------------------------
 
-    fn throwWith(self: *Vm, comptime kind: []const u8, msg: []const u8) Error {
-        var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{s}: {s}", .{ kind, msg }) catch kind;
-        self.pending_exception = self.makeString(text) catch Value.undefined_value;
+    /// Throw a real Error object with the given prototype and message.
+    fn throwError(self: *Vm, proto: ?*gc.Object, msg: []const u8) Error {
+        const obj = self.makeError(proto, msg) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.JsThrow,
+        };
+        self.pending_exception = Value.fromObject(obj);
         return error.JsThrow;
     }
     fn throwTypeError(self: *Vm, msg: []const u8) Error {
-        return self.throwWith("TypeError", msg);
+        return self.throwError(self.type_error_proto, msg);
     }
     fn throwRangeError(self: *Vm, msg: []const u8) Error {
-        return self.throwWith("RangeError", msg);
+        return self.throwError(self.range_error_proto, msg);
+    }
+    fn throwReferenceError(self: *Vm, msg: []const u8) Error {
+        return self.throwError(self.reference_error_proto, msg);
     }
 };
 
@@ -743,6 +884,282 @@ fn numberToString(n: f64, buf: []u8) []const u8 {
         return std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(n))}) catch "0";
     }
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch "0";
+}
+
+// ---- native built-in functions ---------------------------------------------
+
+fn castVm(ctx: *anyopaque) *Vm {
+    return @ptrCast(@alignCast(ctx));
+}
+fn argAt(args: []const Value, i: usize) Value {
+    return if (i < args.len) args[i] else Value.undefined_value;
+}
+
+fn nativeError(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const obj = if (this.isObject() and this.asObject() != vm.global_object)
+        this.asObject()
+    else
+        try vm.newObject(vm.error_proto);
+    try vm.protect(Value.fromObject(obj));
+    defer vm.unprotect();
+    const msg = argAt(args, 0);
+    if (!msg.isUndefined()) {
+        const s = try vm.toStringVal(msg);
+        try vm.defineData(obj, "message", s, true, false, true);
+    }
+    return Value.fromObject(obj);
+}
+
+fn nativeErrorToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("Error.prototype.toString called on non-object");
+    const name_v = try vm.getProperty(this, "name");
+    const name = try vm.toStringVal(name_v);
+    try vm.protect(name);
+    defer vm.unprotect();
+    const msg_v = try vm.getProperty(this, "message");
+    const msg = try vm.toStringVal(msg_v);
+    try vm.protect(msg);
+    defer vm.unprotect();
+    if (msg.asString().units.len == 0) return name;
+    if (name.asString().units.len == 0) return msg;
+    // name + ": " + message
+    const sep = try vm.makeString(": ");
+    try vm.protect(sep);
+    defer vm.unprotect();
+    const first = try vm.concat(name.asString().units, sep.asString().units);
+    try vm.protect(first);
+    defer vm.unprotect();
+    return vm.concat(first.asString().units, msg.asString().units);
+}
+
+fn nativeObject(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    const v = argAt(args, 0);
+    if (v.isObject()) return v;
+    if (v.isNullish()) return Value.fromObject(try vm.newObject(vm.object_proto));
+    // ToObject for primitives (wrapper objects) is not implemented; return a
+    // fresh object so Object(x) at least yields an object.
+    return Value.fromObject(try vm.newObject(vm.object_proto));
+}
+
+fn nativeObjectToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    return switch (this) {
+        .undefined => vm.makeString("[object Undefined]"),
+        .null => vm.makeString("[object Null]"),
+        else => vm.makeString("[object Object]"),
+    };
+}
+
+fn nativeObjectValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = args;
+    return this;
+}
+
+fn nativeHasOwnProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return Value.fromBool(false);
+    const key = try vm.toPropertyKey(argAt(args, 0));
+    defer vm.gpa.free(key);
+    return Value.fromBool(this.asObject().properties.contains(key));
+}
+
+fn nativeIsPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    const v = argAt(args, 0);
+    if (!this.isObject() or !v.isObject()) return Value.fromBool(false);
+    const target = this.asObject();
+    var o: ?*gc.Object = v.asObject().prototype;
+    while (o) |cur| {
+        if (cur == target) return Value.fromBool(true);
+        o = cur.prototype;
+    }
+    return Value.fromBool(false);
+}
+
+fn nativeObjectGetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    const v = argAt(args, 0);
+    if (!v.isObject()) return vm.throwTypeError("Object.getPrototypeOf called on non-object");
+    return if (v.asObject().prototype) |p| Value.fromObject(p) else Value.null_value;
+}
+
+fn nativeObjectCreate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    const proto_arg = argAt(args, 0);
+    const proto: ?*gc.Object = if (proto_arg.isObject()) proto_arg.asObject() else if (proto_arg.isNull()) null else return vm.throwTypeError("Object prototype may only be an Object or null");
+    return Value.fromObject(try vm.newObject(proto));
+}
+
+fn nativeObjectDefineProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    const obj_v = argAt(args, 0);
+    if (!obj_v.isObject()) return vm.throwTypeError("Object.defineProperty called on non-object");
+    const obj = obj_v.asObject();
+    const key = try vm.toPropertyKey(argAt(args, 1));
+    defer vm.gpa.free(key);
+    const desc_v = argAt(args, 2);
+    if (!desc_v.isObject()) return vm.throwTypeError("property descriptor must be an object");
+
+    var desc = gc.PropertyDescriptor{ .enumerable = false, .writable = false, .configurable = false };
+    const get_v = try vm.getProperty(desc_v, "get");
+    const set_v = try vm.getProperty(desc_v, "set");
+    if (get_v.isObject() or set_v.isObject()) {
+        desc.is_accessor = true;
+        desc.get = if (get_v.isObject()) get_v else null;
+        desc.set = if (set_v.isObject()) set_v else null;
+    } else {
+        desc.value = try vm.getProperty(desc_v, "value");
+        desc.writable = toBoolean(try vm.getProperty(desc_v, "writable"));
+    }
+    desc.enumerable = toBoolean(try vm.getProperty(desc_v, "enumerable"));
+    desc.configurable = toBoolean(try vm.getProperty(desc_v, "configurable"));
+
+    const gop = try obj.properties.getOrPut(vm.gpa, key);
+    if (!gop.found_existing) gop.key_ptr.* = try vm.gpa.dupe(u8, key);
+    gop.value_ptr.* = desc;
+    return obj_v;
+}
+
+fn nativeObjectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    const obj_v = argAt(args, 0);
+    if (!obj_v.isObject()) return vm.throwTypeError("called on non-object");
+    const key = try vm.toPropertyKey(argAt(args, 1));
+    defer vm.gpa.free(key);
+    const desc = obj_v.asObject().properties.get(key) orelse return Value.undefined_value;
+    const result = try vm.newObject(vm.object_proto);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    if (desc.is_accessor) {
+        try vm.defineData(result, "get", desc.get orelse Value.undefined_value, true, true, true);
+        try vm.defineData(result, "set", desc.set orelse Value.undefined_value, true, true, true);
+    } else {
+        try vm.defineData(result, "value", desc.value, true, true, true);
+        try vm.defineData(result, "writable", Value.fromBool(desc.writable), true, true, true);
+    }
+    try vm.defineData(result, "enumerable", Value.fromBool(desc.enumerable), true, true, true);
+    try vm.defineData(result, "configurable", Value.fromBool(desc.configurable), true, true, true);
+    return Value.fromObject(result);
+}
+
+fn nativeString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    if (args.len == 0) return vm.makeString("");
+    return vm.toStringVal(args[0]);
+}
+
+fn nativeNumber(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    if (args.len == 0) return Value.fromNumber(0);
+    return Value.fromNumber(try vm.toNumber(args[0]));
+}
+
+fn nativeBoolean(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    return Value.fromBool(toBoolean(argAt(args, 0)));
+}
+
+fn mathUnary(ctx: *anyopaque, args: []const Value, comptime op: anytype) Error!Value {
+    const vm = castVm(ctx);
+    const x: f64 = try vm.toNumber(argAt(args, 0));
+    return Value.fromNumber(op(x));
+}
+fn nativeMathAbs(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return mathUnary(ctx, args, struct {
+        fn f(x: f64) f64 {
+            return @abs(x);
+        }
+    }.f);
+}
+fn nativeMathFloor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return mathUnary(ctx, args, std.math.floor);
+}
+fn nativeMathCeil(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return mathUnary(ctx, args, std.math.ceil);
+}
+fn nativeMathRound(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return mathUnary(ctx, args, struct {
+        fn f(x: f64) f64 {
+            return std.math.floor(x + 0.5);
+        }
+    }.f);
+}
+fn nativeMathTrunc(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return mathUnary(ctx, args, std.math.trunc);
+}
+fn nativeMathSqrt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return mathUnary(ctx, args, std.math.sqrt);
+}
+fn nativeMathSign(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return mathUnary(ctx, args, struct {
+        fn f(x: f64) f64 {
+            if (std.math.isNan(x)) return x;
+            if (x > 0) return 1;
+            if (x < 0) return -1;
+            return x; // +/-0
+        }
+    }.f);
+}
+fn nativeMathPow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const base = try vm.toNumber(argAt(args, 0));
+    const exp = try vm.toNumber(argAt(args, 1));
+    return Value.fromNumber(std.math.pow(f64, base, exp));
+}
+fn nativeMathMax(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    var result: f64 = -std.math.inf(f64);
+    for (args) |a| {
+        const n = try vm.toNumber(a);
+        if (std.math.isNan(n)) return Value.fromNumber(std.math.nan(f64));
+        if (n > result) result = n;
+    }
+    return Value.fromNumber(result);
+}
+fn nativeMathMin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    var result: f64 = std.math.inf(f64);
+    for (args) |a| {
+        const n = try vm.toNumber(a);
+        if (std.math.isNan(n)) return Value.fromNumber(std.math.nan(f64));
+        if (n < result) result = n;
+    }
+    return Value.fromNumber(result);
+}
+fn nativeIsNaN(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    return Value.fromBool(std.math.isNan(try vm.toNumber(argAt(args, 0))));
+}
+fn nativeIsFinite(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const n = try vm.toNumber(argAt(args, 0));
+    return Value.fromBool(!std.math.isNan(n) and !std.math.isInf(n));
 }
 
 fn utf16ToUtf8Alloc(gpa: std.mem.Allocator, units: []const u16) Error![]u8 {
@@ -983,6 +1400,64 @@ test "reading an undeclared global throws ReferenceError" {
     var vm = Vm.init(testing.allocator);
     defer vm.deinit();
     try testing.expectError(error.JsThrow, eval(&vm, "return missingGlobalVar;"));
+}
+
+test "error objects and instanceof" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var e = new TypeError("boom");
+        \\return (e.message === "boom" && e.name === "TypeError") ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var e = new RangeError("x");
+        \\return (e instanceof RangeError && e instanceof Error) ? 1 : 0;
+    ));
+    // Engine-thrown errors are real Error objects now.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\try { null.x; } catch (e) { return (e instanceof TypeError) ? 1 : 0; }
+        \\return 0;
+    ));
+}
+
+test "Error.prototype.toString" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    const v = try eval(&vm, "return new Error('nope').toString();");
+    try testing.expect(v.isString());
+    try testing.expectEqualSlices(u16, &[_]u16{ 'E', 'r', 'r', 'o', 'r', ':', ' ', 'n', 'o', 'p', 'e' }, v.asString().units);
+}
+
+test "String / Number / Boolean" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return String(42) === '42' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 3.5), try evalNumber("return Number('3.5');"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return Boolean(0) === false ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return String(true) === 'true' ? 1 : 0;"));
+}
+
+test "Math" {
+    try testing.expectEqual(@as(f64, 5), try evalNumber("return Math.abs(-5);"));
+    try testing.expectEqual(@as(f64, 3), try evalNumber("return Math.floor(3.9);"));
+    try testing.expectEqual(@as(f64, 4), try evalNumber("return Math.ceil(3.1);"));
+    try testing.expectEqual(@as(f64, 4), try evalNumber("return Math.sqrt(16);"));
+    try testing.expectEqual(@as(f64, 7), try evalNumber("return Math.max(1, 7, 3);"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return Math.min(1, 7, 3);"));
+    try testing.expectEqual(@as(f64, 8), try evalNumber("return Math.pow(2, 3);"));
+}
+
+test "Object builtins" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { a: 1 };
+        \\return o.hasOwnProperty('a') && !o.hasOwnProperty('b') ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var proto = { greet: 5 };
+        \\var o = Object.create(proto);
+        \\return (Object.getPrototypeOf(o) === proto && o.greet === 5) ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 42), try evalNumber(
+        \\var o = {};
+        \\Object.defineProperty(o, 'x', { value: 42, enumerable: false });
+        \\return o.x;
+    ));
 }
 
 test "objects under GC stress" {

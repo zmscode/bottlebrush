@@ -35,14 +35,16 @@ const Runner = struct {
         if (meta.negative) |neg| {
             switch (neg.phase) {
                 .parse => return self.scoreParseNegative(source, meta),
-                // Runtime/resolution negatives need error-type checking (Error
-                // objects with .constructor.name) — not implemented yet.
-                .resolution, .runtime => return .skip,
+                .resolution, .runtime => {
+                    if (meta.flags.is_async or meta.flags.module) return .skip;
+                    // Expect a throw whose constructor name matches.
+                    return self.runTest(source, meta, neg.type_name);
+                },
             }
         }
         // Features the engine doesn't support yet.
-        if (meta.flags.is_async or meta.flags.module or meta.flags.raw) return .skip;
-        return self.runPositive(source, meta);
+        if (meta.flags.is_async or meta.flags.module) return .skip;
+        return self.runTest(source, meta, null);
     }
 
     fn scoreParseNegative(self: *Runner, source: []const u8, meta: frontmatter.Meta) report.Outcome {
@@ -57,11 +59,13 @@ const Runner = struct {
         }
     }
 
-    fn runPositive(self: *Runner, source: []const u8, meta: frontmatter.Meta) report.Outcome {
+    /// Build the combined source, run it in a fresh realm, and score. For a
+    /// negative test, `expected_error` is the constructor name that must be
+    /// thrown; for a positive test it is null (any throw is a failure).
+    fn runTest(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8) report.Outcome {
         const combined = self.buildSource(source, meta) catch return .skip;
         defer self.gpa.free(combined);
 
-        // Parse.
         const pr = parser.parse(self.gpa, combined, .script) catch return .skip;
         var ast_tree = switch (pr) {
             .syntax_error => return .skip, // parser gap, not a conformance failure
@@ -69,7 +73,6 @@ const Runner = struct {
         };
         defer ast_tree.deinit();
 
-        // Compile.
         const cr = compiler.compile(self.gpa, ast_tree.root, combined) catch return .skip;
         var program = switch (cr) {
             .compile_error => return .skip, // unsupported construct, not a failure
@@ -77,18 +80,30 @@ const Runner = struct {
         };
         defer program.deinit();
 
-        // Run in a fresh realm.
         var vm = bottlebrush.Vm.init(self.gpa);
         defer vm.deinit();
         _ = vm.run(&program) catch |e| switch (e) {
-            error.JsThrow => return .fail, // assertion failed or runtime error
+            error.JsThrow => {
+                if (expected_error) |want| {
+                    // Negative test: the thrown error's type must match.
+                    const name = vm.pendingErrorName(self.gpa);
+                    defer if (name) |n| self.gpa.free(n);
+                    if (name) |n| return if (std.mem.eql(u8, n, want)) .pass else .fail;
+                    return .fail;
+                }
+                return .fail; // positive test threw
+            },
             else => return .skip, // OOM / engine limit
         };
-        return .pass;
+        // Completed without throwing.
+        return if (expected_error != null) .fail else .pass;
     }
 
     /// Concatenate: [use strict] + sta.js + assert.js + includes + test source.
+    /// A `raw` test runs verbatim with no harness.
     fn buildSource(self: *Runner, source: []const u8, meta: frontmatter.Meta) ![]u8 {
+        if (meta.flags.raw) return self.gpa.dupe(u8, source);
+
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(self.gpa);
 
