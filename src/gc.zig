@@ -117,6 +117,10 @@ pub const Object = struct {
     /// DataView (with `is_dataview` set), where `ta.length` is a byte count.
     ta: ?TypedArrayView = null,
     is_dataview: bool = false,
+    /// Proxy exotic: when set, fundamental operations dispatch to trap functions
+    /// on `proxy_handler`, with `proxy_target` as the underlying object.
+    proxy_target: ?*Object = null,
+    proxy_handler: ?*Object = null,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -129,6 +133,8 @@ pub const Object = struct {
         }
         for (self.elements.items) |v| v.mark(t);
         if (self.ta) |ta| t.mark(&ta.buffer.gc);
+        if (self.proxy_target) |p| t.mark(&p.gc);
+        if (self.proxy_handler) |h| t.mark(&h.gc);
     }
 
     pub fn deinitCell(self: *Object, gpa: std.mem.Allocator) void {

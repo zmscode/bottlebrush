@@ -537,6 +537,21 @@ pub const Vm = struct {
         }
         try self.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 
+        // ---- Proxy + Reflect ----
+        const proxy_ctor = try self.makeNative("Proxy", nativeProxy, 2);
+        try self.defineData(global, "Proxy", Value.fromObject(proxy_ctor), true, false, true);
+
+        const reflect = try self.newObject(self.object_proto);
+        try self.defineMethod(reflect, "get", nativeReflectGet, 2);
+        try self.defineMethod(reflect, "set", nativeReflectSet, 3);
+        try self.defineMethod(reflect, "has", nativeReflectHas, 2);
+        try self.defineMethod(reflect, "deleteProperty", nativeReflectDelete, 2);
+        try self.defineMethod(reflect, "ownKeys", nativeReflectOwnKeys, 1);
+        try self.defineMethod(reflect, "getPrototypeOf", nativeReflectGetProto, 1);
+        try self.defineMethod(reflect, "apply", nativeReflectApply, 3);
+        try self.defineMethod(reflect, "construct", nativeReflectConstruct, 2);
+        try self.defineData(global, "Reflect", Value.fromObject(reflect), true, false, true);
+
         // ---- JSON ----
         const json = try self.newObject(self.object_proto);
         try self.defineMethod(json, "stringify", nativeJSONStringify, 3);
@@ -800,6 +815,21 @@ pub const Vm = struct {
     }
 
     fn callValue(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!Value {
+        // Callable proxy: dispatch to the `apply` trap, else forward to target.
+        if (callee.isObject()) {
+            if (callee.asObject().proxy_target) |target| {
+                const handler = callee.asObject().proxy_handler.?;
+                const trap = try self.getProperty(Value.fromObject(handler), "apply");
+                if (isCallable(trap)) {
+                    const arr = try self.newArray(0);
+                    try self.protect(Value.fromObject(arr));
+                    defer self.unprotect();
+                    for (args) |a| try arr.elements.append(self.gpa, a);
+                    return self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), this_value, Value.fromObject(arr) });
+                }
+                return self.callValue(Value.fromObject(target), this_value, args);
+            }
+        }
         if (!callee.isObject() or callee.asObject().callable == null) {
             return self.throwTypeError("value is not a function");
         }
@@ -824,6 +854,21 @@ pub const Vm = struct {
     /// constructor's `prototype`, run the constructor with it as `this`, and
     /// return the constructor's object result or that object.
     fn constructValue(self: *Vm, callee: Value, args: []const Value) Error!Value {
+        // Constructor proxy: dispatch to the `construct` trap, else forward.
+        if (callee.isObject()) {
+            if (callee.asObject().proxy_target) |target| {
+                const handler = callee.asObject().proxy_handler.?;
+                const trap = try self.getProperty(Value.fromObject(handler), "construct");
+                if (isCallable(trap)) {
+                    const arr = try self.newArray(0);
+                    try self.protect(Value.fromObject(arr));
+                    defer self.unprotect();
+                    for (args) |a| try arr.elements.append(self.gpa, a);
+                    return self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), Value.fromObject(arr), callee });
+                }
+                return self.constructValue(Value.fromObject(target), args);
+            }
+        }
         if (!callee.isObject() or callee.asObject().callable == null) {
             return self.throwTypeError("value is not a constructor");
         }
@@ -937,6 +982,16 @@ pub const Vm = struct {
 
     /// [[Get]] on a value: walk the prototype chain; invoke getters.
     fn getProperty(self: *Vm, base: Value, key: []const u8) Error!Value {
+        if (base.isObject()) {
+            if (base.asObject().proxy_target) |target| {
+                const handler = base.asObject().proxy_handler.?;
+                const trap = try self.getProperty(Value.fromObject(handler), "get");
+                if (isCallable(trap)) {
+                    return self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), base });
+                }
+                return self.getProperty(Value.fromObject(target), key);
+            }
+        }
         if (!base.isObject()) {
             if (base.isNullish()) return self.throwTypeError("cannot read property of null or undefined");
             // String primitives: length, index access, and String.prototype.
@@ -1001,6 +1056,17 @@ pub const Vm = struct {
     /// [[Set]] on a value: honor setters and writability; create own data
     /// property on the receiver otherwise.
     fn setProperty(self: *Vm, base: Value, key: []const u8, value: Value) Error!void {
+        if (base.isObject()) {
+            if (base.asObject().proxy_target) |target| {
+                const handler = base.asObject().proxy_handler.?;
+                const trap = try self.getProperty(Value.fromObject(handler), "set");
+                if (isCallable(trap)) {
+                    _ = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), value, base });
+                    return;
+                }
+                return self.setProperty(Value.fromObject(target), key, value);
+            }
+        }
         if (!base.isObject()) {
             if (base.isNullish()) return self.throwTypeError("cannot set property of null or undefined");
             return; // silent no-op on primitives (sloppy)
@@ -1103,6 +1169,15 @@ pub const Vm = struct {
         if (!obj.isObject()) return self.throwTypeError("cannot use 'in' on a non-object");
         const k = try self.toPropertyKey(key);
         defer self.gpa.free(k);
+        if (obj.asObject().proxy_target) |target| {
+            const handler = obj.asObject().proxy_handler.?;
+            const trap = try self.getProperty(Value.fromObject(handler), "has");
+            if (isCallable(trap)) {
+                const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(k) });
+                return toBoolean(r);
+            }
+            return self.hasProperty(target, k);
+        }
         return self.hasProperty(obj.asObject(), k);
     }
 
@@ -3768,6 +3843,109 @@ fn nativeSymbolKeyFor(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     return Value.undefined_value;
 }
 
+// ---- Proxy + Reflect built-ins ---------------------------------------------
+
+fn nativeProxy(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("Constructor Proxy requires 'new'");
+    const target = argAt(args, 0);
+    const handler = argAt(args, 1);
+    if (!target.isObject() or !handler.isObject()) {
+        return vm.throwTypeError("Cannot create proxy with a non-object as target or handler");
+    }
+    const obj = this.asObject();
+    obj.proxy_target = target.asObject();
+    obj.proxy_handler = handler.asObject();
+    // Inherit callability so `typeof` and call/construct dispatch behave.
+    obj.callable = target.asObject().callable;
+    return this;
+}
+
+fn nativeReflectGet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.get called on non-object");
+    const key = try vm.toPropertyKey(argAt(args, 1));
+    defer vm.gpa.free(key);
+    return vm.getProperty(target, key);
+}
+fn nativeReflectSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.set called on non-object");
+    const key = try vm.toPropertyKey(argAt(args, 1));
+    defer vm.gpa.free(key);
+    try vm.setProperty(target, key, argAt(args, 2));
+    return Value.fromBool(true);
+}
+fn nativeReflectHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.has called on non-object");
+    return Value.fromBool(try vm.inOperator(argAt(args, 1), target));
+}
+fn nativeReflectDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.deleteProperty called on non-object");
+    const key = try vm.toPropertyKey(argAt(args, 1));
+    defer vm.gpa.free(key);
+    if (target.asObject().properties.fetchOrderedRemove(key)) |kv| vm.gpa.free(kv.key);
+    return Value.fromBool(true);
+}
+fn nativeReflectGetProto(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.getPrototypeOf called on non-object");
+    return if (target.asObject().prototype) |p| Value.fromObject(p) else Value.null_value;
+}
+fn nativeReflectOwnKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.ownKeys called on non-object");
+    const o = target.asObject();
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    if (o.is_array) {
+        var i: usize = 0;
+        while (i < o.elements.items.len) : (i += 1) {
+            var b: [16]u8 = undefined;
+            try result.elements.append(vm.gpa, try vm.makeString(std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable));
+        }
+    }
+    var it = o.properties.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (k.len > 0 and k[0] == 0) continue; // skip internal/symbol keys
+        try result.elements.append(vm.gpa, try vm.makeString(k));
+    }
+    return Value.fromObject(result);
+}
+fn nativeReflectApply(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    const this_arg = argAt(args, 1);
+    const args_arr = argAt(args, 2);
+    const list: []const Value = if (args_arr.isObject() and args_arr.asObject().is_array) args_arr.asObject().elements.items else &.{};
+    return vm.callValue(target, this_arg, list);
+}
+fn nativeReflectConstruct(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    const args_arr = argAt(args, 1);
+    const list: []const Value = if (args_arr.isObject() and args_arr.asObject().is_array) args_arr.asObject().elements.items else &.{};
+    return vm.constructValue(target, list);
+}
+
 fn clampIndex(n: f64, len: i64) i64 {
     if (std.math.isNan(n) or n < 0) return 0;
     if (n > @as(f64, @floatFromInt(len))) return len;
@@ -4381,6 +4559,49 @@ test "TypedArrays under GC stress" {
         \\return total;
     );
     try testing.expectEqual(@as(f64, 45), v.asNumber()); // 0+1+...+9
+}
+
+test "Proxy" {
+    // get trap.
+    try testing.expectEqual(@as(f64, 100), try evalNumber(
+        \\var p = new Proxy({}, { get: function (t, k) { return 100; } });
+        \\return p.anything;
+    ));
+    // set trap intercepts.
+    try testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\var log = 0;
+        \\var p = new Proxy({}, { set: function (t, k, v) { log = v; return true; } });
+        \\p.x = 5;
+        \\return log;
+    ));
+    // has trap for `in`.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var p = new Proxy({}, { has: function (t, k) { return k === 'yes'; } });
+        \\return (('yes' in p) && !('no' in p)) ? 1 : 0;
+    ));
+    // No trap -> forwards to target.
+    try testing.expectEqual(@as(f64, 42), try evalNumber("var p = new Proxy({ v: 42 }, {}); return p.v;"));
+    // apply trap.
+    try testing.expectEqual(@as(f64, 20), try evalNumber(
+        \\function base() { return 1; }
+        \\var p = new Proxy(base, { apply: function (t, thisArg, args) { return args[0] * 2; } });
+        \\return p(10);
+    ));
+}
+
+test "Reflect" {
+    try testing.expectEqual(@as(f64, 3), try evalNumber("return Reflect.get({ a: 3 }, 'a');"));
+    try testing.expectEqual(@as(f64, 9), try evalNumber("var o = {}; Reflect.set(o, 'x', 9); return o.x;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return Reflect.has({ a: 1 }, 'a') ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 2), try evalNumber("return Reflect.ownKeys({ a: 1, b: 2 }).length;"));
+    try testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\function add(a, b) { return a + b; }
+        \\return Reflect.apply(add, null, [3, 4]);
+    ));
+    try testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\function Point(x) { this.x = x; }
+        \\return Reflect.construct(Point, [5]).x;
+    ));
 }
 
 test "Symbol" {
