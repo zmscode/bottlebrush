@@ -17,6 +17,10 @@ pub const token = @import("token.zig");
 pub const Lexer = @import("lexer.zig").Lexer;
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
+pub const bytecode = @import("bytecode.zig");
+pub const compiler = @import("compiler.zig");
+pub const interpreter = @import("interpreter.zig");
+pub const Vm = interpreter.Vm;
 
 test {
     // Pull in every module's tests. Add new modules here as phases land.
@@ -27,4 +31,7 @@ test {
     _ = @import("lexer.zig");
     _ = @import("ast.zig");
     _ = @import("parser.zig");
+    _ = @import("bytecode.zig");
+    _ = @import("compiler.zig");
+    _ = @import("interpreter.zig");
 }

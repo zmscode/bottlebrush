@@ -6,26 +6,33 @@ driven by [Test262](https://github.com/tc39/test262) conformance from day one.
 See [plan.md](plan.md) for the architecture and [phase/](phase/) for the
 per-phase build plans.
 
-## Status: Phase 1 — Lexer, parser & AST
+## Status: Phase 2 — Bytecode compiler & interpreter
 
-The front end is in place: source text now parses to an AST, and the Test262
-runner scores **parse-phase negatives** (SyntaxError tests). Execution still
-starts in Phase 2.
+The engine **executes**. Source compiles to register-based bytecode and runs on
+the interpreter: arithmetic, variables, control flow, functions, recursion, and
+closures all work (`zig build run` runs a demo). Objects, arrays, and the
+standard library arrive next, which is what unlocks Test262 *positive* scoring.
 
 - **Value** (`src/value.zig`) — tagged-union `Value` behind a stable accessor
   API (NaN-boxing swaps in later, Phase 7).
-- **GC** (`src/gc.zig`, `src/handle.zig`) — precise stop-the-world mark-sweep
-  with a `trace` interface, `HandleScope` rooting, and a `stress` flag.
-- **Lexer** (`src/token.zig`, `src/lexer.zig`) — full punctuator/number/string/
-  template set, keyword table, ASI signal, and parser-driven rescans for regex
-  literals and template continuations.
-- **Parser + AST** (`src/parser.zig`, `src/ast.zig`) — recursive descent with
-  precedence-climbing expressions, arrow cover-grammar via backtracking,
-  destructuring patterns, classes, and module syntax; arena-allocated AST.
-- **Test262 harness** (`test262/`) — parse-phase negatives are scored (PASS iff
-  a SyntaxError is reported). Positive tests and runtime negatives still SKIP
-  pending the evaluator. Full Unicode ID tables and cooked literal values are
-  deferred to later phases.
+- **GC** (`src/gc.zig`, `src/handle.zig`) — precise mark-sweep with `Environment`
+  and `Closure` cells, a `trace` interface, and a `stress` mode the VM honors.
+- **Lexer / Parser / AST** (`src/{token,lexer,parser,ast}.zig`) — full front end.
+- **Bytecode** (`src/bytecode.zig`) — register-based ops, `CodeBlock`, disassembler.
+- **Compiler** (`src/compiler.zig`) — AST → bytecode: scope analysis, var
+  hoisting, stack-discipline register allocation, control flow via jumps,
+  functions/closures.
+- **Interpreter** (`src/interpreter.zig`) — dispatch loop, coercions, equality,
+  calls (native-stack recursion, depth-guarded), and try/catch exception
+  unwinding via handler tables. The VM is a GC root provider.
+- **Test262 harness** (`test262/`) — parse-phase negatives are scored (100% of
+  the fixture slice). Positive tests still SKIP pending objects + the harness.
+
+**Phase-2 simplifications** (documented inline, tightened later): one
+environment per function (no per-iteration `let` bindings, no TDZ enforcement),
+`this` is `undefined`, engine-thrown errors are strings (real `Error` objects
+need the object model), and objects/arrays/member-access/`new`/destructuring/
+generators are reported as unsupported by the compiler for now.
 
 ## Requirements
 

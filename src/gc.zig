@@ -16,12 +16,18 @@
 //! when Phase 7 swaps in a generational GC.
 
 const std = @import("std");
+// Mutual import with value.zig: value references cell pointers, and cells
+// (Environment/Closure) reference `Value`. This is cycle-free at the type level
+// because all references are pointers/slices — no struct-size loop.
+const Value = @import("value.zig").Value;
 
 pub const Kind = enum(u8) {
     string,
     object,
     symbol,
     bigint,
+    environment,
+    closure,
 };
 
 /// Header prepended (as the first field) to every GC-managed cell.
@@ -49,10 +55,48 @@ pub const String = struct {
 pub const Object = struct {
     pub const gc_kind: Kind = .object;
     gc: GcHeader,
-    // Phase 3 adds the property map + prototype. Phase 0: an empty shell so the
-    // `Value.object` variant has something real to reference.
+    // Phase 3 adds the property map + prototype. Phase 2: an optional callable
+    // slot so a function is represented as an object that can be invoked.
+    callable: ?*Closure = null,
 
-    pub fn trace(_: *Object, _: *Tracer) void {}
+    pub fn trace(self: *Object, t: *Tracer) void {
+        if (self.callable) |c| t.mark(&c.gc);
+    }
+};
+
+/// A function activation blueprint: compiled code plus the lexical environment
+/// captured at creation. `code` is an opaque `*const bytecode.CodeBlock`
+/// (kept opaque to avoid a gc→bytecode→value import cycle); the interpreter
+/// casts it back.
+pub const Closure = struct {
+    pub const gc_kind: Kind = .closure;
+    gc: GcHeader,
+    /// `*const bytecode.CodeBlock` (opaque here). Set by the interpreter right
+    /// after allocation; never traced, so a brief undefined value is safe.
+    code: *const anyopaque = undefined,
+    env: ?*Environment = null,
+
+    pub fn trace(self: *Closure, t: *Tracer) void {
+        if (self.env) |e| t.mark(&e.gc);
+    }
+};
+
+/// A declarative environment record: a flat array of variable slots plus a
+/// parent link. Identifiers are resolved at compile time to (depth, slot).
+pub const Environment = struct {
+    pub const gc_kind: Kind = .environment;
+    gc: GcHeader,
+    parent: ?*Environment = null,
+    slots: []Value = &.{},
+
+    pub fn trace(self: *Environment, t: *Tracer) void {
+        if (self.parent) |p| t.mark(&p.gc);
+        for (self.slots) |v| v.mark(t);
+    }
+
+    pub fn deinitCell(self: *Environment, gpa: std.mem.Allocator) void {
+        if (self.slots.len != 0) gpa.free(self.slots);
+    }
 };
 
 pub const Symbol = struct {
@@ -88,6 +132,8 @@ pub const Tracer = struct {
             .object => cellFromHeader(Object, header).trace(self),
             .symbol => cellFromHeader(Symbol, header).trace(self),
             .bigint => cellFromHeader(BigInt, header).trace(self),
+            .environment => cellFromHeader(Environment, header).trace(self),
+            .closure => cellFromHeader(Closure, header).trace(self),
         }
     }
 };
@@ -178,6 +224,12 @@ pub const Heap = struct {
                 self.gpa.destroy(s);
             },
             .bigint => self.gpa.destroy(cellFromHeader(BigInt, header)),
+            .environment => {
+                const e = cellFromHeader(Environment, header);
+                e.deinitCell(self.gpa);
+                self.gpa.destroy(e);
+            },
+            .closure => self.gpa.destroy(cellFromHeader(Closure, header)),
         }
     }
 };
