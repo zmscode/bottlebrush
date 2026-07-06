@@ -472,21 +472,22 @@ pub const Compiler = struct {
         try self.patchContinues(&ctx, cont_target);
     }
 
-    /// `for (LHS of RHS) body` desugared to index iteration over `length` +
-    /// element access. This covers arrays and strings; the full iteration
-    /// protocol (Symbol.iterator) is deferred.
+    /// `for (LHS of RHS) body` using the iteration protocol: get an iterator
+    /// via @@iterator, then loop over `iterator.next()` until `{done: true}`.
     fn compileForOf(self: *Compiler, s: anytype) CompileError!void {
         try self.pushBlock();
         defer self.popBlock();
 
-        // Resolve the loop-variable assignment target once.
         const target = try self.forHeadTarget(s.left);
 
+        // iter = GetIterator(RHS)
         const iter_reg = self.allocReg();
-        try self.compileExprInto(iter_reg, s.right);
-        const idx_reg = self.allocReg();
-        const zero = try self.addConst(.{ .number = 0 });
-        _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = zero });
+        {
+            const src_reg = self.allocReg();
+            try self.compileExprInto(src_reg, s.right);
+            _ = try self.emit(.{ .op = .iter_init, .a = iter_reg, .b = src_reg });
+            self.freeTo(src_reg + 1); // free src_reg, keep iter_reg
+        }
 
         var ctx = LoopCtx{};
         const prev_loop = self.loop;
@@ -497,29 +498,25 @@ pub const Compiler = struct {
         defer self.break_target = prev_break;
 
         const top = self.here();
-        // if (idx >= iter.length) break
-        const len_reg = self.allocReg();
-        const len_name = try self.addConst(.{ .string = "length" });
-        _ = try self.emit(.{ .op = .get_prop, .a = len_reg, .b = iter_reg, .c = len_name });
-        const cond_reg = self.allocReg();
-        _ = try self.emit(.{ .op = .ge, .a = cond_reg, .b = idx_reg, .c = len_reg });
-        const jexit = try self.emit(.{ .op = .jump_if_true, .a = cond_reg });
-        self.freeTo(len_reg);
+        // result = iter.next(); if (result.done) break
+        const result_reg = self.allocReg();
+        _ = try self.emit(.{ .op = .iter_next, .a = result_reg, .b = iter_reg });
+        const done_reg = self.allocReg();
+        const done_name = try self.addConst(.{ .string = "done" });
+        _ = try self.emit(.{ .op = .get_prop, .a = done_reg, .b = result_reg, .c = done_name });
+        const jexit = try self.emit(.{ .op = .jump_if_true, .a = done_reg });
+        self.freeTo(result_reg + 1); // free done_reg, keep result_reg
 
-        // elem = iter[idx]; assign to the loop variable
-        const elem_reg = self.allocReg();
-        _ = try self.emit(.{ .op = .get_elem, .a = elem_reg, .b = iter_reg, .c = idx_reg });
-        try self.emitAssignTarget(target, elem_reg);
-        self.freeTo(elem_reg);
+        // loopVar = result.value
+        const value_reg = self.allocReg();
+        const value_name = try self.addConst(.{ .string = "value" });
+        _ = try self.emit(.{ .op = .get_prop, .a = value_reg, .b = result_reg, .c = value_name });
+        try self.emitAssignTarget(target, value_reg);
+        self.freeTo(result_reg);
 
         try self.compileStmt(s.body);
 
         const cont_target = self.here();
-        const one_reg = self.allocReg();
-        const one = try self.addConst(.{ .number = 1 });
-        _ = try self.emit(.{ .op = .load_const, .a = one_reg, .b = one });
-        _ = try self.emit(.{ .op = .add, .a = idx_reg, .b = idx_reg, .c = one_reg });
-        self.freeTo(one_reg);
         _ = try self.emit(.{ .op = .jump, .a = top });
 
         self.patchTarget(jexit, self.here());

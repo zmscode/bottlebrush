@@ -87,6 +87,9 @@ pub const Op = enum(u8) {
     load_this, // a=dst
     arr_push, // a=array reg, b=value reg  (append one)
     arr_spread, // a=array reg, b=iterable reg  (append all elements)
+    iter_init, // a=dst iterator, b=iterable reg  (GetIterator)
+    iter_next, // a=dst result{value,done}, b=iterator reg  (IteratorNext)
+    gen_yield, // a=dst (resumed value), b=yielded value reg
 
     // Functions
     new_closure, // a=dst, b=child code-block index

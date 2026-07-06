@@ -28,6 +28,7 @@ const Frame = struct {
     env: *gc.Environment,
     regs: []Value,
     this_value: Value,
+    pc: u32 = 0,
 };
 
 pub const Vm = struct {
@@ -63,6 +64,12 @@ pub const Vm = struct {
     symbol_proto: ?*gc.Object = null,
     /// Global symbol registry (Symbol.for / Symbol.keyFor).
     symbol_registry: std.ArrayList(SymbolReg) = .empty,
+    /// The well-known @@iterator symbol (used to drive the iteration protocol).
+    symbol_iterator: ?Value = null,
+    /// The property-map key encoding @@iterator (owned).
+    symbol_iterator_key: []const u8 = &.{},
+    iterator_proto: ?*gc.Object = null,
+    generator_proto: ?*gc.Object = null,
 
     const SymbolReg = struct { key: []u8, sym: *gc.Symbol };
 
@@ -74,6 +81,7 @@ pub const Vm = struct {
         self.temp_roots.deinit(self.gpa);
         for (self.symbol_registry.items) |r| self.gpa.free(r.key);
         self.symbol_registry.deinit(self.gpa);
+        if (self.symbol_iterator_key.len != 0) self.gpa.free(self.symbol_iterator_key);
         self.heap.deinit();
     }
 
@@ -99,6 +107,9 @@ pub const Vm = struct {
         if (self.typed_array_proto) |o| tracer.mark(&o.gc);
         if (self.dataview_proto) |o| tracer.mark(&o.gc);
         if (self.symbol_proto) |o| tracer.mark(&o.gc);
+        if (self.symbol_iterator) |s| s.mark(tracer);
+        if (self.iterator_proto) |o| tracer.mark(&o.gc);
+        if (self.generator_proto) |o| tracer.mark(&o.gc);
         for (self.symbol_registry.items) |r| tracer.mark(&r.sym.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
@@ -226,6 +237,15 @@ pub const Vm = struct {
     fn installBuiltins(self: *Vm) Error!void {
         const global = self.global_object.?;
 
+        // ---- @@iterator + %IteratorPrototype% (iterables below reference it) ----
+        const sym_iter = try self.makeSymbol("Symbol.iterator");
+        self.symbol_iterator = sym_iter;
+        self.symbol_iterator_key = try self.toPropertyKey(sym_iter);
+        const iter_proto = try self.newObject(self.object_proto);
+        self.iterator_proto = iter_proto;
+        try self.defineMethod(iter_proto, "next", nativeIteratorNext, 0);
+        try self.defineData(iter_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("[Symbol.iterator]", nativeIterSelf, 0)), true, false, true);
+
         // ---- Object.prototype methods + Object constructor ----
         try self.defineMethod(self.object_proto.?, "hasOwnProperty", nativeHasOwnProperty, 1);
         try self.defineMethod(self.object_proto.?, "toString", nativeObjectToString, 0);
@@ -277,6 +297,10 @@ pub const Vm = struct {
         try self.defineMethod(array_proto, "forEach", nativeArrayForEach, 1);
         try self.defineMethod(array_proto, "map", nativeArrayMap, 1);
         try self.defineMethod(array_proto, "filter", nativeArrayFilter, 1);
+        try self.defineMethod(array_proto, "values", nativeIterableValues, 0);
+        try self.defineMethod(array_proto, "keys", nativeIterableKeys, 0);
+        try self.defineMethod(array_proto, "entries", nativeIterableEntries, 0);
+        try self.defineData(array_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
         try self.defineMethod(array_proto, "toString", nativeArrayToString, 0);
         const array_ctor = try self.makeNative("Array", nativeArray, 1);
         try self.defineData(array_ctor, "prototype", Value.fromObject(array_proto), false, false, false);
@@ -301,6 +325,7 @@ pub const Vm = struct {
         try self.defineMethod(string_proto, "repeat", nativeStringRepeat, 1);
         try self.defineMethod(string_proto, "concat", nativeStringConcat, 1);
         try self.defineMethod(string_proto, "split", nativeStringSplit, 2);
+        try self.defineData(string_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("[Symbol.iterator]", nativeIterableValues, 0)), true, false, true);
         try self.defineMethod(string_proto, "toString", nativeStringToString, 0);
         try self.defineMethod(string_proto, "valueOf", nativeStringToString, 0);
         const string_ctor = try self.makeNative("String", nativeString, 1);
@@ -400,6 +425,10 @@ pub const Vm = struct {
         try self.defineMethod(map_proto, "delete", nativeMapDelete, 1);
         try self.defineMethod(map_proto, "clear", nativeCollectionClear, 0);
         try self.defineMethod(map_proto, "forEach", nativeMapForEach, 1);
+        try self.defineMethod(map_proto, "entries", nativeIterableEntries, 0);
+        try self.defineMethod(map_proto, "keys", nativeIterableKeys, 0);
+        try self.defineMethod(map_proto, "values", nativeIterableValues, 0);
+        try self.defineData(map_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("entries", nativeIterableEntries, 0)), true, false, true);
         try self.defineGetter(map_proto, "size", nativeMapSize);
         const map_ctor = try self.makeNative("Map", nativeMap, 0);
         try self.defineData(map_ctor, "prototype", Value.fromObject(map_proto), false, false, false);
@@ -414,6 +443,10 @@ pub const Vm = struct {
         try self.defineMethod(set_proto, "delete", nativeSetDelete, 1);
         try self.defineMethod(set_proto, "clear", nativeCollectionClear, 0);
         try self.defineMethod(set_proto, "forEach", nativeSetForEach, 1);
+        try self.defineMethod(set_proto, "values", nativeIterableValues, 0);
+        try self.defineMethod(set_proto, "keys", nativeIterableValues, 0);
+        try self.defineMethod(set_proto, "entries", nativeIterableEntries, 0);
+        try self.defineData(set_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
         try self.defineGetter(set_proto, "size", nativeSetSize);
         const set_ctor = try self.makeNative("Set", nativeSet, 0);
         try self.defineData(set_ctor, "prototype", Value.fromObject(set_proto), false, false, false);
@@ -469,6 +502,8 @@ pub const Vm = struct {
         try self.defineMethod(ta_proto, "toString", nativeTAJoin, 0);
         try self.defineMethod(ta_proto, "forEach", nativeTAForEach, 1);
         try self.defineMethod(ta_proto, "indexOf", nativeTAIndexOf, 1);
+        try self.defineMethod(ta_proto, "values", nativeIterableValues, 0);
+        try self.defineData(ta_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
 
         const ta_types = .{
             .{ "Int8Array", gc.TAKind.i8 },
@@ -533,7 +568,11 @@ pub const Vm = struct {
             "species",   "toPrimitive",   "toStringTag", "unscopables",
         };
         inline for (well_known) |name| {
-            try self.defineData(symbol_ctor, name, try self.makeSymbol("Symbol." ++ name), false, false, false);
+            const sym = if (comptime std.mem.eql(u8, name, "iterator"))
+                self.symbol_iterator.?
+            else
+                try self.makeSymbol("Symbol." ++ name);
+            try self.defineData(symbol_ctor, name, sym, false, false, false);
         }
         try self.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 
@@ -613,7 +652,8 @@ pub const Vm = struct {
 
     // ---- execution ---------------------------------------------------------
 
-    const Step = union(enum) { advance, jumped, returned: Value };
+    const Step = union(enum) { advance, jumped, returned: Value, yielded: Value };
+    const RunResult = union(enum) { returned: Value, yielded: Value };
 
     fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, this_value: Value) Error!Value {
         const regs = try self.gpa.alloc(Value, code.num_registers);
@@ -624,23 +664,33 @@ pub const Vm = struct {
         try self.frames.append(self.gpa, &frame);
         defer _ = self.frames.pop();
 
-        var pc: u32 = 0;
+        return switch (try self.runLoop(&frame)) {
+            .returned => |v| v,
+            .yielded => unreachable, // only generator frames yield
+        };
+    }
+
+    /// The core dispatch loop over a frame. Runs until the function returns or a
+    /// generator yields (leaving `frame.pc` at the `gen_yield` instruction).
+    fn runLoop(self: *Vm, frame: *Frame) Error!RunResult {
+        const code = frame.code;
         while (true) {
-            const inst = code.code[pc];
-            const step = self.exec(code, env, regs, frame.this_value, inst, &pc) catch |e| {
+            const inst = code.code[frame.pc];
+            const step = self.exec(code, frame.env, frame.regs, frame.this_value, inst, &frame.pc) catch |e| {
                 if (e != error.JsThrow) return e;
-                if (self.findHandler(code, pc)) |h| {
-                    regs[h.catch_reg] = self.pending_exception.?;
+                if (self.findHandler(code, frame.pc)) |h| {
+                    frame.regs[h.catch_reg] = self.pending_exception.?;
                     self.pending_exception = null;
-                    pc = h.target_pc;
+                    frame.pc = h.target_pc;
                     continue;
                 }
                 return error.JsThrow;
             };
             switch (step) {
-                .advance => pc += 1,
+                .advance => frame.pc += 1,
                 .jumped => {},
-                .returned => |v| return v,
+                .returned => |v| return .{ .returned = v },
+                .yielded => |v| return .{ .yielded = v },
             }
         }
     }
@@ -755,6 +805,9 @@ pub const Vm = struct {
             .load_this => regs[inst.a] = this_value,
             .arr_push => try regs[inst.a].asObject().elements.append(self.gpa, regs[inst.b]),
             .arr_spread => try self.spreadInto(regs[inst.a].asObject(), regs[inst.b]),
+            .iter_init => regs[inst.a] = try self.getIterator(regs[inst.b]),
+            .iter_next => regs[inst.a] = try self.iteratorNext(regs[inst.b]),
+            .gen_yield => return Step{ .yielded = regs[inst.b] },
 
             .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env),
             .call => {
@@ -921,6 +974,59 @@ pub const Vm = struct {
             }
         }
         return self.throwTypeError("value is not iterable");
+    }
+
+    // ---- iteration protocol ------------------------------------------------
+
+    fn makeIterResult(self: *Vm, value: Value, done: bool) Error!Value {
+        const o = try self.newObject(self.object_proto);
+        try self.protect(Value.fromObject(o));
+        defer self.unprotect();
+        try self.defineData(o, "value", value, true, true, true);
+        try self.defineData(o, "done", Value.fromBool(done), true, true, true);
+        return Value.fromObject(o);
+    }
+
+    /// A built-in iterator over `target`. kind: 0=values, 1=keys, 2=entries.
+    fn makeIterator(self: *Vm, target: Value, kind: u8) Error!Value {
+        const it = try self.newObject(self.iterator_proto);
+        try self.protect(Value.fromObject(it));
+        defer self.unprotect();
+        try self.defineData(it, "\x00itT", target, true, false, false);
+        try self.defineData(it, "\x00itI", Value.fromNumber(0), true, false, false);
+        try self.defineData(it, "\x00itK", Value.fromNumber(@floatFromInt(kind)), true, false, false);
+        return Value.fromObject(it);
+    }
+
+    /// GetIterator(obj): obj[@@iterator]().
+    fn getIterator(self: *Vm, iterable: Value) Error!Value {
+        const method = try self.getProperty(iterable, self.symbol_iterator_key);
+        if (!isCallable(method)) return self.throwTypeError("value is not iterable");
+        const iter = try self.callValue(method, iterable, &.{});
+        if (!iter.isObject()) return self.throwTypeError("iterator method did not return an object");
+        return iter;
+    }
+
+    /// IteratorNext(iter): iter.next().
+    fn iteratorNext(self: *Vm, iter: Value) Error!Value {
+        const next = try self.getProperty(iter, "next");
+        const r = try self.callValue(next, iter, &.{});
+        if (!r.isObject()) return self.throwTypeError("iterator result is not an object");
+        return r;
+    }
+
+    fn iterPair(self: *Vm, a: Value, b: Value) Error!Value {
+        const arr = try self.newArray(2);
+        arr.elements.items[0] = a;
+        arr.elements.items[1] = b;
+        return Value.fromObject(arr);
+    }
+    fn iterEntryValue(self: *Vm, kind: u8, index: Value, element: Value) Error!Value {
+        return switch (kind) {
+            1 => index, // keys
+            2 => self.iterPair(index, element), // entries
+            else => element, // values
+        };
     }
 
     fn newArray(self: *Vm, len: u32) Error!*gc.Object {
@@ -3231,6 +3337,74 @@ fn nativeCollectionClear(ctx: *anyopaque, this: Value, args: []const Value) Erro
     return Value.undefined_value;
 }
 
+// ---- iterator built-ins ----------------------------------------------------
+
+fn nativeIterSelf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = args;
+    return this;
+}
+fn nativeIterableValues(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return castVm(ctx).makeIterator(this, 0);
+}
+fn nativeIterableKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return castVm(ctx).makeIterator(this, 1);
+}
+fn nativeIterableEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return castVm(ctx).makeIterator(this, 2);
+}
+
+fn nativeIteratorNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("not an iterator");
+    const t = try vm.getProperty(this, "\x00itT");
+    if (t.isUndefined()) return vm.makeIterResult(Value.undefined_value, true);
+    const idx: usize = @intFromFloat((try vm.getProperty(this, "\x00itI")).asNumber());
+    const kind: u8 = @intFromFloat((try vm.getProperty(this, "\x00itK")).asNumber());
+
+    var value: Value = Value.undefined_value;
+    var exhausted = false;
+    const index_val = Value.fromNumber(@floatFromInt(idx));
+    if (t.isString()) {
+        const units = t.asString().units;
+        if (idx >= units.len) exhausted = true else value = try vm.makeStringFromUtf16(units[idx .. idx + 1]);
+    } else if (t.isObject()) {
+        const o = t.asObject();
+        if (o.is_array) {
+            if (idx >= o.elements.items.len) exhausted = true else value = try vm.iterEntryValue(kind, index_val, o.elements.items[idx]);
+        } else if (o.ta) |ta| {
+            if (idx >= ta.length) exhausted = true else value = try vm.iterEntryValue(kind, index_val, readTypedElement(ta, @intCast(idx)));
+        } else if (o.collection == .set) {
+            if (idx >= o.elements.items.len) exhausted = true else {
+                const v = o.elements.items[idx];
+                value = if (kind == 2) try vm.iterPair(v, v) else v;
+            }
+        } else if (o.collection == .map) {
+            const count = o.elements.items.len / 2;
+            if (idx >= count) exhausted = true else {
+                const k = o.elements.items[idx * 2];
+                const v = o.elements.items[idx * 2 + 1];
+                value = switch (kind) {
+                    1 => k,
+                    2 => try vm.iterPair(k, v),
+                    else => v,
+                };
+            }
+        } else exhausted = true;
+    } else exhausted = true;
+
+    if (exhausted) {
+        try vm.setProperty(this, "\x00itT", Value.undefined_value);
+        return vm.makeIterResult(Value.undefined_value, true);
+    }
+    try vm.setProperty(this, "\x00itI", Value.fromNumber(@floatFromInt(idx + 1)));
+    return vm.makeIterResult(value, false);
+}
+
 // ---- Date built-ins --------------------------------------------------------
 //
 // The time value (ms since the Unix epoch) is stored in a non-enumerable
@@ -4737,6 +4911,36 @@ test "switch statements" {
         \\var x = 0;
         \\switch (1) { case 1: x += 1; case 2: x += 2; break; case 3: x += 100; }
         \\return x;
+    ));
+}
+
+test "iteration protocol" {
+    // for-of over Set / Map / Array iterators.
+    try testing.expectEqual(@as(f64, 6), try evalNumber("var s = 0; for (var x of new Set([1, 2, 3])) s += x; return s;"));
+    try testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\var s = 0;
+        \\for (var e of new Map([['a', 1], ['b', 2]])) s += e[1];
+        \\return s;
+    ));
+    try testing.expectEqual(@as(f64, 30), try evalNumber("var s = 0; for (var v of [10, 20].values()) s += v; return s;"));
+    try testing.expectEqual(@as(f64, 3), try evalNumber("var s = 0; for (var k of [0, 0, 0].keys()) s += 1; return s;"));
+    try testing.expectEqual(@as(f64, 5), try evalNumber("var it = [5].entries().next(); return it.value[0] + it.value[1];"));
+    // Manual iterator use.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var it = [1, 2][Symbol.iterator]();
+        \\var r = it.next();
+        \\return (r.value === 1 && r.done === false) ? 1 : 0;
+    ));
+    // Custom iterable via a computed Symbol.iterator key.
+    try testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\var obj = {};
+        \\obj[Symbol.iterator] = function () {
+        \\  var i = 0;
+        \\  return { next: function () { return i < 3 ? { value: i++, done: false } : { value: undefined, done: true }; } };
+        \\};
+        \\var s = 0;
+        \\for (var x of obj) s += x;
+        \\return s;
     ));
 }
 
