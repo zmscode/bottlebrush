@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.sinh, "name", {
-  value: "sinh",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "sinh",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

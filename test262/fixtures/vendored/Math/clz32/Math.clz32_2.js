@@ -7,4 +7,4 @@ author: Ryan Lewis
 description: Math.clz32 should return 0 if passed 2147483648
 ---*/
 
-assert.sameValue(Math.clz32(2147483648), 0, 'Math.clz32(2147483648)');
+assert.sameValue(Math.clz32(2147483648), 0, "Math.clz32(2147483648)");

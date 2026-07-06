@@ -14,10 +14,10 @@ includes: [propertyHelper.js]
 features: [Symbol.toStringTag]
 ---*/
 
-assert.sameValue(Math[Symbol.toStringTag], 'Math');
+assert.sameValue(Math[Symbol.toStringTag], "Math");
 
 verifyProperty(Math, Symbol.toStringTag, {
-  writable: false,
-  enumerable: false,
-  configurable: true,
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

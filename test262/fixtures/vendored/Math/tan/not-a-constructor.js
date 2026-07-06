@@ -21,9 +21,8 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.tan), false, 'isConstructor(Math.tan) must return false');
+assert.sameValue(isConstructor(Math.tan), false, "isConstructor(Math.tan) must return false");
 
 assert.throws(TypeError, () => {
-  new Math.tan();
+	new Math.tan();
 });
-

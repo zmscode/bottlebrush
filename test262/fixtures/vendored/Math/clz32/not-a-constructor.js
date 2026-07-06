@@ -21,9 +21,8 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.clz32), false, 'isConstructor(Math.clz32) must return false');
+assert.sameValue(isConstructor(Math.clz32), false, "isConstructor(Math.clz32) must return false");
 
 assert.throws(TypeError, () => {
-  new Math.clz32();
+	new Math.clz32();
 });
-

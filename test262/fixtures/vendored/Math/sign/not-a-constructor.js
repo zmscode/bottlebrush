@@ -21,9 +21,8 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.sign), false, 'isConstructor(Math.sign) must return false');
+assert.sameValue(isConstructor(Math.sign), false, "isConstructor(Math.sign) must return false");
 
 assert.throws(TypeError, () => {
-  new Math.sign();
+	new Math.sign();
 });
-

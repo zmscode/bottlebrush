@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.sign, "name", {
-  value: "sign",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "sign",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

@@ -9,4 +9,4 @@ description: Checking if Math.exp(+Infinity) is +Ifinity
 
 // CHECK#1
 var x = +Infinity;
-assert.sameValue(Math.exp(x), +Infinity, 'Math.exp(+Infinity) must return +Infinity');
+assert.sameValue(Math.exp(x), +Infinity, "Math.exp(+Infinity) must return +Infinity");

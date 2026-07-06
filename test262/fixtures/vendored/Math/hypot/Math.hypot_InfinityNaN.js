@@ -9,4 +9,4 @@ description: >
     is Infinity.
 ---*/
 
-assert.sameValue(Math.hypot(NaN, Infinity), Infinity, 'Math.hypot(NaN, Infinity)');
+assert.sameValue(Math.hypot(NaN, Infinity), Infinity, "Math.hypot(NaN, Infinity)");

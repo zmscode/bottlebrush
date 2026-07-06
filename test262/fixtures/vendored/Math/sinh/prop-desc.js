@@ -8,7 +8,7 @@ es6id: 20.2.2.31
 ---*/
 
 verifyProperty(Math, "sinh", {
-  writable: true,
-  enumerable: false,
-  configurable: true
+	writable: true,
+	enumerable: false,
+	configurable: true,
 });

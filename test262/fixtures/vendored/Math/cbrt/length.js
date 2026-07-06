@@ -22,8 +22,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.cbrt, "length", {
-  value: 1,
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: 1,
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

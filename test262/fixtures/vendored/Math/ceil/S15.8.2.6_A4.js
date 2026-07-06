@@ -9,4 +9,4 @@ description: Checking if Math.ceil(x) is +Infinity, where x is +Infinity
 
 // CHECK#1
 var x = +Infinity;
-assert.sameValue(Math.ceil(x), +Infinity, 'Math.ceil(+Infinity) must return +Infinity');
+assert.sameValue(Math.ceil(x), +Infinity, "Math.ceil(+Infinity) must return +Infinity");

@@ -9,4 +9,4 @@ description: Checking if Math.sqrt(+Infinity) is +Infinity
 
 // CHECK#1
 var x = +Infinity;
-assert.sameValue(Math.sqrt(x), +Infinity, 'Math.sqrt(+Infinity) must return +Infinity');
+assert.sameValue(Math.sqrt(x), +Infinity, "Math.sqrt(+Infinity) must return +Infinity");

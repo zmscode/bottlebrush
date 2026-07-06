@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.sqrt, "name", {
-  value: "sqrt",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "sqrt",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

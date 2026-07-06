@@ -10,7 +10,7 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math, "f16round", {
-  writable: true,
-  enumerable: false,
-  configurable: true,
+	writable: true,
+	enumerable: false,
+	configurable: true,
 });

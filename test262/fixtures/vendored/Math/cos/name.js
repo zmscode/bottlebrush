@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.cos, "name", {
-  value: "cos",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "cos",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

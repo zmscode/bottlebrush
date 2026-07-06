@@ -9,4 +9,4 @@ description: Checking if Math.round(x) is -Infinity, where x is -Infinity
 
 // CHECK#1
 var x = -Infinity;
-assert.sameValue(Math.round(x), -Infinity, 'Math.round(-Infinity) must return -Infinity');
+assert.sameValue(Math.round(x), -Infinity, "Math.round(-Infinity) must return -Infinity");

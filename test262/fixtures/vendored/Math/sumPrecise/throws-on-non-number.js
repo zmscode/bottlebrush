@@ -8,66 +8,65 @@ features: [Math.sumPrecise]
 ---*/
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise([{}]);
+	Math.sumPrecise([{}]);
 });
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise([0n]);
+	Math.sumPrecise([0n]);
 });
-
 
 var coercions = 0;
 var objectWithValueOf = {
-  valueOf: function() {
-    ++coercions;
-    throw new Test262Error("valueOf should not be called");
-  },
-  toString: function() {
-    ++coercions;
-    throw new Test262Error("toString should not be called");
-  }
+	valueOf: function () {
+		++coercions;
+		throw new Test262Error("valueOf should not be called");
+	},
+	toString: function () {
+		++coercions;
+		throw new Test262Error("toString should not be called");
+	},
 };
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise([objectWithValueOf]);
+	Math.sumPrecise([objectWithValueOf]);
 });
 assert.sameValue(coercions, 0);
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise([objectWithValueOf, NaN]);
+	Math.sumPrecise([objectWithValueOf, NaN]);
 });
 assert.sameValue(coercions, 0);
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise([NaN, objectWithValueOf]);
+	Math.sumPrecise([NaN, objectWithValueOf]);
 });
 assert.sameValue(coercions, 0);
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise([-Infinity, Infinity, objectWithValueOf]);
+	Math.sumPrecise([-Infinity, Infinity, objectWithValueOf]);
 });
 assert.sameValue(coercions, 0);
 
 var nextCalls = 0;
 var returnCalls = 0;
 var iterator = {
-  next: function () {
-    ++nextCalls;
-    return { done: false, value: objectWithValueOf };
-  },
-  return: function () {
-    ++returnCalls;
-    return {};
-  }
+	next: function () {
+		++nextCalls;
+		return { done: false, value: objectWithValueOf };
+	},
+	return: function () {
+		++returnCalls;
+		return {};
+	},
 };
 var iterable = {
-  [Symbol.iterator]: function () {
-    return iterator;
-  }
+	[Symbol.iterator]: function () {
+		return iterator;
+	},
 };
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise(iterable);
+	Math.sumPrecise(iterable);
 });
 assert.sameValue(coercions, 0);
 assert.sameValue(nextCalls, 1);

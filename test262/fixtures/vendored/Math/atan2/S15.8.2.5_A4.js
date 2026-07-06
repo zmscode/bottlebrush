@@ -15,7 +15,6 @@ x[2] = +Infinity;
 x[1] = 1;
 var xnum = 3;
 
-for (var i = 0; i < xnum; i++)
-{
-  assert.sameValue(Math.atan2(y, x[i]), 0, x[i]);
+for (var i = 0; i < xnum; i++) {
+	assert.sameValue(Math.atan2(y, x[i]), 0, x[i]);
 }

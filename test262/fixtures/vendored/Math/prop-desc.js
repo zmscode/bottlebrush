@@ -25,16 +25,24 @@ includes: [propertyHelper.js]
 
 assert.sameValue(typeof Math, "object");
 
-assert.throws(TypeError, function() {
-  Math();
-}, "no [[Call]]");
+assert.throws(
+	TypeError,
+	function () {
+		Math();
+	},
+	"no [[Call]]",
+);
 
-assert.throws(TypeError, function() {
-  new Math();
-}, "no [[Construct]]");
+assert.throws(
+	TypeError,
+	function () {
+		new Math();
+	},
+	"no [[Construct]]",
+);
 
 verifyProperty(this, "Math", {
-  enumerable: false,
-  writable: true,
-  configurable: true
+	enumerable: false,
+	writable: true,
+	configurable: true,
 });

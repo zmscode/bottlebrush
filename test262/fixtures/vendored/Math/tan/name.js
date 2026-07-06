@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.tan, "name", {
-  value: "tan",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "tan",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

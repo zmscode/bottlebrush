@@ -7,5 +7,5 @@ author: Ryan Lewis
 description: Return arg when called with Infinity or -Infinity.
 ---*/
 
-assert.sameValue(Math.trunc(Infinity), Infinity, 'Math.trunc(Infinity)');
-assert.sameValue(Math.trunc(-Infinity), -Infinity, 'Math.trunc(-Infinity)');
+assert.sameValue(Math.trunc(Infinity), Infinity, "Math.trunc(Infinity)");
+assert.sameValue(Math.trunc(-Infinity), -Infinity, "Math.trunc(-Infinity)");

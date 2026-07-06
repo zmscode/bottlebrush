@@ -7,4 +7,4 @@ author: Ryan Lewis
 description: Math.hypot should return 0 if called with no arguments.
 ---*/
 
-assert.sameValue(Math.hypot(), 0, 'Math.hypot()');
+assert.sameValue(Math.hypot(), 0, "Math.hypot()");

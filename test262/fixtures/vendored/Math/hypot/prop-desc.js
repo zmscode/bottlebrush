@@ -8,7 +8,7 @@ es6id: 20.2.2.18
 ---*/
 
 verifyProperty(Math, "hypot", {
-  writable: true,
-  enumerable: false,
-  configurable: true
+	writable: true,
+	enumerable: false,
+	configurable: true,
 });

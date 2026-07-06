@@ -10,5 +10,5 @@ info: |
     The precision of this approximation is host-defined.
 ---*/
 
-assert.sameValue(typeof Math.PI, 'number');
+assert.sameValue(typeof Math.PI, "number");
 assert.notSameValue(Math.PI, NaN);

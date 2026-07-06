@@ -6,10 +6,9 @@ description: If base < 0 and base is finite and exponent is finite and exponent 
 esid: sec-applying-the-exp-operator
 ---*/
 
-
 var exponent = new Array();
 var base = new Array();
-base[0] = -1.7976931348623157E308; //largest (by module) finite number
+base[0] = -1.7976931348623157e308; //largest (by module) finite number
 base[1] = -Math.PI;
 base[2] = -1;
 base[3] = -0.000000000000001;
@@ -27,11 +26,7 @@ exponent[7] = Math.PI;
 var exponentnum = 8;
 
 for (var i = 0; i < basenum; i++) {
-  for (var j = 0; j < exponentnum; j++) {
-    assert.sameValue(
-      Math.pow(base[i], exponent[j]),
-      NaN,
-      "(" + base[i] + ", " + exponent[j] + ")"
-    );
-  }
+	for (var j = 0; j < exponentnum; j++) {
+		assert.sameValue(Math.pow(base[i], exponent[j]), NaN, "(" + base[i] + ", " + exponent[j] + ")");
+	}
 }

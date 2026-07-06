@@ -8,4 +8,4 @@ description: Checking if Math.min.length property is defined and equals to 2
 ---*/
 assert.sameValue(typeof Math.min, "function", 'The value of `typeof Math.min` is expected to be "function"');
 assert.notSameValue(typeof Math.min.length, "undefined", 'The value of typeof Math.min.length is not "undefined"');
-assert.sameValue(Math.min.length, 2, 'The value of Math.min.length is expected to be 2');
+assert.sameValue(Math.min.length, 2, "The value of Math.min.length is expected to be 2");

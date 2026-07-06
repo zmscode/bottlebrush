@@ -9,4 +9,4 @@ description: Checking if Math.log(+Infinity) equals to +Infinity
 
 // CHECK#1
 var x = +Infinity;
-assert.sameValue(Math.log(x), +Infinity, 'Math.log(+Infinity) must return +Infinity');
+assert.sameValue(Math.log(x), +Infinity, "Math.log(+Infinity) must return +Infinity");

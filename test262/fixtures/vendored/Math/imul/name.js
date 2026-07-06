@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.imul, "name", {
-  value: "imul",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "imul",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

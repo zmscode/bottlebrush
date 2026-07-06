@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.max, "name", {
-  value: "max",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "max",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });

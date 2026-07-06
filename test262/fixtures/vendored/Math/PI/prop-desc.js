@@ -11,8 +11,8 @@ info: |
 includes: [propertyHelper.js]
 ---*/
 
-verifyProperty(Math, 'PI', {
-  writable: false,
-  enumerable: false,
-  configurable: false,
+verifyProperty(Math, "PI", {
+	writable: false,
+	enumerable: false,
+	configurable: false,
 });

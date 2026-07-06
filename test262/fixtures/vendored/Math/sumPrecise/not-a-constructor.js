@@ -11,5 +11,5 @@ features: [Reflect.construct, Math.sumPrecise]
 assert.sameValue(isConstructor(Math.sumPrecise), false, "isConstructor(Math.sumPrecise) must return false");
 
 assert.throws(TypeError, function () {
-  new Math.sumPrecise();
+	new Math.sumPrecise();
 });

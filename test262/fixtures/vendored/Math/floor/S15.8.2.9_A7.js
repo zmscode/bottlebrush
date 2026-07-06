@@ -10,13 +10,8 @@ description: >
 ---*/
 
 // CHECK#1
-for (var i = -1000; i < 1000; i++)
-{
-  var x = i / 10.0;
+for (var i = -1000; i < 1000; i++) {
+	var x = i / 10.0;
 
-  assert.sameValue(
-    -Math.ceil(-x),
-    Math.floor(x),
-    'The value of `-Math.ceil(-x)` must return the same value returned by Math.floor(x)'
-  );
+	assert.sameValue(-Math.ceil(-x), Math.floor(x), "The value of `-Math.ceil(-x)` must return the same value returned by Math.floor(x)");
 }

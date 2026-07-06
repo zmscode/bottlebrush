@@ -7,4 +7,4 @@ author: Ryan Lewis
 description: Math.trunc should return 0 when called with 0.
 ---*/
 
-assert.sameValue(Math.trunc(0), 0, 'Math.trunc(0)');
+assert.sameValue(Math.trunc(0), 0, "Math.trunc(0)");

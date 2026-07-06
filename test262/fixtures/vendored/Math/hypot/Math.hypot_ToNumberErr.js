@@ -16,20 +16,27 @@ info: |
 var counter = 0;
 
 assert.throws(
-  Test262Error,
-  function() {
-    Math.hypot(
-      Infinity,
-      -Infinity,
-      NaN,
-      0,
-      -0,
-      {valueOf: function(){ throw new Test262Error(); }},
-      {valueOf: function(){ counter++; }}
-    );
-  },
-  'Math.hypot propagates an abrupt completion from coercing an argument to Number'
+	Test262Error,
+	function () {
+		Math.hypot(
+			Infinity,
+			-Infinity,
+			NaN,
+			0,
+			-0,
+			{
+				valueOf: function () {
+					throw new Test262Error();
+				},
+			},
+			{
+				valueOf: function () {
+					counter++;
+				},
+			},
+		);
+	},
+	"Math.hypot propagates an abrupt completion from coercing an argument to Number",
 );
 
-assert.sameValue(counter, 0,
-    'Math.hypot aborts argument processing at the first abrupt completion');
+assert.sameValue(counter, 0, "Math.hypot aborts argument processing at the first abrupt completion");

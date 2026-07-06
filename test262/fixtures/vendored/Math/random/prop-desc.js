@@ -13,7 +13,7 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math, "random", {
-  writable: true,
-  enumerable: false,
-  configurable: true
+	writable: true,
+	enumerable: false,
+	configurable: true,
 });

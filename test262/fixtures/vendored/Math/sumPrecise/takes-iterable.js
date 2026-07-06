@@ -10,8 +10,8 @@ features: [generators, Math.sumPrecise]
 assert.sameValue(Math.sumPrecise([1, 2]), 3);
 
 function* gen() {
-  yield 1;
-  yield 2;
+	yield 1;
+	yield 2;
 }
 assert.sameValue(Math.sumPrecise(gen()), 3);
 
@@ -20,13 +20,13 @@ overridenArray[Symbol.iterator] = gen;
 assert.sameValue(Math.sumPrecise(overridenArray), 3);
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise();
+	Math.sumPrecise();
 });
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise(1, 2);
+	Math.sumPrecise(1, 2);
 });
 
 assert.throws(TypeError, function () {
-  Math.sumPrecise({});
+	Math.sumPrecise({});
 });

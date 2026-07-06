@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.clz32, "name", {
-  value: "clz32",
-  writable: false,
-  enumerable: false,
-  configurable: true
+	value: "clz32",
+	writable: false,
+	enumerable: false,
+	configurable: true,
 });
