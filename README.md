@@ -6,16 +6,18 @@ driven by [Test262](https://github.com/tc39/test262) conformance from day one.
 See [plan.md](plan.md) for the architecture and [phase/](phase/) for the
 per-phase build plans.
 
-## Status: Phase 3 — Object model (in progress)
+## Status: Phase 3 — Object model & harness (complete)
 
-Objects work. The engine now has a real object model — prototypes, property
-descriptors, member access, `this`, `new`, method calls, and coercion via
-`ToPrimitive`/`valueOf`/`toString` — all exercised under GC stress. `zig build
-run` runs a constructor + prototype-method + method-chaining demo.
+Objects work, and **positive Test262 tests now execute against the real
+`assert.js` harness**. The engine has a full object model — prototypes,
+property descriptors, member access, `this`, `new`, method calls, `instanceof`,
+`in`, a global object, and coercion via `ToPrimitive`/`valueOf`/`toString` — all
+exercised under GC stress. The runner concatenates `sta.js` + `assert.js` +
+`includes` with each test, runs it in a fresh realm, and scores PASS/FAIL/SKIP.
+`zig build run` runs a constructor + prototype-method + method-chaining demo.
 
-Remaining for Phase 3: a global object, the `Object` built-in and error
-constructors, and wiring the real Test262 `assert.js` harness — which is what
-flips Test262 *positive* tests from SKIP to scored.
+Still ahead (Phase 4): the standard library — `Object`/`Array`/`String`/`Error`
+constructors, etc. — which is what lets the bulk of the corpus run.
 
 Earlier phases (all complete):
 

@@ -90,6 +90,14 @@ pub const Vm = struct {
         const global = try self.heap.create(gc.Object);
         global.prototype = obj_proto;
         self.global_object = global;
+
+        // A few global value properties. The `Object`/`String`/error
+        // constructors are not installed yet; free references to them only
+        // fault if actually evaluated at run time.
+        try self.defineData(global, "globalThis", Value.fromObject(global), true, false, true);
+        try self.defineData(global, "NaN", Value.fromNumber(std.math.nan(f64)), false, false, false);
+        try self.defineData(global, "Infinity", Value.fromNumber(std.math.inf(f64)), false, false, false);
+        try self.defineData(global, "undefined", Value.undefined_value, false, false, false);
     }
 
     // ---- entry -------------------------------------------------------------
@@ -186,6 +194,10 @@ pub const Vm = struct {
             .get_var => regs[inst.a] = self.envAt(env, inst.b).slots[inst.c],
             .set_var, .init_var => self.envAt(env, inst.a).slots[inst.b] = regs[inst.c],
 
+            .get_global => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, false),
+            .get_global_typeof => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, true),
+            .set_global => try self.setProperty(Value.fromObject(self.global_object.?), code.constants[inst.a].string, regs[inst.b]),
+
             .add => regs[inst.a] = try self.opAdd(regs[inst.b], regs[inst.c]),
             .sub => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) - try self.toNumber(regs[inst.c])),
             .mul => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) * try self.toNumber(regs[inst.c])),
@@ -211,6 +223,8 @@ pub const Vm = struct {
             .le => regs[inst.a] = Value.fromBool(try self.compare(regs[inst.b], regs[inst.c], .le)),
             .gt => regs[inst.a] = Value.fromBool(try self.compare(regs[inst.b], regs[inst.c], .gt)),
             .ge => regs[inst.a] = Value.fromBool(try self.compare(regs[inst.b], regs[inst.c], .ge)),
+            .instance_of => regs[inst.a] = Value.fromBool(try self.instanceOf(regs[inst.b], regs[inst.c])),
+            .in_op => regs[inst.a] = Value.fromBool(try self.inOperator(regs[inst.b], regs[inst.c])),
 
             .logical_not => regs[inst.a] = Value.fromBool(!toBoolean(regs[inst.b])),
             .type_of => regs[inst.a] = try self.typeOf(regs[inst.b]),
@@ -405,6 +419,48 @@ pub const Vm = struct {
             obj = o.prototype;
         }
         try self.defineData(receiver, key, value, true, true, true);
+    }
+
+    fn hasProperty(self: *Vm, obj: *gc.Object, key: []const u8) bool {
+        _ = self;
+        var o: ?*gc.Object = obj;
+        while (o) |cur| {
+            if (cur.properties.contains(key)) return true;
+            o = cur.prototype;
+        }
+        return false;
+    }
+
+    fn getGlobal(self: *Vm, name: []const u8, for_typeof: bool) Error!Value {
+        const global = self.global_object.?;
+        if (self.hasProperty(global, name)) {
+            return self.getProperty(Value.fromObject(global), name);
+        }
+        if (for_typeof) return Value.undefined_value;
+        return self.throwWith("ReferenceError", name);
+    }
+
+    fn instanceOf(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+        if (!rhs.isObject() or rhs.asObject().callable == null) {
+            return self.throwTypeError("right-hand side of 'instanceof' is not callable");
+        }
+        const proto_val = try self.getProperty(rhs, "prototype");
+        if (!proto_val.isObject()) return self.throwTypeError("'prototype' is not an object");
+        const target = proto_val.asObject();
+        if (!lhs.isObject()) return false;
+        var o: ?*gc.Object = lhs.asObject().prototype;
+        while (o) |cur| {
+            if (cur == target) return true;
+            o = cur.prototype;
+        }
+        return false;
+    }
+
+    fn inOperator(self: *Vm, key: Value, obj: Value) Error!bool {
+        if (!obj.isObject()) return self.throwTypeError("cannot use 'in' on a non-object");
+        const k = try self.toPropertyKey(key);
+        defer self.gpa.free(k);
+        return self.hasProperty(obj.asObject(), k);
     }
 
     fn toPropertyKey(self: *Vm, v: Value) Error![]u8 {
@@ -908,6 +964,25 @@ test "object toString coercion in concatenation" {
     );
     try testing.expect(v.isString());
     try testing.expectEqualSlices(u16, &[_]u16{ 'h', 'i', '!' }, v.asString().units);
+}
+
+test "globals, instanceof, in, typeof-undeclared" {
+    try testing.expectEqual(@as(f64, 42), try evalNumber("foo = 42; return foo;"));
+    try testing.expectEqual(@as(f64, 7), try evalNumber("globalThis.bar = 7; return bar;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function C() {}
+        \\var c = new C();
+        \\return (c instanceof C) ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("var o = { a: 1 }; return ('a' in o) ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 0), try evalNumber("var o = { a: 1 }; return ('b' in o) ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return (typeof notDeclared === 'undefined') ? 1 : 0;"));
+}
+
+test "reading an undeclared global throws ReferenceError" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectError(error.JsThrow, eval(&vm, "return missingGlobalVar;"));
 }
 
 test "objects under GC stress" {

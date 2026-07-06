@@ -29,6 +29,11 @@ pub const Op = enum(u8) {
     set_var, // a=depth, b=slot, c=src
     init_var, // a=depth, b=slot, c=src  (declaration init; clears TDZ)
 
+    // Globals (properties of the global object)
+    get_global, // a=dst, b=name const  (ReferenceError if absent)
+    get_global_typeof, // a=dst, b=name const  (undefined if absent)
+    set_global, // a=name const, b=src
+
     // Arithmetic
     add, // a=dst, b=lhs, c=rhs  (numeric add or string concat)
     sub,
@@ -57,6 +62,8 @@ pub const Op = enum(u8) {
     le,
     gt,
     ge,
+    instance_of, // a=dst, b=lhs, c=rhs  (lhs instanceof rhs)
+    in_op, // a=dst, b=key, c=obj  (key in obj)
 
     // Logical / misc unary
     logical_not, // a=dst, b=operand

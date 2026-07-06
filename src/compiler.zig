@@ -567,12 +567,18 @@ pub const Compiler = struct {
     }
 
     fn compileIdentLoad(self: *Compiler, dst: u32, name: []const u8, pos: u32) CompileError!void {
+        _ = pos;
         if (std.mem.eql(u8, name, "undefined")) {
             _ = try self.emit(.{ .op = .load_undefined, .a = dst });
             return;
         }
-        const bind = self.resolve(name) orelse return self.fail("undeclared identifier", pos);
-        _ = try self.emit(.{ .op = .get_var, .a = dst, .b = bind.depth, .c = bind.slot });
+        if (self.resolve(name)) |bind| {
+            _ = try self.emit(.{ .op = .get_var, .a = dst, .b = bind.depth, .c = bind.slot });
+        } else {
+            // Free identifier -> a property of the global object.
+            const idx = try self.addConst(.{ .string = name });
+            _ = try self.emit(.{ .op = .get_global, .a = dst, .b = idx });
+        }
     }
 
     fn compileBinary(self: *Compiler, dst: u32, b: anytype) CompileError!void {
@@ -599,6 +605,16 @@ pub const Compiler = struct {
 
     fn compileUnary(self: *Compiler, dst: u32, u: anytype, pos: u32) CompileError!void {
         if (u.op == .kw_delete) return self.fail("delete unsupported", pos);
+        // `typeof <free identifier>` must yield "undefined", not ReferenceError.
+        if (u.op == .kw_typeof and u.operand.kind == .ident) {
+            const name = u.operand.kind.ident;
+            if (!std.mem.eql(u8, name, "undefined") and self.resolve(name) == null) {
+                const idx = try self.addConst(.{ .string = name });
+                _ = try self.emit(.{ .op = .get_global_typeof, .a = dst, .b = idx });
+                _ = try self.emit(.{ .op = .type_of, .a = dst, .b = dst });
+                return;
+            }
+        }
         try self.compileExprInto(dst, u.operand);
         const op: Op = switch (u.op) {
             .minus => .neg,
@@ -646,20 +662,34 @@ pub const Compiler = struct {
         }
         if (a.target.kind != .ident) return self.fail("assignment target must be an identifier or member", pos);
         const name = a.target.kind.ident;
-        const bind = self.resolve(name) orelse return self.fail("undeclared identifier", pos);
 
-        if (a.op == .assign) {
-            try self.compileExprInto(dst, a.value);
+        if (self.resolve(name)) |bind| {
+            if (a.op == .assign) {
+                try self.compileExprInto(dst, a.value);
+            } else {
+                _ = try self.emit(.{ .op = .get_var, .a = dst, .b = bind.depth, .c = bind.slot });
+                const rhs = self.allocReg();
+                try self.compileExprInto(rhs, a.value);
+                const op = compoundOpcode(a.op) orelse return self.fail("unsupported assignment operator", pos);
+                _ = try self.emit(.{ .op = op, .a = dst, .b = dst, .c = rhs });
+                self.freeTo(rhs);
+            }
+            _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = dst });
         } else {
-            // Compound: dst = current OP value
-            _ = try self.emit(.{ .op = .get_var, .a = dst, .b = bind.depth, .c = bind.slot });
-            const rhs = self.allocReg();
-            try self.compileExprInto(rhs, a.value);
-            const op = compoundOpcode(a.op) orelse return self.fail("unsupported assignment operator", pos);
-            _ = try self.emit(.{ .op = op, .a = dst, .b = dst, .c = rhs });
-            self.freeTo(rhs);
+            // Free identifier -> global property.
+            const idx = try self.addConst(.{ .string = name });
+            if (a.op == .assign) {
+                try self.compileExprInto(dst, a.value);
+            } else {
+                _ = try self.emit(.{ .op = .get_global, .a = dst, .b = idx });
+                const rhs = self.allocReg();
+                try self.compileExprInto(rhs, a.value);
+                const op = compoundOpcode(a.op) orelse return self.fail("unsupported assignment operator", pos);
+                _ = try self.emit(.{ .op = op, .a = dst, .b = dst, .c = rhs });
+                self.freeTo(rhs);
+            }
+            _ = try self.emit(.{ .op = .set_global, .a = idx, .b = dst });
         }
-        _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = dst });
     }
 
     fn compileMemberStore(self: *Compiler, dst: u32, a: anytype, pos: u32) CompileError!void {
@@ -900,6 +930,8 @@ fn binaryOpcode(k: token.Kind) ?Op {
         .lt_eq => .le,
         .gt => .gt,
         .gt_eq => .ge,
+        .kw_instanceof => .instance_of,
+        .kw_in => .in_op,
         else => null,
     };
 }
