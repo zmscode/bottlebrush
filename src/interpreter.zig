@@ -54,6 +54,8 @@ pub const Vm = struct {
     string_proto: ?*gc.Object = null,
     number_proto: ?*gc.Object = null,
     regexp_proto: ?*gc.Object = null,
+    map_proto: ?*gc.Object = null,
+    set_proto: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -79,6 +81,8 @@ pub const Vm = struct {
         if (self.string_proto) |o| tracer.mark(&o.gc);
         if (self.number_proto) |o| tracer.mark(&o.gc);
         if (self.regexp_proto) |o| tracer.mark(&o.gc);
+        if (self.map_proto) |o| tracer.mark(&o.gc);
+        if (self.set_proto) |o| tracer.mark(&o.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -142,6 +146,35 @@ pub const Vm = struct {
     /// non-enumerable (as built-in methods are).
     fn defineMethod(self: *Vm, obj: *gc.Object, name: []const u8, func: gc.NativeFn, length: u32) Error!void {
         try self.defineData(obj, name, Value.fromObject(try self.makeNative(name, func, length)), true, false, true);
+    }
+
+    /// Define an accessor property with a native getter (no setter).
+    fn defineGetter(self: *Vm, obj: *gc.Object, name: []const u8, getter: gc.NativeFn) Error!void {
+        const getter_obj = try self.makeNative(name, getter, 0);
+        const gop = try obj.properties.getOrPut(self.gpa, name);
+        if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, name);
+        gop.value_ptr.* = .{
+            .is_accessor = true,
+            .get = Value.fromObject(getter_obj),
+            .set = null,
+            .enumerable = false,
+            .configurable = true,
+        };
+    }
+
+    fn newMap(self: *Vm) Error!*gc.Object {
+        self.maybeStress();
+        const o = try self.heap.create(gc.Object);
+        o.prototype = self.map_proto;
+        o.collection = .map;
+        return o;
+    }
+    fn newSet(self: *Vm) Error!*gc.Object {
+        self.maybeStress();
+        const o = try self.heap.create(gc.Object);
+        o.prototype = self.set_proto;
+        o.collection = .set;
+        return o;
     }
 
     /// Create a RegExp object. Phase 4 stub: the pattern is *not* compiled — the
@@ -340,6 +373,41 @@ pub const Vm = struct {
         try self.defineData(regexp_ctor, "prototype", Value.fromObject(regexp_proto), false, false, false);
         try self.defineData(regexp_proto, "constructor", Value.fromObject(regexp_ctor), true, false, true);
         try self.defineData(global, "RegExp", Value.fromObject(regexp_ctor), true, false, true);
+
+        // ---- Map ----
+        const map_proto = try self.newObject(self.object_proto);
+        self.map_proto = map_proto;
+        try self.defineMethod(map_proto, "get", nativeMapGet, 1);
+        try self.defineMethod(map_proto, "set", nativeMapSet, 2);
+        try self.defineMethod(map_proto, "has", nativeMapHas, 1);
+        try self.defineMethod(map_proto, "delete", nativeMapDelete, 1);
+        try self.defineMethod(map_proto, "clear", nativeCollectionClear, 0);
+        try self.defineMethod(map_proto, "forEach", nativeMapForEach, 1);
+        try self.defineGetter(map_proto, "size", nativeMapSize);
+        const map_ctor = try self.makeNative("Map", nativeMap, 0);
+        try self.defineData(map_ctor, "prototype", Value.fromObject(map_proto), false, false, false);
+        try self.defineData(map_proto, "constructor", Value.fromObject(map_ctor), true, false, true);
+        try self.defineData(global, "Map", Value.fromObject(map_ctor), true, false, true);
+
+        // ---- Set ----
+        const set_proto = try self.newObject(self.object_proto);
+        self.set_proto = set_proto;
+        try self.defineMethod(set_proto, "add", nativeSetAdd, 1);
+        try self.defineMethod(set_proto, "has", nativeSetHas, 1);
+        try self.defineMethod(set_proto, "delete", nativeSetDelete, 1);
+        try self.defineMethod(set_proto, "clear", nativeCollectionClear, 0);
+        try self.defineMethod(set_proto, "forEach", nativeSetForEach, 1);
+        try self.defineGetter(set_proto, "size", nativeSetSize);
+        const set_ctor = try self.makeNative("Set", nativeSet, 0);
+        try self.defineData(set_ctor, "prototype", Value.fromObject(set_proto), false, false, false);
+        try self.defineData(set_proto, "constructor", Value.fromObject(set_ctor), true, false, true);
+        try self.defineData(global, "Set", Value.fromObject(set_ctor), true, false, true);
+
+        // ---- JSON ----
+        const json = try self.newObject(self.object_proto);
+        try self.defineMethod(json, "stringify", nativeJSONStringify, 3);
+        try self.defineMethod(json, "parse", nativeJSONParse, 2);
+        try self.defineData(global, "JSON", Value.fromObject(json), true, false, true);
 
         // ---- global functions ----
         try self.defineMethod(global, "isNaN", nativeIsNaN, 1);
@@ -1025,6 +1093,97 @@ pub const Vm = struct {
     }
     fn throwReferenceError(self: *Vm, msg: []const u8) Error {
         return self.throwError(self.reference_error_proto, msg);
+    }
+    fn throwSyntaxError(self: *Vm, msg: []const u8) Error {
+        return self.throwError(self.syntax_error_proto, msg);
+    }
+
+    // ---- JSON --------------------------------------------------------------
+
+    /// Serialize `value` to compact JSON, appending to `out`. Returns false if
+    /// the value has no JSON representation (undefined/function/symbol) and
+    /// should be omitted. `stack` detects cycles. Indentation (`space`) is not
+    /// yet supported.
+    fn jsonSerialize(self: *Vm, out: *std.ArrayList(u8), value: Value, stack: *std.ArrayList(*gc.Object)) Error!bool {
+        var v = value;
+        if (v.isObject()) {
+            const to_json = try self.getProperty(v, "toJSON");
+            if (isCallable(to_json)) v = try self.callValue(to_json, v, &.{});
+        }
+        switch (v) {
+            .undefined, .symbol => return false,
+            .null => try out.appendSlice(self.gpa, "null"),
+            .boolean => |b| try out.appendSlice(self.gpa, if (b) "true" else "false"),
+            .number => |n| {
+                if (std.math.isNan(n) or std.math.isInf(n)) {
+                    try out.appendSlice(self.gpa, "null");
+                } else {
+                    var buf: [64]u8 = undefined;
+                    try out.appendSlice(self.gpa, numberToString(n, &buf));
+                }
+            },
+            .bigint => return self.throwTypeError("Do not know how to serialize a BigInt"),
+            .string => |s| try self.jsonQuote(out, s.units),
+            .object => |o| {
+                if (o.callable != null) return false; // functions omitted
+                for (stack.items) |st| {
+                    if (st == o) return self.throwTypeError("Converting circular structure to JSON");
+                }
+                try stack.append(self.gpa, o);
+                defer _ = stack.pop();
+                if (o.is_array) {
+                    try out.append(self.gpa, '[');
+                    for (o.elements.items, 0..) |el, i| {
+                        if (i > 0) try out.append(self.gpa, ',');
+                        if (!try self.jsonSerialize(out, el, stack)) try out.appendSlice(self.gpa, "null");
+                    }
+                    try out.append(self.gpa, ']');
+                } else {
+                    try out.append(self.gpa, '{');
+                    var keys: std.ArrayList([]const u8) = .empty;
+                    defer {
+                        for (keys.items) |k| self.gpa.free(k);
+                        keys.deinit(self.gpa);
+                    }
+                    try ownEnumerableKeys(self, o, &keys);
+                    var first = true;
+                    for (keys.items) |k| {
+                        const mark = out.items.len;
+                        if (!first) try out.append(self.gpa, ',');
+                        try self.jsonQuoteBytes(out, k);
+                        try out.append(self.gpa, ':');
+                        const val = try self.getProperty(v, k);
+                        if (try self.jsonSerialize(out, val, stack)) {
+                            first = false;
+                        } else {
+                            out.shrinkRetainingCapacity(mark); // omit this key
+                        }
+                    }
+                    try out.append(self.gpa, '}');
+                }
+            },
+        }
+        return true;
+    }
+
+    fn jsonQuote(self: *Vm, out: *std.ArrayList(u8), units: []const u16) Error!void {
+        try out.append(self.gpa, '"');
+        for (units) |u| try appendJsonChar(self.gpa, out, u);
+        try out.append(self.gpa, '"');
+    }
+    fn jsonQuoteBytes(self: *Vm, out: *std.ArrayList(u8), bytes: []const u8) Error!void {
+        try out.append(self.gpa, '"');
+        for (bytes) |b| try appendJsonChar(self.gpa, out, b);
+        try out.append(self.gpa, '"');
+    }
+
+    fn jsonParse(self: *Vm, text: []const u8) Error!Value {
+        var p = JsonParser{ .vm = self, .s = text, .i = 0 };
+        p.skipWs();
+        const v = try p.parseValue();
+        p.skipWs();
+        if (p.i != text.len) return self.throwSyntaxError("Unexpected non-whitespace character after JSON");
+        return v;
     }
 };
 
@@ -2195,6 +2354,411 @@ fn nativeRegExpToString(ctx: *anyopaque, this: Value, args: []const Value) Error
     return vm.makeStringFromUtf16(buf.items);
 }
 
+// ---- JSON helpers ----------------------------------------------------------
+
+fn appendJsonChar(gpa: std.mem.Allocator, out: *std.ArrayList(u8), u: u16) Error!void {
+    switch (u) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        8 => try out.appendSlice(gpa, "\\b"),
+        12 => try out.appendSlice(gpa, "\\f"),
+        else => {
+            if (u < 0x20) {
+                const hex = "0123456789abcdef";
+                try out.appendSlice(gpa, "\\u");
+                try out.append(gpa, hex[(u >> 12) & 0xf]);
+                try out.append(gpa, hex[(u >> 8) & 0xf]);
+                try out.append(gpa, hex[(u >> 4) & 0xf]);
+                try out.append(gpa, hex[u & 0xf]);
+            } else if (u < 0x80) {
+                try out.append(gpa, @intCast(u));
+            } else {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(u, &buf) catch {
+                    try out.append(gpa, '?');
+                    return;
+                };
+                try out.appendSlice(gpa, buf[0..n]);
+            }
+        },
+    }
+}
+
+const JsonParser = struct {
+    vm: *Vm,
+    s: []const u8,
+    i: usize,
+
+    fn skipWs(self: *JsonParser) void {
+        while (self.i < self.s.len) {
+            switch (self.s[self.i]) {
+                ' ', '\t', '\n', '\r' => self.i += 1,
+                else => break,
+            }
+        }
+    }
+    fn peek(self: *JsonParser) u8 {
+        return if (self.i < self.s.len) self.s[self.i] else 0;
+    }
+
+    fn parseValue(self: *JsonParser) Error!Value {
+        self.skipWs();
+        switch (self.peek()) {
+            '{' => return self.parseObject(),
+            '[' => return self.parseArray(),
+            '"' => return self.parseString(),
+            't' => {
+                try self.expectWord("true");
+                return Value.fromBool(true);
+            },
+            'f' => {
+                try self.expectWord("false");
+                return Value.fromBool(false);
+            },
+            'n' => {
+                try self.expectWord("null");
+                return Value.null_value;
+            },
+            '-', '0'...'9' => return self.parseNumber(),
+            else => return self.vm.throwSyntaxError("Unexpected token in JSON"),
+        }
+    }
+
+    fn expectWord(self: *JsonParser, word: []const u8) Error!void {
+        if (self.i + word.len > self.s.len or !std.mem.eql(u8, self.s[self.i .. self.i + word.len], word)) {
+            return self.vm.throwSyntaxError("Unexpected token in JSON");
+        }
+        self.i += word.len;
+    }
+
+    fn parseNumber(self: *JsonParser) Error!Value {
+        const start = self.i;
+        if (self.peek() == '-') self.i += 1;
+        while (self.i < self.s.len and self.s[self.i] >= '0' and self.s[self.i] <= '9') self.i += 1;
+        if (self.peek() == '.') {
+            self.i += 1;
+            while (self.i < self.s.len and self.s[self.i] >= '0' and self.s[self.i] <= '9') self.i += 1;
+        }
+        if (self.peek() == 'e' or self.peek() == 'E') {
+            self.i += 1;
+            if (self.peek() == '+' or self.peek() == '-') self.i += 1;
+            while (self.i < self.s.len and self.s[self.i] >= '0' and self.s[self.i] <= '9') self.i += 1;
+        }
+        const n = std.fmt.parseFloat(f64, self.s[start..self.i]) catch return self.vm.throwSyntaxError("Invalid number in JSON");
+        return Value.fromNumber(n);
+    }
+
+    /// Parse a JSON string; returns UTF-8 bytes in `buf` (caller-owned scratch).
+    fn parseStringInto(self: *JsonParser, buf: *std.ArrayList(u8)) Error!void {
+        if (self.peek() != '"') return self.vm.throwSyntaxError("Expected string in JSON");
+        self.i += 1;
+        while (self.i < self.s.len) {
+            const c = self.s[self.i];
+            self.i += 1;
+            if (c == '"') return;
+            if (c == '\\') {
+                const e = self.peek();
+                self.i += 1;
+                switch (e) {
+                    '"' => try buf.append(self.vm.gpa, '"'),
+                    '\\' => try buf.append(self.vm.gpa, '\\'),
+                    '/' => try buf.append(self.vm.gpa, '/'),
+                    'b' => try buf.append(self.vm.gpa, 8),
+                    'f' => try buf.append(self.vm.gpa, 12),
+                    'n' => try buf.append(self.vm.gpa, '\n'),
+                    'r' => try buf.append(self.vm.gpa, '\r'),
+                    't' => try buf.append(self.vm.gpa, '\t'),
+                    'u' => {
+                        if (self.i + 4 > self.s.len) return self.vm.throwSyntaxError("Invalid \\u escape in JSON");
+                        const cp = std.fmt.parseInt(u21, self.s[self.i .. self.i + 4], 16) catch return self.vm.throwSyntaxError("Invalid \\u escape in JSON");
+                        self.i += 4;
+                        var ub: [4]u8 = undefined;
+                        const n = std.unicode.utf8Encode(cp, &ub) catch {
+                            try buf.append(self.vm.gpa, '?');
+                            continue;
+                        };
+                        try buf.appendSlice(self.vm.gpa, ub[0..n]);
+                    },
+                    else => return self.vm.throwSyntaxError("Invalid escape in JSON"),
+                }
+            } else {
+                try buf.append(self.vm.gpa, c);
+            }
+        }
+        return self.vm.throwSyntaxError("Unterminated string in JSON");
+    }
+
+    fn parseString(self: *JsonParser) Error!Value {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.vm.gpa);
+        try self.parseStringInto(&buf);
+        return self.vm.makeString(buf.items);
+    }
+
+    fn parseArray(self: *JsonParser) Error!Value {
+        self.i += 1; // '['
+        const arr = try self.vm.newArray(0);
+        try self.vm.protect(Value.fromObject(arr));
+        defer self.vm.unprotect();
+        self.skipWs();
+        if (self.peek() == ']') {
+            self.i += 1;
+            return Value.fromObject(arr);
+        }
+        while (true) {
+            const v = try self.parseValue();
+            try arr.elements.append(self.vm.gpa, v);
+            self.skipWs();
+            const c = self.peek();
+            if (c == ',') {
+                self.i += 1;
+                continue;
+            }
+            if (c == ']') {
+                self.i += 1;
+                break;
+            }
+            return self.vm.throwSyntaxError("Expected ',' or ']' in JSON array");
+        }
+        return Value.fromObject(arr);
+    }
+
+    fn parseObject(self: *JsonParser) Error!Value {
+        self.i += 1; // '{'
+        const obj = try self.vm.newObject(self.vm.object_proto);
+        try self.vm.protect(Value.fromObject(obj));
+        defer self.vm.unprotect();
+        self.skipWs();
+        if (self.peek() == '}') {
+            self.i += 1;
+            return Value.fromObject(obj);
+        }
+        while (true) {
+            self.skipWs();
+            var key_buf: std.ArrayList(u8) = .empty;
+            defer key_buf.deinit(self.vm.gpa);
+            try self.parseStringInto(&key_buf);
+            self.skipWs();
+            if (self.peek() != ':') return self.vm.throwSyntaxError("Expected ':' in JSON object");
+            self.i += 1;
+            const v = try self.parseValue();
+            try self.vm.setProperty(Value.fromObject(obj), key_buf.items, v);
+            self.skipWs();
+            const c = self.peek();
+            if (c == ',') {
+                self.i += 1;
+                continue;
+            }
+            if (c == '}') {
+                self.i += 1;
+                break;
+            }
+            return self.vm.throwSyntaxError("Expected ',' or '}' in JSON object");
+        }
+        return Value.fromObject(obj);
+    }
+};
+
+fn nativeJSONStringify(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    var stack: std.ArrayList(*gc.Object) = .empty;
+    defer stack.deinit(vm.gpa);
+    const written = try vm.jsonSerialize(&out, argAt(args, 0), &stack);
+    if (!written) return Value.undefined_value;
+    return vm.makeString(out.items);
+}
+
+fn nativeJSONParse(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const text_v = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(text_v);
+    defer vm.unprotect();
+    const utf8 = try utf16ToUtf8Alloc(vm.gpa, text_v.asString().units);
+    defer vm.gpa.free(utf8);
+    return vm.jsonParse(utf8);
+}
+
+// ---- Map / Set built-ins ---------------------------------------------------
+
+fn sameValueZero(a: Value, b: Value) bool {
+    if (a.isNumber() and b.isNumber()) {
+        const x = a.asNumber();
+        const y = b.asNumber();
+        if (std.math.isNan(x) and std.math.isNan(y)) return true;
+        return x == y; // +0 and -0 are equal under SameValueZero
+    }
+    return sameTypeStrictEq(a, b);
+}
+
+fn thisCollection(vm: *Vm, this: Value, kind: gc.Collection) Error!*gc.Object {
+    if (!this.isObject() or this.asObject().collection != kind) {
+        return vm.throwTypeError("method called on an incompatible receiver");
+    }
+    return this.asObject();
+}
+
+/// Index of `key` in a Map's interleaved entries (the key slot), or null.
+fn mapFind(map: *gc.Object, key: Value) ?usize {
+    var i: usize = 0;
+    while (i < map.elements.items.len) : (i += 2) {
+        if (sameValueZero(map.elements.items[i], key)) return i;
+    }
+    return null;
+}
+fn setFind(set: *gc.Object, value: Value) ?usize {
+    for (set.elements.items, 0..) |v, i| {
+        if (sameValueZero(v, value)) return i;
+    }
+    return null;
+}
+
+fn nativeMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const map = try vm.newMap();
+    try vm.protect(Value.fromObject(map));
+    defer vm.unprotect();
+    // Optional iterable of [key, value] pairs (arrays only, for now).
+    const init_v = argAt(args, 0);
+    if (init_v.isObject() and init_v.asObject().is_array) {
+        for (init_v.asObject().elements.items) |entry| {
+            if (entry.isObject() and entry.asObject().is_array) {
+                const e = entry.asObject().elements.items;
+                const k = if (e.len > 0) e[0] else Value.undefined_value;
+                const val = if (e.len > 1) e[1] else Value.undefined_value;
+                if (mapFind(map, k)) |idx| {
+                    map.elements.items[idx + 1] = val;
+                } else {
+                    try map.elements.append(vm.gpa, k);
+                    try map.elements.append(vm.gpa, val);
+                }
+            }
+        }
+    }
+    return Value.fromObject(map);
+}
+fn nativeMapGet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .map);
+    if (mapFind(map, argAt(args, 0))) |i| return map.elements.items[i + 1];
+    return Value.undefined_value;
+}
+fn nativeMapSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .map);
+    const key = argAt(args, 0);
+    const val = argAt(args, 1);
+    if (mapFind(map, key)) |i| {
+        map.elements.items[i + 1] = val;
+    } else {
+        try map.elements.append(vm.gpa, key);
+        try map.elements.append(vm.gpa, val);
+    }
+    return this;
+}
+fn nativeMapHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .map);
+    return Value.fromBool(mapFind(map, argAt(args, 0)) != null);
+}
+fn nativeMapDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .map);
+    if (mapFind(map, argAt(args, 0))) |i| {
+        _ = map.elements.orderedRemove(i); // key
+        _ = map.elements.orderedRemove(i); // value (shifted into i)
+        return Value.fromBool(true);
+    }
+    return Value.fromBool(false);
+}
+fn nativeMapSize(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .map);
+    return Value.fromNumber(@floatFromInt(map.elements.items.len / 2));
+}
+fn nativeMapForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .map);
+    const cb = argAt(args, 0);
+    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
+    var i: usize = 0;
+    while (i + 1 < map.elements.items.len) : (i += 2) {
+        const k = map.elements.items[i];
+        const v = map.elements.items[i + 1];
+        _ = try vm.callValue(cb, Value.undefined_value, &.{ v, k, this });
+    }
+    return Value.undefined_value;
+}
+
+fn nativeSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const set = try vm.newSet();
+    try vm.protect(Value.fromObject(set));
+    defer vm.unprotect();
+    const init_v = argAt(args, 0);
+    if (init_v.isObject() and init_v.asObject().is_array) {
+        for (init_v.asObject().elements.items) |v| {
+            if (setFind(set, v) == null) try set.elements.append(vm.gpa, v);
+        }
+    }
+    return Value.fromObject(set);
+}
+fn nativeSetAdd(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .set);
+    const v = argAt(args, 0);
+    if (setFind(set, v) == null) try set.elements.append(vm.gpa, v);
+    return this;
+}
+fn nativeSetHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .set);
+    return Value.fromBool(setFind(set, argAt(args, 0)) != null);
+}
+fn nativeSetDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .set);
+    if (setFind(set, argAt(args, 0))) |i| {
+        _ = set.elements.orderedRemove(i);
+        return Value.fromBool(true);
+    }
+    return Value.fromBool(false);
+}
+fn nativeSetSize(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .set);
+    return Value.fromNumber(@floatFromInt(set.elements.items.len));
+}
+fn nativeSetForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .set);
+    const cb = argAt(args, 0);
+    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
+    var i: usize = 0;
+    while (i < set.elements.items.len) : (i += 1) {
+        const v = set.elements.items[i];
+        _ = try vm.callValue(cb, Value.undefined_value, &.{ v, v, this });
+    }
+    return Value.undefined_value;
+}
+
+fn nativeCollectionClear(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = args;
+    if (this.isObject()) this.asObject().elements.clearRetainingCapacity();
+    return Value.undefined_value;
+}
+
 fn clampIndex(n: f64, len: i64) i64 {
     if (std.math.isNan(n) or n < 0) return 0;
     if (n > @as(f64, @floatFromInt(len))) return len;
@@ -2598,6 +3162,100 @@ test "string primitive access and methods" {
     try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a'.concat('b', 'c') === 'abc' ? 1 : 0;"));
     try testing.expectEqual(@as(f64, 1), try evalNumber("return String.fromCharCode(104, 105) === 'hi' ? 1 : 0;"));
     try testing.expectEqual(@as(f64, 1), try evalNumber("return ('hi'.startsWith('h') && 'hi'.endsWith('i')) ? 1 : 0;"));
+}
+
+test "Map" {
+    try testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\var m = new Map();
+        \\m.set("a", 1); m.set("b", 2);
+        \\return m.get("a") + m.get("b") + m.size;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var m = new Map();
+        \\m.set(1, "x");
+        \\var had = m.has(1);
+        \\m.delete(1);
+        \\return (had && !m.has(1) && m.size === 0) ? 1 : 0;
+    ));
+    // Object keys by identity; NaN key via SameValueZero.
+    try testing.expectEqual(@as(f64, 42), try evalNumber("var m = new Map(); var k = {}; m.set(k, 42); return m.get(k);"));
+    try testing.expectEqual(@as(f64, 5), try evalNumber("var m = new Map(); m.set(NaN, 5); return m.get(NaN);"));
+    try testing.expectEqual(@as(f64, 2), try evalNumber("var m = new Map([['a', 1], ['b', 2]]); return m.get('b');"));
+    // Overwrite keeps size; chaining returns the map.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("var m = new Map(); m.set(1, 'a'); m.set(1, 'b'); return m.size;"));
+    try testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\var m = new Map([['a', 1], ['b', 2], ['c', 3]]);
+        \\var sum = 0;
+        \\m.forEach(function (v) { sum += v; });
+        \\return sum;
+    ));
+}
+
+test "Set" {
+    try testing.expectEqual(@as(f64, 2), try evalNumber("var s = new Set(); s.add(1); s.add(2); s.add(1); return s.size;"));
+    try testing.expectEqual(@as(f64, 3), try evalNumber("var s = new Set([1, 2, 2, 3]); return s.size;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var s = new Set();
+        \\s.add("x");
+        \\var had = s.has("x");
+        \\s.delete("x");
+        \\return (had && !s.has("x") && s.size === 0) ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\var s = new Set([1, 2, 3]);
+        \\var sum = 0;
+        \\s.forEach(function (v) { sum += v; });
+        \\return sum;
+    ));
+}
+
+test "Map/Set under GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var m = new Map();
+        \\for (var i = 0; i < 15; i++) { m.set("k" + i, i); }
+        \\var s = new Set();
+        \\for (var j = 0; j < 15; j++) { s.add(j % 5); }
+        \\return m.size + s.size;
+    );
+    try testing.expectEqual(@as(f64, 20), v.asNumber()); // 15 + 5
+}
+
+test "JSON.stringify" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify(42) === '42' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify('hi') === '\"hi\"' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify(true) === 'true' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify(null) === 'null' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify([1, 2, 3]) === '[1,2,3]' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify({ a: 1, b: 2 }) === '{\"a\":1,\"b\":2}' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify({ a: [1, 2], b: { c: 3 } }) === '{\"a\":[1,2],\"b\":{\"c\":3}}' ? 1 : 0;"));
+    // undefined / functions omitted from objects, null in arrays.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify({ a: 1, b: undefined }) === '{\"a\":1}' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify([1, undefined, 3]) === '[1,null,3]' ? 1 : 0;"));
+}
+
+test "JSON.parse and round-trip" {
+    try testing.expectEqual(@as(f64, 42), try evalNumber("return JSON.parse('42');"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.parse('\"hi\"') === 'hi' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.parse('true') === true ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.parse('null') === null ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\var o = JSON.parse('{"a":1,"b":[2,3]}');
+        \\return o.a + o.b[0] + o.b[1] - 1;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { x: 1, y: [2, 3], z: "hi" };
+        \\var r = JSON.parse(JSON.stringify(o));
+        \\return (r.x === 1 && r.y[1] === 3 && r.z === "hi") ? 1 : 0;
+    ));
+}
+
+test "JSON cyclic structure throws" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectError(error.JsThrow, eval(&vm, "var o = {}; o.self = o; return JSON.stringify(o);"));
 }
 
 test "RegExp construction (stub)" {

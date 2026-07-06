@@ -70,6 +70,8 @@ pub const PropertyDescriptor = struct {
 /// later addition.
 pub const PropertyMap = std.StringArrayHashMapUnmanaged(PropertyDescriptor);
 
+pub const Collection = enum { none, map, set };
+
 pub const Object = struct {
     pub const gc_kind: Kind = .object;
     gc: GcHeader,
@@ -84,7 +86,10 @@ pub const Object = struct {
     /// Array exotic: when true, indexed elements live in `elements` and
     /// `length` is `elements.items.len` (see the interpreter's array paths).
     is_array: bool = false,
-    /// Dense element store for arrays (holes are represented as `undefined`).
+    /// Collection kind: Map stores interleaved key/value pairs in `elements`,
+    /// Set stores values in `elements`.
+    collection: Collection = .none,
+    /// Dense element store: array elements, or Map/Set entries.
     elements: std.ArrayList(Value) = .empty,
 
     pub fn trace(self: *Object, t: *Tracer) void {
