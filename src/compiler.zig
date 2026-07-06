@@ -63,8 +63,10 @@ pub const Compiler = struct {
     source: []const u8,
     fs: *FnState,
     diag: ?Diagnostic = null,
-    /// Innermost loop context, for break/continue jump patching.
+    /// Innermost loop context, for `continue` jump patching.
     loop: ?*LoopCtx = null,
+    /// Innermost breakable context (loop or switch), for `break`.
+    break_target: ?*LoopCtx = null,
 
     fn fail(self: *Compiler, comptime msg: []const u8, pos: u32) CompileError {
         if (self.diag == null) self.diag = .{ .message = msg, .pos = pos };
@@ -319,6 +321,7 @@ pub const Compiler = struct {
             .do_while_stmt => |s| try self.compileDoWhile(s),
             .for_stmt => |s| try self.compileFor(s),
             .for_of_stmt => |s| try self.compileForOf(s),
+            .switch_stmt => |s| try self.compileSwitch(s),
             .return_stmt => |arg| {
                 const r = if (arg) |a| try self.compileExprToNew(a) else blk: {
                     const rr = self.allocReg();
@@ -383,9 +386,12 @@ pub const Compiler = struct {
 
     fn compileWhile(self: *Compiler, s: anytype) CompileError!void {
         var ctx = LoopCtx{};
-        const prev = self.loop;
+        const prev_loop = self.loop;
+        const prev_break = self.break_target;
         self.loop = &ctx;
-        defer self.loop = prev;
+        self.break_target = &ctx;
+        defer self.loop = prev_loop;
+        defer self.break_target = prev_break;
 
         const top = self.here();
         const c = try self.compileExprToNew(s.cond);
@@ -400,9 +406,12 @@ pub const Compiler = struct {
 
     fn compileDoWhile(self: *Compiler, s: anytype) CompileError!void {
         var ctx = LoopCtx{};
-        const prev = self.loop;
+        const prev_loop = self.loop;
+        const prev_break = self.break_target;
         self.loop = &ctx;
-        defer self.loop = prev;
+        self.break_target = &ctx;
+        defer self.loop = prev_loop;
+        defer self.break_target = prev_break;
 
         const top = self.here();
         try self.compileStmt(s.body);
@@ -437,9 +446,12 @@ pub const Compiler = struct {
         }
 
         var ctx = LoopCtx{};
-        const prev = self.loop;
+        const prev_loop = self.loop;
+        const prev_break = self.break_target;
         self.loop = &ctx;
-        defer self.loop = prev;
+        self.break_target = &ctx;
+        defer self.loop = prev_loop;
+        defer self.break_target = prev_break;
 
         const top = self.here();
         var jf: ?u32 = null;
@@ -477,9 +489,12 @@ pub const Compiler = struct {
         _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = zero });
 
         var ctx = LoopCtx{};
-        const prev = self.loop;
+        const prev_loop = self.loop;
+        const prev_break = self.break_target;
         self.loop = &ctx;
-        defer self.loop = prev;
+        self.break_target = &ctx;
+        defer self.loop = prev_loop;
+        defer self.break_target = prev_break;
 
         const top = self.here();
         // if (idx >= iter.length) break
@@ -542,6 +557,58 @@ pub const Compiler = struct {
         }
     }
 
+    fn compileSwitch(self: *Compiler, s: anytype) CompileError!void {
+        try self.pushBlock();
+        defer self.popBlock();
+
+        const disc_reg = self.allocReg();
+        try self.compileExprInto(disc_reg, s.discriminant);
+
+        var ctx = LoopCtx{};
+        const prev_break = self.break_target;
+        self.break_target = &ctx;
+        defer self.break_target = prev_break;
+
+        // Comparison chain: strict-equality test per case, jump to its body.
+        var case_jumps: std.ArrayList(?u32) = .empty;
+        defer case_jumps.deinit(self.gpa);
+        var default_index: ?usize = null;
+        for (s.cases, 0..) |c, i| {
+            const sc = c.kind.switch_case;
+            if (sc.test_expr) |t| {
+                const tmp = self.allocReg();
+                try self.compileExprInto(tmp, t);
+                const cmp = self.allocReg();
+                _ = try self.emit(.{ .op = .strict_eq, .a = cmp, .b = disc_reg, .c = tmp });
+                const jpc = try self.emit(.{ .op = .jump_if_true, .a = cmp });
+                try case_jumps.append(self.gpa, jpc);
+                self.freeTo(tmp);
+            } else {
+                default_index = i;
+                try case_jumps.append(self.gpa, null);
+            }
+        }
+        // No case matched -> jump to default (or past the switch).
+        const default_jump = try self.emit(.{ .op = .jump });
+
+        // Emit case bodies, recording each body's start pc.
+        var body_starts: std.ArrayList(u32) = .empty;
+        defer body_starts.deinit(self.gpa);
+        for (s.cases) |c| {
+            try body_starts.append(self.gpa, self.here());
+            for (c.kind.switch_case.body) |stmt| try self.compileStmt(stmt);
+        }
+        const end_pc = self.here();
+
+        // Patch the comparison jumps and the default jump.
+        for (case_jumps.items, 0..) |maybe_jpc, i| {
+            if (maybe_jpc) |jpc| self.patchTarget(jpc, body_starts.items[i]);
+        }
+        self.patchTarget(default_jump, if (default_index) |di| body_starts.items[di] else end_pc);
+        try self.patchBreaks(&ctx, end_pc);
+        self.freeTo(disc_reg);
+    }
+
     fn compileTry(self: *Compiler, s: anytype) CompileError!void {
         const try_start = self.here();
         try self.compileStmt(s.block);
@@ -586,11 +653,16 @@ pub const Compiler = struct {
     };
 
     fn emitLoopJump(self: *Compiler, kind: LoopKind, pos: u32) CompileError!void {
-        const ctx = self.loop orelse return self.fail("break/continue outside loop", pos);
         const pc = try self.emit(.{ .op = .jump });
         switch (kind) {
-            .brk => try ctx.breaks.append(self.gpa, pc),
-            .cont => try ctx.continues.append(self.gpa, pc),
+            .brk => {
+                const ctx = self.break_target orelse return self.fail("break outside loop or switch", pos);
+                try ctx.breaks.append(self.gpa, pc);
+            },
+            .cont => {
+                const ctx = self.loop orelse return self.fail("continue outside loop", pos);
+                try ctx.continues.append(self.gpa, pc);
+            },
         }
     }
     fn patchBreaks(self: *Compiler, ctx: *LoopCtx, target: u32) CompileError!void {

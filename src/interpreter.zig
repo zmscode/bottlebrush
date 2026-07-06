@@ -270,6 +270,12 @@ pub const Vm = struct {
         try self.defineData(number_proto, "constructor", Value.fromObject(number_ctor), true, false, true);
         try self.defineData(number_ctor, "MAX_SAFE_INTEGER", Value.fromNumber(9007199254740991), false, false, false);
         try self.defineData(number_ctor, "MIN_SAFE_INTEGER", Value.fromNumber(-9007199254740991), false, false, false);
+        try self.defineData(number_ctor, "POSITIVE_INFINITY", Value.fromNumber(std.math.inf(f64)), false, false, false);
+        try self.defineData(number_ctor, "NEGATIVE_INFINITY", Value.fromNumber(-std.math.inf(f64)), false, false, false);
+        try self.defineData(number_ctor, "NaN", Value.fromNumber(std.math.nan(f64)), false, false, false);
+        try self.defineData(number_ctor, "MAX_VALUE", Value.fromNumber(1.7976931348623157e308), false, false, false);
+        try self.defineData(number_ctor, "MIN_VALUE", Value.fromNumber(5e-324), false, false, false);
+        try self.defineData(number_ctor, "EPSILON", Value.fromNumber(2.220446049250313e-16), false, false, false);
         try self.defineMethod(number_ctor, "isInteger", nativeNumberIsInteger, 1);
         try self.defineMethod(number_ctor, "isFinite", nativeNumberIsFinite, 1);
         try self.defineMethod(number_ctor, "isNaN", nativeNumberIsNaN, 1);
@@ -291,6 +297,37 @@ pub const Vm = struct {
         try self.defineMethod(math, "max", nativeMathMax, 2);
         try self.defineMethod(math, "min", nativeMathMin, 2);
         try self.defineMethod(math, "pow", nativeMathPow, 2);
+        try self.defineMethod(math, "sin", mathUnaryFn(opSin), 1);
+        try self.defineMethod(math, "cos", mathUnaryFn(opCos), 1);
+        try self.defineMethod(math, "tan", mathUnaryFn(opTan), 1);
+        try self.defineMethod(math, "asin", mathUnaryFn(opAsin), 1);
+        try self.defineMethod(math, "acos", mathUnaryFn(opAcos), 1);
+        try self.defineMethod(math, "atan", mathUnaryFn(opAtan), 1);
+        try self.defineMethod(math, "sinh", mathUnaryFn(opSinh), 1);
+        try self.defineMethod(math, "cosh", mathUnaryFn(opCosh), 1);
+        try self.defineMethod(math, "tanh", mathUnaryFn(opTanh), 1);
+        try self.defineMethod(math, "asinh", mathUnaryFn(opAsinh), 1);
+        try self.defineMethod(math, "acosh", mathUnaryFn(opAcosh), 1);
+        try self.defineMethod(math, "atanh", mathUnaryFn(opAtanh), 1);
+        try self.defineMethod(math, "exp", mathUnaryFn(opExp), 1);
+        try self.defineMethod(math, "expm1", mathUnaryFn(opExpm1), 1);
+        try self.defineMethod(math, "log", mathUnaryFn(opLog), 1);
+        try self.defineMethod(math, "log2", mathUnaryFn(opLog2), 1);
+        try self.defineMethod(math, "log10", mathUnaryFn(opLog10), 1);
+        try self.defineMethod(math, "log1p", mathUnaryFn(opLog1p), 1);
+        try self.defineMethod(math, "cbrt", mathUnaryFn(opCbrt), 1);
+        try self.defineMethod(math, "fround", mathUnaryFn(opFround), 1);
+        try self.defineMethod(math, "atan2", nativeMathAtan2, 2);
+        try self.defineMethod(math, "hypot", nativeMathHypot, 2);
+        try self.defineMethod(math, "clz32", nativeMathClz32, 1);
+        try self.defineMethod(math, "imul", nativeMathImul, 2);
+        try self.defineMethod(math, "random", nativeMathRandom, 0);
+        try self.defineData(math, "LN2", Value.fromNumber(0.6931471805599453), false, false, false);
+        try self.defineData(math, "LN10", Value.fromNumber(2.302585092994046), false, false, false);
+        try self.defineData(math, "LOG2E", Value.fromNumber(1.4426950408889634), false, false, false);
+        try self.defineData(math, "LOG10E", Value.fromNumber(0.4342944819032518), false, false, false);
+        try self.defineData(math, "SQRT2", Value.fromNumber(1.4142135623730951), false, false, false);
+        try self.defineData(math, "SQRT1_2", Value.fromNumber(0.7071067811865476), false, false, false);
         try self.defineData(global, "Math", Value.fromObject(math), true, false, true);
 
         // ---- RegExp (Phase 4 stub: construction only; matching throws) ----
@@ -436,7 +473,7 @@ pub const Vm = struct {
             .mul => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) * try self.toNumber(regs[inst.c])),
             .div => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) / try self.toNumber(regs[inst.c])),
             .mod => regs[inst.a] = Value.fromNumber(jsMod(try self.toNumber(regs[inst.b]), try self.toNumber(regs[inst.c]))),
-            .exp => regs[inst.a] = Value.fromNumber(std.math.pow(f64, try self.toNumber(regs[inst.b]), try self.toNumber(regs[inst.c]))),
+            .exp => regs[inst.a] = Value.fromNumber(jsPow(try self.toNumber(regs[inst.b]), try self.toNumber(regs[inst.c]))),
             .neg => regs[inst.a] = Value.fromNumber(-(try self.toNumber(regs[inst.b]))),
             .to_number => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b])),
 
@@ -1036,6 +1073,21 @@ fn jsUshr(a: i32, count: u32) u32 {
     return x >> sh;
 }
 
+/// JS `Number::exponentiate` — differs from C `pow` on a few edge cases
+/// (`x**±0` is 1 even for NaN x; `(±1)**±Infinity` is NaN).
+fn jsPow(base: f64, exp: f64) f64 {
+    if (std.math.isNan(exp)) return std.math.nan(f64);
+    if (exp == 0) return 1;
+    if (std.math.isNan(base)) return std.math.nan(f64);
+    if (std.math.isInf(exp)) {
+        const ab = @abs(base);
+        if (ab == 1) return std.math.nan(f64);
+        if (exp > 0) return if (ab > 1) std.math.inf(f64) else 0;
+        return if (ab > 1) 0 else std.math.inf(f64);
+    }
+    return std.math.pow(f64, base, exp);
+}
+
 fn doubleToInt32(n: f64) i32 {
     if (std.math.isNan(n) or std.math.isInf(n)) return 0;
     const truncated = std.math.trunc(n);
@@ -1067,7 +1119,8 @@ fn numberToString(n: f64, buf: []u8) []const u8 {
     if (std.math.isNan(n)) return "NaN";
     if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
     if (n == 0) return "0";
-    if (n == std.math.trunc(n) and @abs(n) < 1e21) {
+    // Integer fast path only when the value fits safely in i64.
+    if (n == std.math.trunc(n) and @abs(n) < 9.0e18) {
         return std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(n))}) catch "0";
     }
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch "0";
@@ -1285,7 +1338,14 @@ fn nativeMathRound(ctx: *anyopaque, this: Value, args: []const Value) Error!Valu
     _ = this;
     return mathUnary(ctx, args, struct {
         fn f(x: f64) f64 {
-            return std.math.floor(x + 0.5);
+            if (std.math.isNan(x) or std.math.isInf(x) or x == 0) return x; // preserves -0
+            // floor(x) + (fractional >= 0.5 ? 1 : 0); avoids the x+0.5
+            // double-rounding pitfall. Ties round toward +Infinity.
+            const fl = std.math.floor(x);
+            const result = if (x - fl >= 0.5) fl + 1 else fl;
+            // Values in [-0.5, 0) round to -0, not +0.
+            if (result == 0 and x < 0) return -0.0;
+            return result;
         }
     }.f);
 }
@@ -1313,29 +1373,41 @@ fn nativeMathPow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value 
     const vm = castVm(ctx);
     const base = try vm.toNumber(argAt(args, 0));
     const exp = try vm.toNumber(argAt(args, 1));
-    return Value.fromNumber(std.math.pow(f64, base, exp));
+    return Value.fromNumber(jsPow(base, exp));
+}
+fn isNegZero(x: f64) bool {
+    return x == 0 and std.math.signbit(x);
 }
 fn nativeMathMax(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = this;
     const vm = castVm(ctx);
     var result: f64 = -std.math.inf(f64);
+    var saw_nan = false;
+    // Spec: coerce every argument (side effects) before deciding.
     for (args) |a| {
         const n = try vm.toNumber(a);
-        if (std.math.isNan(n)) return Value.fromNumber(std.math.nan(f64));
-        if (n > result) result = n;
+        if (std.math.isNan(n)) {
+            saw_nan = true;
+        } else if (n > result or (n == 0 and result == 0 and isNegZero(result) and !isNegZero(n))) {
+            result = n; // +0 is greater than -0
+        }
     }
-    return Value.fromNumber(result);
+    return Value.fromNumber(if (saw_nan) std.math.nan(f64) else result);
 }
 fn nativeMathMin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = this;
     const vm = castVm(ctx);
     var result: f64 = std.math.inf(f64);
+    var saw_nan = false;
     for (args) |a| {
         const n = try vm.toNumber(a);
-        if (std.math.isNan(n)) return Value.fromNumber(std.math.nan(f64));
-        if (n < result) result = n;
+        if (std.math.isNan(n)) {
+            saw_nan = true;
+        } else if (n < result or (n == 0 and result == 0 and !isNegZero(result) and isNegZero(n))) {
+            result = n; // -0 is less than +0
+        }
     }
-    return Value.fromNumber(result);
+    return Value.fromNumber(if (saw_nan) std.math.nan(f64) else result);
 }
 fn nativeIsNaN(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = this;
@@ -1347,6 +1419,120 @@ fn nativeIsFinite(ctx: *anyopaque, this: Value, args: []const Value) Error!Value
     const vm = castVm(ctx);
     const n = try vm.toNumber(argAt(args, 0));
     return Value.fromBool(!std.math.isNan(n) and !std.math.isInf(n));
+}
+
+/// Build a native for a unary Math function from a `fn(f64) f64`.
+fn mathUnaryFn(comptime op: anytype) gc.NativeFn {
+    return struct {
+        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+            _ = this;
+            return mathUnary(ctx, args, op);
+        }
+    }.call;
+}
+
+fn opSin(x: f64) f64 {
+    return @sin(x);
+}
+fn opCos(x: f64) f64 {
+    return @cos(x);
+}
+fn opTan(x: f64) f64 {
+    return std.math.tan(x);
+}
+fn opAsin(x: f64) f64 {
+    return std.math.asin(x);
+}
+fn opAcos(x: f64) f64 {
+    return std.math.acos(x);
+}
+fn opAtan(x: f64) f64 {
+    return std.math.atan(x);
+}
+fn opSinh(x: f64) f64 {
+    return std.math.sinh(x);
+}
+fn opCosh(x: f64) f64 {
+    return std.math.cosh(x);
+}
+fn opTanh(x: f64) f64 {
+    return std.math.tanh(x);
+}
+fn opAsinh(x: f64) f64 {
+    return std.math.asinh(x);
+}
+fn opAcosh(x: f64) f64 {
+    return std.math.acosh(x);
+}
+fn opAtanh(x: f64) f64 {
+    return std.math.atanh(x);
+}
+fn opExp(x: f64) f64 {
+    return @exp(x);
+}
+fn opExpm1(x: f64) f64 {
+    return std.math.expm1(x);
+}
+fn opLog(x: f64) f64 {
+    return @log(x);
+}
+fn opLog2(x: f64) f64 {
+    return @log2(x);
+}
+fn opLog10(x: f64) f64 {
+    return @log10(x);
+}
+fn opLog1p(x: f64) f64 {
+    return std.math.log1p(x);
+}
+fn opCbrt(x: f64) f64 {
+    return std.math.cbrt(x);
+}
+fn opFround(x: f64) f64 {
+    return @floatCast(@as(f32, @floatCast(x)));
+}
+
+fn nativeMathAtan2(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const y = try vm.toNumber(argAt(args, 0));
+    const x = try vm.toNumber(argAt(args, 1));
+    return Value.fromNumber(std.math.atan2(y, x));
+}
+fn nativeMathHypot(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    var sum: f64 = 0;
+    var any_inf = false;
+    for (args) |a| {
+        const n = try vm.toNumber(a);
+        if (std.math.isInf(n)) any_inf = true;
+        sum += n * n;
+    }
+    // ±Infinity in any argument yields +Infinity, even alongside NaN.
+    if (any_inf) return Value.fromNumber(std.math.inf(f64));
+    return Value.fromNumber(@sqrt(sum));
+}
+fn nativeMathClz32(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const n = try vm.toUint32(argAt(args, 0));
+    return Value.fromNumber(@floatFromInt(@as(u32, @clz(n))));
+}
+fn nativeMathImul(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const a = try vm.toInt32(argAt(args, 0));
+    const b = try vm.toInt32(argAt(args, 1));
+    return Value.fromNumber(@floatFromInt(a *% b));
+}
+
+var math_prng = std.Random.DefaultPrng.init(0x2545F4914F6CDD1D);
+fn nativeMathRandom(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    _ = args;
+    return Value.fromNumber(math_prng.random().float(f64));
 }
 
 // ---- Array built-ins -------------------------------------------------------
@@ -1794,7 +1980,7 @@ fn nativeStringRepeat(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     try vm.protect(sv);
     defer vm.unprotect();
     const n = try vm.toNumber(argAt(args, 0));
-    if (n < 0 or std.math.isInf(n)) return vm.throwRangeError("invalid count value");
+    if (n < 0 or std.math.isNan(n) or n > 4294967295) return vm.throwRangeError("invalid count value");
     const count: usize = @intFromFloat(n);
     const units = sv.asString().units;
     var buf: std.ArrayList(u16) = .empty;
@@ -1893,8 +2079,12 @@ fn nativeNumberToString(ctx: *anyopaque, this: Value, args: []const Value) Error
         return vm.makeString(numberToString(x, &buf));
     }
     if (radix < 2 or radix > 36) return vm.throwRangeError("toString() radix must be between 2 and 36");
-    // Integer radix conversion (fractional part not supported for non-decimal).
     var buf: [72]u8 = undefined;
+    // Fall back to decimal formatting for non-finite or out-of-i64-range values.
+    if (std.math.isNan(x) or std.math.isInf(x) or @abs(x) >= 9.0e18) {
+        return vm.makeString(numberToString(x, &buf));
+    }
+    // Integer radix conversion (fractional part not supported for non-decimal).
     const i: i64 = @intFromFloat(std.math.trunc(x));
     return vm.makeString(formatRadix(i, radix, &buf));
 }
@@ -2427,6 +2617,29 @@ test "RegExp matching throws (stub, replace later)" {
     var vm = Vm.init(testing.allocator);
     defer vm.deinit();
     try testing.expectError(error.JsThrow, eval(&vm, "return /x/.test('x');"));
+}
+
+test "switch statements" {
+    try testing.expectEqual(@as(f64, 20), try evalNumber(
+        \\function f(n) {
+        \\  switch (n) {
+        \\    case 1: return 10;
+        \\    case 2: return 20;
+        \\    default: return 0;
+        \\  }
+        \\}
+        \\return f(2);
+    ));
+    try testing.expectEqual(@as(f64, 99), try evalNumber(
+        \\function f(n) { switch (n) { case 1: return 1; default: return 99; } }
+        \\return f(7);
+    ));
+    // Fall-through until break.
+    try testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\var x = 0;
+        \\switch (1) { case 1: x += 1; case 2: x += 2; break; case 3: x += 100; }
+        \\return x;
+    ));
 }
 
 test "for-of over arrays and strings" {
