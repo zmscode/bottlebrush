@@ -72,6 +72,26 @@ pub const PropertyMap = std.StringArrayHashMapUnmanaged(PropertyDescriptor);
 
 pub const Collection = enum { none, map, set };
 
+/// Typed-array element kinds.
+pub const TAKind = enum { i8, u8, u8c, i16, u16, i32, u32, f32, f64 };
+
+pub fn bytesPerElement(k: TAKind) u32 {
+    return switch (k) {
+        .i8, .u8, .u8c => 1,
+        .i16, .u16 => 2,
+        .i32, .u32, .f32 => 4,
+        .f64 => 8,
+    };
+}
+
+/// A typed-array view over an ArrayBuffer.
+pub const TypedArrayView = struct {
+    buffer: *Object, // the backing ArrayBuffer object
+    offset: u32, // byte offset into the buffer
+    length: u32, // element count
+    kind: TAKind,
+};
+
 pub const Object = struct {
     pub const gc_kind: Kind = .object;
     gc: GcHeader,
@@ -91,6 +111,10 @@ pub const Object = struct {
     collection: Collection = .none,
     /// Dense element store: array elements, or Map/Set entries.
     elements: std.ArrayList(Value) = .empty,
+    /// ArrayBuffer backing bytes (owned); null for non-buffers.
+    buffer_data: ?[]u8 = null,
+    /// TypedArray view metadata; null for non-typed-arrays.
+    ta: ?TypedArrayView = null,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -102,12 +126,14 @@ pub const Object = struct {
             if (entry.value_ptr.set) |s| s.mark(t);
         }
         for (self.elements.items) |v| v.mark(t);
+        if (self.ta) |ta| t.mark(&ta.buffer.gc);
     }
 
     pub fn deinitCell(self: *Object, gpa: std.mem.Allocator) void {
         for (self.properties.keys()) |k| gpa.free(k);
         self.properties.deinit(gpa);
         self.elements.deinit(gpa);
+        if (self.buffer_data) |b| gpa.free(b);
     }
 };
 

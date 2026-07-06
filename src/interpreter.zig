@@ -57,6 +57,8 @@ pub const Vm = struct {
     map_proto: ?*gc.Object = null,
     set_proto: ?*gc.Object = null,
     date_proto: ?*gc.Object = null,
+    arraybuffer_proto: ?*gc.Object = null,
+    typed_array_proto: ?*gc.Object = null,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -85,6 +87,8 @@ pub const Vm = struct {
         if (self.map_proto) |o| tracer.mark(&o.gc);
         if (self.set_proto) |o| tracer.mark(&o.gc);
         if (self.date_proto) |o| tracer.mark(&o.gc);
+        if (self.arraybuffer_proto) |o| tracer.mark(&o.gc);
+        if (self.typed_array_proto) |o| tracer.mark(&o.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -436,6 +440,46 @@ pub const Vm = struct {
         try self.defineMethod(date_ctor, "UTC", nativeDateUTC, 7);
         try self.defineMethod(date_ctor, "parse", nativeDateParse, 1);
         try self.defineData(global, "Date", Value.fromObject(date_ctor), true, false, true);
+
+        // ---- ArrayBuffer + TypedArrays ----
+        const ab_proto = try self.newObject(self.object_proto);
+        self.arraybuffer_proto = ab_proto;
+        const ab_ctor = try self.makeNative("ArrayBuffer", nativeArrayBuffer, 1);
+        try self.defineData(ab_ctor, "prototype", Value.fromObject(ab_proto), false, false, false);
+        try self.defineData(ab_proto, "constructor", Value.fromObject(ab_ctor), true, false, true);
+        try self.defineData(global, "ArrayBuffer", Value.fromObject(ab_ctor), true, false, true);
+
+        const ta_proto = try self.newObject(self.object_proto);
+        self.typed_array_proto = ta_proto;
+        try self.defineMethod(ta_proto, "fill", nativeTAFill, 1);
+        try self.defineMethod(ta_proto, "set", nativeTASet, 1);
+        try self.defineMethod(ta_proto, "subarray", nativeTASubarray, 2);
+        try self.defineMethod(ta_proto, "join", nativeTAJoin, 1);
+        try self.defineMethod(ta_proto, "toString", nativeTAJoin, 0);
+        try self.defineMethod(ta_proto, "forEach", nativeTAForEach, 1);
+        try self.defineMethod(ta_proto, "indexOf", nativeTAIndexOf, 1);
+
+        const ta_types = .{
+            .{ "Int8Array", gc.TAKind.i8 },
+            .{ "Uint8Array", gc.TAKind.u8 },
+            .{ "Uint8ClampedArray", gc.TAKind.u8c },
+            .{ "Int16Array", gc.TAKind.i16 },
+            .{ "Uint16Array", gc.TAKind.u16 },
+            .{ "Int32Array", gc.TAKind.i32 },
+            .{ "Uint32Array", gc.TAKind.u32 },
+            .{ "Float32Array", gc.TAKind.f32 },
+            .{ "Float64Array", gc.TAKind.f64 },
+        };
+        inline for (ta_types) |t| {
+            const proto = try self.newObject(self.typed_array_proto);
+            const ctor = try self.makeNative(t[0], typedArrayConstructor(t[1]), 3);
+            try self.defineData(ctor, "prototype", Value.fromObject(proto), false, false, false);
+            try self.defineData(proto, "constructor", Value.fromObject(ctor), true, false, true);
+            const bpe: f64 = @floatFromInt(gc.bytesPerElement(t[1]));
+            try self.defineData(ctor, "BYTES_PER_ELEMENT", Value.fromNumber(bpe), false, false, false);
+            try self.defineData(proto, "BYTES_PER_ELEMENT", Value.fromNumber(bpe), false, false, false);
+            try self.defineData(global, t[0], Value.fromObject(ctor), true, false, true);
+        }
 
         // ---- JSON ----
         const json = try self.newObject(self.object_proto);
@@ -790,6 +834,25 @@ pub const Vm = struct {
         return o;
     }
 
+    fn newArrayBuffer(self: *Vm, len: u32) Error!*gc.Object {
+        self.maybeStress();
+        const o = try self.heap.create(gc.Object);
+        o.prototype = self.arraybuffer_proto;
+        const data = try self.gpa.alloc(u8, len);
+        @memset(data, 0);
+        o.buffer_data = data;
+        return o;
+    }
+
+    /// Create a typed-array view object over a (possibly new) buffer.
+    fn newTypedArray(self: *Vm, proto: ?*gc.Object, buffer: *gc.Object, offset: u32, length: u32, kind: gc.TAKind) Error!*gc.Object {
+        self.maybeStress();
+        const o = try self.heap.create(gc.Object);
+        o.prototype = proto;
+        o.ta = .{ .buffer = buffer, .offset = offset, .length = length, .kind = kind };
+        return o;
+    }
+
     fn setArrayElement(self: *Vm, arr: *gc.Object, i: u32, value: Value) Error!void {
         if (i >= arr.elements.items.len) {
             const old = arr.elements.items.len;
@@ -842,6 +905,21 @@ pub const Vm = struct {
                 if (i < arr.elements.items.len) return arr.elements.items[i];
             }
         }
+        // TypedArray exotic own access (indexed elements + view properties).
+        if (base.asObject().ta) |ta| {
+            if (arrayIndex(key)) |i| {
+                if (i < ta.length) return readTypedElement(ta, i);
+                return Value.undefined_value;
+            }
+            if (std.mem.eql(u8, key, "length")) return Value.fromNumber(@floatFromInt(ta.length));
+            if (std.mem.eql(u8, key, "byteLength")) return Value.fromNumber(@floatFromInt(ta.length * gc.bytesPerElement(ta.kind)));
+            if (std.mem.eql(u8, key, "byteOffset")) return Value.fromNumber(@floatFromInt(ta.offset));
+            if (std.mem.eql(u8, key, "buffer")) return Value.fromObject(ta.buffer);
+        }
+        // ArrayBuffer byteLength.
+        if (base.asObject().buffer_data) |buf| {
+            if (base.asObject().ta == null and std.mem.eql(u8, key, "byteLength")) return Value.fromNumber(@floatFromInt(buf.len));
+        }
         var obj: ?*gc.Object = base.asObject();
         while (obj) |o| {
             if (o.properties.getPtr(key)) |desc| {
@@ -872,6 +950,13 @@ pub const Vm = struct {
                 return self.setArrayLength(arr, len);
             }
             if (arrayIndex(key)) |i| return self.setArrayElement(arr, i, value);
+        }
+        // TypedArray exotic indexed write.
+        if (base.asObject().ta) |ta| {
+            if (arrayIndex(key)) |i| {
+                if (i < ta.length) writeTypedElement(ta, i, try self.toNumber(value));
+                return;
+            }
         }
         const receiver = base.asObject();
         // Search prototype chain for an accessor or a non-writable data prop.
@@ -3104,6 +3189,191 @@ fn parseIsoDate(s: []const u8) f64 {
     return timeClip(makeDateTime(@floatFromInt(year), @floatFromInt(month - 1), @floatFromInt(day), h, mi, sec, ms));
 }
 
+// ---- TypedArray / ArrayBuffer built-ins ------------------------------------
+
+fn readTypedElement(ta: gc.TypedArrayView, i: u32) Value {
+    const bytes = ta.buffer.buffer_data.?;
+    const off = ta.offset + i * gc.bytesPerElement(ta.kind);
+    const n: f64 = switch (ta.kind) {
+        .i8 => @floatFromInt(@as(i8, @bitCast(bytes[off]))),
+        .u8, .u8c => @floatFromInt(bytes[off]),
+        .i16 => @floatFromInt(std.mem.readInt(i16, bytes[off..][0..2], .little)),
+        .u16 => @floatFromInt(std.mem.readInt(u16, bytes[off..][0..2], .little)),
+        .i32 => @floatFromInt(std.mem.readInt(i32, bytes[off..][0..4], .little)),
+        .u32 => @floatFromInt(std.mem.readInt(u32, bytes[off..][0..4], .little)),
+        .f32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[off..][0..4], .little)))),
+        .f64 => @bitCast(std.mem.readInt(u64, bytes[off..][0..8], .little)),
+    };
+    return Value.fromNumber(n);
+}
+
+fn clampToU8(n: f64) u8 {
+    if (std.math.isNan(n) or n <= 0) return 0;
+    if (n >= 255) return 255;
+    return @intFromFloat(std.math.round(n));
+}
+
+fn writeTypedElement(ta: gc.TypedArrayView, i: u32, n: f64) void {
+    const bytes = ta.buffer.buffer_data.?;
+    const off = ta.offset + i * gc.bytesPerElement(ta.kind);
+    const bits: u32 = @bitCast(doubleToInt32(n)); // ToInt32/ToUint32 bit pattern
+    switch (ta.kind) {
+        .i8, .u8 => bytes[off] = @truncate(bits),
+        .u8c => bytes[off] = clampToU8(n),
+        .i16, .u16 => std.mem.writeInt(u16, bytes[off..][0..2], @truncate(bits), .little),
+        .i32, .u32 => std.mem.writeInt(u32, bytes[off..][0..4], bits, .little),
+        .f32 => std.mem.writeInt(u32, bytes[off..][0..4], @bitCast(@as(f32, @floatCast(n))), .little),
+        .f64 => std.mem.writeInt(u64, bytes[off..][0..8], @bitCast(n), .little),
+    }
+}
+
+fn nativeArrayBuffer(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("Constructor ArrayBuffer requires 'new'");
+    const len_f = try vm.toNumber(argAt(args, 0));
+    if (std.math.isNan(len_f) or len_f < 0 or len_f > 0x7fffffff) return vm.throwRangeError("Invalid array buffer length");
+    const len: u32 = @intFromFloat(len_f);
+    const data = try vm.gpa.alloc(u8, len);
+    @memset(data, 0);
+    this.asObject().buffer_data = data;
+    return this;
+}
+
+fn typedArrayConstructor(comptime kind: gc.TAKind) gc.NativeFn {
+    return struct {
+        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+            const vm = castVm(ctx);
+            if (!this.isObject()) return vm.throwTypeError("Constructor requires 'new'");
+            const obj = this.asObject();
+            const bpe = gc.bytesPerElement(kind);
+            const arg = argAt(args, 0);
+
+            if (arg.isObject() and arg.asObject().buffer_data != null and arg.asObject().ta == null) {
+                // View over an existing ArrayBuffer.
+                const buffer = arg.asObject();
+                const off_f = if (args.len > 1) try vm.toNumber(args[1]) else 0;
+                const offset: u32 = @intFromFloat(@max(0, off_f));
+                const avail = buffer.buffer_data.?.len - @min(offset, buffer.buffer_data.?.len);
+                const length: u32 = if (args.len > 2 and !args[2].isUndefined())
+                    @intFromFloat(@max(0, try vm.toNumber(args[2])))
+                else
+                    @intCast(avail / bpe);
+                if (offset + length * bpe > buffer.buffer_data.?.len) return vm.throwRangeError("Invalid typed array length");
+                obj.ta = .{ .buffer = buffer, .offset = offset, .length = length, .kind = kind };
+            } else if (arg.isObject() and (arg.asObject().is_array or arg.asObject().ta != null)) {
+                // Copy from an array or another typed array.
+                const src = arg.asObject();
+                const length: u32 = if (src.is_array) @intCast(src.elements.items.len) else src.ta.?.length;
+                const buffer = try vm.newArrayBuffer(length * bpe);
+                obj.ta = .{ .buffer = buffer, .offset = 0, .length = length, .kind = kind };
+                var i: u32 = 0;
+                while (i < length) : (i += 1) {
+                    const el = if (src.is_array) src.elements.items[i] else readTypedElement(src.ta.?, i);
+                    writeTypedElement(obj.ta.?, i, try vm.toNumber(el));
+                }
+            } else {
+                // Length (or empty).
+                const len_f = if (arg.isUndefined()) 0 else try vm.toNumber(arg);
+                if (std.math.isNan(len_f) or len_f < 0 or len_f > 0x3fffffff) return vm.throwRangeError("Invalid typed array length");
+                const length: u32 = @intFromFloat(len_f);
+                const buffer = try vm.newArrayBuffer(length * bpe);
+                obj.ta = .{ .buffer = buffer, .offset = 0, .length = length, .kind = kind };
+            }
+            return this;
+        }
+    }.call;
+}
+
+fn thisTypedArray(vm: *Vm, this: Value) Error!gc.TypedArrayView {
+    if (!this.isObject() or this.asObject().ta == null) return vm.throwTypeError("not a TypedArray");
+    return this.asObject().ta.?;
+}
+
+fn nativeTAFill(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const ta = try thisTypedArray(vm, this);
+    const n = try vm.toNumber(argAt(args, 0));
+    const len: i64 = @intCast(ta.length);
+    const start = relativeIndex(try optNumber(vm, argAt(args, 1), 0), len);
+    const end = relativeIndex(try optNumber(vm, argAt(args, 2), @floatFromInt(len)), len);
+    var i = start;
+    while (i < end) : (i += 1) writeTypedElement(ta, @intCast(i), n);
+    return this;
+}
+
+fn nativeTASet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const ta = try thisTypedArray(vm, this);
+    const src = argAt(args, 0);
+    const offset: u32 = @intFromFloat(@max(0, try optNumber(vm, argAt(args, 1), 0)));
+    if (src.isObject() and src.asObject().is_array) {
+        const elems = src.asObject().elements.items;
+        if (offset + elems.len > ta.length) return vm.throwRangeError("offset is out of bounds");
+        for (elems, 0..) |el, i| writeTypedElement(ta, offset + @as(u32, @intCast(i)), try vm.toNumber(el));
+    } else if (src.isObject() and src.asObject().ta != null) {
+        const s = src.asObject().ta.?;
+        if (offset + s.length > ta.length) return vm.throwRangeError("offset is out of bounds");
+        var i: u32 = 0;
+        while (i < s.length) : (i += 1) writeTypedElement(ta, offset + i, readTypedElement(s, i).asNumber());
+    } else {
+        return vm.throwTypeError("argument is not array-like");
+    }
+    return Value.undefined_value;
+}
+
+fn nativeTASubarray(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const ta = try thisTypedArray(vm, this);
+    const len: i64 = @intCast(ta.length);
+    const start = relativeIndex(try optNumber(vm, argAt(args, 0), 0), len);
+    const end = relativeIndex(try optNumber(vm, argAt(args, 1), @floatFromInt(len)), len);
+    const new_len: u32 = if (end > start) @intCast(end - start) else 0;
+    const bpe = gc.bytesPerElement(ta.kind);
+    // Shares the same backing buffer (a view, not a copy).
+    const view = try vm.newTypedArray(this.asObject().prototype, ta.buffer, ta.offset + @as(u32, @intCast(start)) * bpe, new_len, ta.kind);
+    return Value.fromObject(view);
+}
+
+fn nativeTAJoin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const ta = try thisTypedArray(vm, this);
+    const sep = if (argAt(args, 0).isUndefined()) try vm.makeString(",") else try vm.toStringVal(argAt(args, 0));
+    try vm.protect(sep);
+    defer vm.unprotect();
+    var buf: std.ArrayList(u16) = .empty;
+    defer buf.deinit(vm.gpa);
+    var i: u32 = 0;
+    while (i < ta.length) : (i += 1) {
+        if (i > 0) try buf.appendSlice(vm.gpa, sep.asString().units);
+        const s = try vm.toStringVal(readTypedElement(ta, i));
+        try buf.appendSlice(vm.gpa, s.asString().units);
+    }
+    return vm.makeStringFromUtf16(buf.items);
+}
+
+fn nativeTAForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const ta = try thisTypedArray(vm, this);
+    const cb = argAt(args, 0);
+    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
+    var i: u32 = 0;
+    while (i < ta.length) : (i += 1) {
+        _ = try vm.callValue(cb, Value.undefined_value, &.{ readTypedElement(ta, i), Value.fromNumber(@floatFromInt(i)), this });
+    }
+    return Value.undefined_value;
+}
+
+fn nativeTAIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const ta = try thisTypedArray(vm, this);
+    const target = try vm.toNumber(argAt(args, 0));
+    var i: u32 = 0;
+    while (i < ta.length) : (i += 1) {
+        if (readTypedElement(ta, i).asNumber() == target) return Value.fromNumber(@floatFromInt(i));
+    }
+    return Value.fromNumber(-1);
+}
+
 fn clampIndex(n: f64, len: i64) i64 {
     if (std.math.isNan(n) or n < 0) return 0;
     if (n > @as(f64, @floatFromInt(len))) return len;
@@ -3620,6 +3890,72 @@ test "RegExp matching throws (stub, replace later)" {
     var vm = Vm.init(testing.allocator);
     defer vm.deinit();
     try testing.expectError(error.JsThrow, eval(&vm, "return /x/.test('x');"));
+}
+
+test "TypedArrays: construction and element access" {
+    try testing.expectEqual(@as(f64, 4), try evalNumber("return new Int32Array(4).length;"));
+    try testing.expectEqual(@as(f64, 30), try evalNumber("var a = new Int32Array(3); a[0] = 10; a[1] = 20; return a[0] + a[1];"));
+    try testing.expectEqual(@as(f64, 6), try evalNumber("var a = new Int32Array([1, 2, 3]); return a[0] + a[1] + a[2];"));
+    try testing.expectEqual(@as(f64, 4), try evalNumber("return Int32Array.BYTES_PER_ELEMENT;"));
+    try testing.expectEqual(@as(f64, 16), try evalNumber("return new Int32Array(4).byteLength;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return (new Int32Array(1) instanceof Int32Array) ? 1 : 0;"));
+}
+
+test "TypedArrays: element type coercion" {
+    try testing.expectEqual(@as(f64, 44), try evalNumber("var a = new Uint8Array(1); a[0] = 300; return a[0];")); // 300 & 255
+    try testing.expectEqual(@as(f64, -56), try evalNumber("var a = new Int8Array(1); a[0] = 200; return a[0];")); // 200 as i8
+    try testing.expectEqual(@as(f64, 255), try evalNumber("var a = new Uint8ClampedArray(1); a[0] = 300; return a[0];")); // clamped
+    try testing.expectEqual(@as(f64, 0), try evalNumber("var a = new Uint8ClampedArray(1); a[0] = -5; return a[0];")); // clamped low
+    try testing.expectEqual(@as(f64, 3.5), try evalNumber("var a = new Float64Array(1); a[0] = 3.5; return a[0];"));
+}
+
+test "TypedArrays: ArrayBuffer views" {
+    try testing.expectEqual(@as(f64, 16), try evalNumber("return new ArrayBuffer(16).byteLength;"));
+    try testing.expectEqual(@as(f64, 14), try evalNumber(
+        \\var b = new ArrayBuffer(8);
+        \\var a = new Int32Array(b);
+        \\a[0] = 5; a[1] = 7;
+        \\return a.length + a[0] + a[1];
+    ));
+    // Two views share one buffer (little-endian low byte).
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var b = new ArrayBuffer(4);
+        \\var bytes = new Uint8Array(b);
+        \\var ints = new Int32Array(b);
+        \\ints[0] = 1;
+        \\return bytes[0];
+    ));
+}
+
+test "TypedArrays: methods" {
+    try testing.expectEqual(@as(f64, 28), try evalNumber("var a = new Int32Array(4); a.fill(7); return a[0] + a[1] + a[2] + a[3];"));
+    try testing.expectEqual(@as(f64, 6), try evalNumber("var a = new Int32Array(4); a.set([1, 2, 3], 1); return a[1] + a[2] + a[3];"));
+    try testing.expectEqual(@as(f64, 4), try evalNumber("var a = new Int32Array([1, 2, 3, 4]); var s = a.subarray(1, 3); return s.length + s[0];"));
+    // subarray shares the buffer.
+    try testing.expectEqual(@as(f64, 99), try evalNumber("var a = new Int32Array([1, 2, 3, 4]); var s = a.subarray(1); s[0] = 99; return a[1];"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return new Int32Array([1, 2, 3]).join('-') === '1-2-3' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return new Int32Array([5, 6, 7]).indexOf(6);"));
+    try testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\var sum = 0;
+        \\new Int32Array([1, 2, 3]).forEach(function (x) { sum += x; });
+        \\return sum;
+    ));
+}
+
+test "TypedArrays under GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var total = 0;
+        \\for (var i = 0; i < 10; i++) {
+        \\  var a = new Float64Array(8);
+        \\  a.fill(i);
+        \\  total += a[3];
+        \\}
+        \\return total;
+    );
+    try testing.expectEqual(@as(f64, 45), v.asNumber()); // 0+1+...+9
 }
 
 test "Date" {
