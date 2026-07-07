@@ -30,6 +30,7 @@ pub const Flags = struct {
     dot_all: bool = false,
     sticky: bool = false,
     unicode: bool = false,
+    has_indices: bool = false,
 
     pub fn parse(s: []const u8) error{InvalidPattern}!Flags {
         var f: Flags = .{};
@@ -40,6 +41,7 @@ pub const Flags = struct {
             's' => f.dot_all = true,
             'y' => f.sticky = true,
             'u' => f.unicode = true,
+            'd' => f.has_indices = true,
             else => return error.InvalidPattern,
         };
         return f;
@@ -476,6 +478,7 @@ const Op = enum(u8) {
     look_neg, // negative lookahead
     lookbehind, // a = sub start, b = continuation (positive lookbehind)
     lookbehind_neg, // negative lookbehind
+    clear_caps, // a = first group, b = last group (inclusive): reset to unset
 };
 
 const Inst = struct { op: Op, a: u32 = 0, b: u32 = 0 };
@@ -569,9 +572,15 @@ const Compiler = struct {
     }
 
     fn compileRepeat(self: *Compiler, child: *const Node, min: u32, max: ?u32, greedy: bool) Error!void {
+        // Spec (RepeatMatcher): the captures of groups *inside* the repeated
+        // subpattern reset at the start of every iteration.
+        const caps = groupSpan(child);
         // Mandatory copies.
         var i: u32 = 0;
-        while (i < min) : (i += 1) try self.compileNode(child);
+        while (i < min) : (i += 1) {
+            try self.emitClearCaps(caps);
+            try self.compileNode(child);
+        }
 
         if (max) |m| {
             // Optional copies: (child?) repeated (m-min) times.
@@ -581,6 +590,7 @@ const Compiler = struct {
             while (k < m) : (k += 1) {
                 const sp = try self.emit(.{ .op = .split });
                 try opt_splits.append(self.gpa, sp);
+                try self.emitClearCaps(caps);
                 try self.compileNode(child);
             }
             const end = self.here();
@@ -588,10 +598,15 @@ const Compiler = struct {
         } else {
             // Unbounded tail: a greedy/lazy star.
             const loop = try self.emit(.{ .op = .split });
+            try self.emitClearCaps(caps);
             try self.compileNode(child);
             _ = try self.emit(.{ .op = .jmp, .a = loop });
             self.setSplit(loop, greedy, loop + 1, self.here());
         }
+    }
+
+    fn emitClearCaps(self: *Compiler, caps: ?[2]u32) Error!void {
+        if (caps) |c| _ = try self.emit(.{ .op = .clear_caps, .a = c[0], .b = c[1] });
     }
 
     /// A split whose `a` is tried first. Greedy prefers entering the body;
@@ -606,6 +621,34 @@ const Compiler = struct {
         }
     }
 };
+
+/// The inclusive range of capture-group indices inside `n`, or null when it
+/// contains none. Group numbers are assigned in source order, so a subtree's
+/// groups are always contiguous.
+fn groupSpan(n: *const Node) ?[2]u32 {
+    var lo: u32 = std.math.maxInt(u32);
+    var hi: u32 = 0;
+    collectGroups(n, &lo, &hi);
+    if (lo == std.math.maxInt(u32)) return null;
+    return .{ lo, hi };
+}
+
+fn collectGroups(n: *const Node, lo: *u32, hi: *u32) void {
+    switch (n.*) {
+        .group => |g| {
+            if (g.capture) |idx| {
+                lo.* = @min(lo.*, idx);
+                hi.* = @max(hi.*, idx);
+            }
+            collectGroups(g.child, lo, hi);
+        },
+        .concat => |parts| for (parts) |p| collectGroups(p, lo, hi),
+        .alt => |branches| for (branches) |b| collectGroups(b, lo, hi),
+        .repeat => |r| collectGroups(r.child, lo, hi),
+        .look => |l| collectGroups(l.child, lo, hi),
+        else => {},
+    }
+}
 
 // ---- compiled regex + matcher ----------------------------------------------
 
@@ -788,6 +831,17 @@ const Matcher = struct {
                 .save => {
                     try self.undo.append(self.gpa, .{ .slot = inst.a, .prev = self.caps[inst.a] });
                     self.caps[inst.a] = sp;
+                    pc += 1;
+                    continue;
+                },
+                .clear_caps => {
+                    var g: usize = inst.a;
+                    while (g <= inst.b) : (g += 1) {
+                        try self.undo.append(self.gpa, .{ .slot = 2 * g, .prev = self.caps[2 * g] });
+                        self.caps[2 * g] = null;
+                        try self.undo.append(self.gpa, .{ .slot = 2 * g + 1, .prev = self.caps[2 * g + 1] });
+                        self.caps[2 * g + 1] = null;
+                    }
                     pc += 1;
                     continue;
                 },

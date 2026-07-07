@@ -220,9 +220,13 @@ pub const Closure = struct {
     /// function declarations/expressions are constructors; generators, arrows,
     /// and most built-in functions are not.
     constructor: bool = false,
+    /// Arrow functions capture the `this` of their creation site (lexical
+    /// `this`); null for ordinary functions, whose `this` is the call receiver.
+    captured_this: ?Value = null,
 
     pub fn trace(self: *Closure, t: *Tracer) void {
         if (self.env) |e| t.mark(&e.gc);
+        if (self.captured_this) |v| v.mark(t);
     }
 };
 
@@ -298,6 +302,10 @@ pub const Heap = struct {
     total_allocated: usize = 0,
     /// When set, the VM should `collect` at every allocation safe-point.
     stress: bool = false,
+    /// Allocation-triggered GC threshold (live cells): collect when
+    /// `live_count` reaches this, then set it to ~2x the surviving live set
+    /// (V8-style heap growth factor). Keeps long-running programs bounded.
+    next_gc: usize = 16 * 1024,
 
     pub fn init(gpa: std.mem.Allocator) Heap {
         return .{ .gpa = gpa };

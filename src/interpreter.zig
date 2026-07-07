@@ -23,11 +23,18 @@ const Value = @import("value.zig").Value;
 pub const Error = gc.VmError;
 
 const max_call_depth = 2000;
+/// One segment of the register stack. `top` is the allocation watermark.
+const RegSlab = struct { mem: []Value, top: usize };
+/// Initial register-slab size (Values); each additional slab doubles.
+const reg_slab_initial = 1 << 12;
 
 /// Internal property key holding a wrapper object's boxed primitive
 /// ([[StringData]]/[[NumberData]]/[[BooleanData]]). NUL-prefixed so it is
 /// invisible to enumeration, like symbol keys.
 const prim_key = "\x00prim";
+/// Internal keys for a RegExp's [[OriginalSource]] / [[OriginalFlags]].
+const regexp_source_key = "\x00resrc";
+const regexp_flags_key = "\x00reflg";
 /// Instruction budget per `run`. A hung/looping test throws `error.Timeout`
 /// (scored as an engine limit, not a conformance failure) instead of spinning
 /// forever. Generous enough for legitimately heavy tests.
@@ -64,6 +71,18 @@ pub const Vm = struct {
     /// loops, so `run` also arms a deadline checked periodically in the loop.
     threaded: std.Io.Threaded = std.Io.Threaded.init_single_threaded,
     deadline_ns: i96 = 0,
+    /// Bytecode compiled at run time (eval / new Function). Kept alive for the
+    /// VM's lifetime because closures reference their CodeBlocks.
+    eval_programs: std.ArrayList(bc.Program) = .empty,
+    /// Segmented register stack (V8-Ignition style): frames carve slices out
+    /// of slabs instead of heap-allocating a register file per call. Growth
+    /// appends a bigger slab, so outstanding frame slices stay valid; slabs
+    /// are reused for the VM's lifetime.
+    reg_slabs: std.ArrayList(RegSlab) = .empty,
+    /// Interned constant-pool strings (content-keyed), so re-executing
+    /// `load_const` reuses one heap string instead of allocating each time.
+    /// Marked as GC roots; keys are gpa-owned.
+    intern: std.StringHashMapUnmanaged(Value) = .empty,
     // Realm intrinsics (created lazily by `bootstrap`).
     object_proto: ?*gc.Object = null,
     function_proto: ?*gc.Object = null,
@@ -77,6 +96,7 @@ pub const Vm = struct {
     array_proto: ?*gc.Object = null,
     string_proto: ?*gc.Object = null,
     number_proto: ?*gc.Object = null,
+    boolean_proto: ?*gc.Object = null,
     regexp_proto: ?*gc.Object = null,
     map_proto: ?*gc.Object = null,
     set_proto: ?*gc.Object = null,
@@ -105,12 +125,23 @@ pub const Vm = struct {
         for (self.symbol_registry.items) |r| self.gpa.free(r.key);
         self.symbol_registry.deinit(self.gpa);
         if (self.symbol_iterator_key.len != 0) self.gpa.free(self.symbol_iterator_key);
+        // Programs compiled by eval/Function() live as long as the VM: closures
+        // created inside them keep pointing at their bytecode arenas.
+        for (self.eval_programs.items) |*p| p.deinit();
+        self.eval_programs.deinit(self.gpa);
+        for (self.reg_slabs.items) |s| self.gpa.free(s.mem);
+        self.reg_slabs.deinit(self.gpa);
+        var iit = self.intern.keyIterator();
+        while (iit.next()) |k| self.gpa.free(k.*);
+        self.intern.deinit(self.gpa);
         self.heap.deinit();
     }
 
     /// GC root provider. Marks all reachable roots held by the VM.
     pub fn markRoots(self: *const Vm, tracer: *gc.Tracer) void {
         if (self.pending_exception) |e| e.mark(tracer);
+        var intern_it = self.intern.valueIterator();
+        while (intern_it.next()) |v| v.mark(tracer);
         if (self.object_proto) |o| tracer.mark(&o.gc);
         if (self.function_proto) |o| tracer.mark(&o.gc);
         if (self.global_object) |o| tracer.mark(&o.gc);
@@ -122,6 +153,7 @@ pub const Vm = struct {
         if (self.array_proto) |o| tracer.mark(&o.gc);
         if (self.string_proto) |o| tracer.mark(&o.gc);
         if (self.number_proto) |o| tracer.mark(&o.gc);
+        if (self.boolean_proto) |o| tracer.mark(&o.gc);
         if (self.regexp_proto) |o| tracer.mark(&o.gc);
         if (self.map_proto) |o| tracer.mark(&o.gc);
         if (self.set_proto) |o| tracer.mark(&o.gc);
@@ -149,8 +181,18 @@ pub const Vm = struct {
         _ = self.temp_roots.pop();
     }
 
+    /// Allocation safe-point: under stress, collect every time; otherwise
+    /// collect when the live set reaches the threshold, then re-arm it at ~2x
+    /// the survivors (V8-style growth factor).
     fn maybeStress(self: *Vm) void {
-        if (self.heap.stress) _ = self.heap.collect(self);
+        if (self.heap.stress) {
+            _ = self.heap.collect(self);
+            return;
+        }
+        if (self.heap.live_count >= self.heap.next_gc) {
+            _ = self.heap.collect(self);
+            self.heap.next_gc = @max(16 * 1024, self.heap.live_count * 2);
+        }
     }
 
     /// Create the base intrinsics if they don't exist yet.
@@ -258,15 +300,13 @@ pub const Vm = struct {
             break :blk re; // the object owns it from here (freed in deinitCell)
         };
 
+        // `source`/`flags`/flag booleans are accessors on RegExp.prototype
+        // (per ES2015+); instances carry only the internal source text and a
+        // writable `lastIndex`.
         const src = if (source.len == 0) "(?:)" else source;
-        try self.defineData(obj, "source", try self.makeString(src), false, false, false);
-        try self.defineData(obj, "flags", try self.makeString(flags), false, false, false);
+        try self.defineData(obj, regexp_source_key, try self.makeString(src), false, false, false);
+        try self.defineData(obj, regexp_flags_key, try self.makeString(flags), false, false, false);
         try self.defineData(obj, "lastIndex", Value.fromNumber(0), true, false, false);
-        try self.defineData(obj, "global", Value.fromBool(hasFlag(flags, 'g')), false, false, false);
-        try self.defineData(obj, "ignoreCase", Value.fromBool(hasFlag(flags, 'i')), false, false, false);
-        try self.defineData(obj, "multiline", Value.fromBool(hasFlag(flags, 'm')), false, false, false);
-        try self.defineData(obj, "sticky", Value.fromBool(hasFlag(flags, 'y')), false, false, false);
-        try self.defineData(obj, "dotAll", Value.fromBool(hasFlag(flags, 's')), false, false, false);
         return obj;
     }
 
@@ -439,7 +479,14 @@ pub const Vm = struct {
         try self.defineMethod(number_ctor, "isNaN", nativeNumberIsNaN, 1);
         try self.defineData(global, "Number", Value.fromObject(number_ctor), true, false, true);
 
-        try self.defineData(global, "Boolean", Value.fromObject(asCtor(try self.makeNative("Boolean", nativeBoolean, 1))), true, false, true);
+        const boolean_proto = try self.newObject(self.object_proto);
+        self.boolean_proto = boolean_proto;
+        try self.defineMethod(boolean_proto, "toString", nativeBooleanToString, 0);
+        try self.defineMethod(boolean_proto, "valueOf", nativeBooleanValueOf, 0);
+        const boolean_ctor = asCtor(try self.makeNative("Boolean", nativeBoolean, 1));
+        try self.defineData(boolean_ctor, "prototype", Value.fromObject(boolean_proto), false, false, false);
+        try self.defineData(boolean_proto, "constructor", Value.fromObject(boolean_ctor), true, false, true);
+        try self.defineData(global, "Boolean", Value.fromObject(boolean_ctor), true, false, true);
 
         // ---- Math ----
         const math = try self.newObject(self.object_proto);
@@ -494,6 +541,14 @@ pub const Vm = struct {
         try self.defineMethod(regexp_proto, "test", nativeRegExpTest, 1);
         try self.defineMethod(regexp_proto, "exec", nativeRegExpExec, 1);
         try self.defineMethod(regexp_proto, "toString", nativeRegExpToString, 0);
+        try self.defineGetter(regexp_proto, "source", nativeRegExpGetSource);
+        try self.defineGetter(regexp_proto, "flags", nativeRegExpGetFlags);
+        try self.defineGetter(regexp_proto, "global", regexpFlagGetter("global"));
+        try self.defineGetter(regexp_proto, "ignoreCase", regexpFlagGetter("ignore_case"));
+        try self.defineGetter(regexp_proto, "multiline", regexpFlagGetter("multiline"));
+        try self.defineGetter(regexp_proto, "sticky", regexpFlagGetter("sticky"));
+        try self.defineGetter(regexp_proto, "dotAll", regexpFlagGetter("dot_all"));
+        try self.defineGetter(regexp_proto, "unicode", regexpFlagGetter("unicode"));
         const regexp_ctor = asCtor(try self.makeNative("RegExp", nativeRegExp, 2));
         try self.defineData(regexp_ctor, "prototype", Value.fromObject(regexp_proto), false, false, false);
         try self.defineData(regexp_proto, "constructor", Value.fromObject(regexp_ctor), true, false, true);
@@ -706,6 +761,7 @@ pub const Vm = struct {
         // ---- global functions ----
         try self.defineMethod(global, "isNaN", nativeIsNaN, 1);
         try self.defineMethod(global, "isFinite", nativeIsFinite, 1);
+        try self.defineMethod(global, "eval", nativeEval, 1);
         try self.defineMethod(global, "parseInt", nativeParseInt, 2);
         try self.defineMethod(global, "parseFloat", nativeParseFloat, 1);
         try self.defineMethod(global, "encodeURI", nativeEncodeURI, 1);
@@ -780,10 +836,35 @@ pub const Vm = struct {
     const Step = union(enum) { advance, jumped, returned: Value, yielded: Value };
     const RunResult = union(enum) { returned: Value, yielded: Value };
 
-    fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, this_value: Value) Error!Value {
-        const regs = try self.gpa.alloc(Value, code.num_registers);
-        defer self.gpa.free(regs);
+    /// Carve `need` registers off the segmented stack. Returns the slab index
+    /// and base; the caller restores `top` on frame exit (strict LIFO).
+    fn pushRegs(self: *Vm, need: usize) Error!struct { slab: usize, base: usize, regs: []Value } {
+        // Find room in the topmost slab, else append a bigger one. Older
+        // slabs' outstanding slices are never moved.
+        if (self.reg_slabs.items.len == 0) {
+            const n = @max(reg_slab_initial, need);
+            try self.reg_slabs.append(self.gpa, .{ .mem = try self.gpa.alloc(Value, n), .top = 0 });
+        }
+        var idx = self.reg_slabs.items.len - 1;
+        var slab = &self.reg_slabs.items[idx];
+        if (slab.top + need > slab.mem.len) {
+            const n = @max(slab.mem.len * 2, need);
+            try self.reg_slabs.append(self.gpa, .{ .mem = try self.gpa.alloc(Value, n), .top = 0 });
+            idx = self.reg_slabs.items.len - 1;
+            slab = &self.reg_slabs.items[idx];
+        }
+        const base = slab.top;
+        slab.top += need;
+        const regs = slab.mem[base .. base + need];
         @memset(regs, Value.undefined_value);
+        return .{ .slab = idx, .base = base, .regs = regs };
+    }
+
+    fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, this_value: Value) Error!Value {
+        // Registers come from the segmented slab stack (no per-call allocation).
+        const r = try self.pushRegs(code.num_registers);
+        defer self.reg_slabs.items[r.slab].top = r.base;
+        const regs = r.regs;
 
         var frame = Frame{ .code = code, .env = env, .regs = regs, .this_value = this_value };
         try self.frames.append(self.gpa, &frame);
@@ -791,12 +872,37 @@ pub const Vm = struct {
 
         return switch (try self.runLoop(&frame)) {
             .returned => |v| v,
-            .yielded => unreachable, // only generator frames yield
+            // Only generator frames should yield; a stray gen_yield in a plain
+            // frame throws instead of crashing the host.
+            .yielded => self.throwTypeError("yield outside generator"),
         };
     }
 
     /// The core dispatch loop over a frame. Runs until the function returns or a
     /// generator yields (leaving `frame.pc` at the `gen_yield` instruction).
+    /// Parse, compile, and run `src8` in the global scope (indirect-eval
+    /// semantics; direct eval's caller-scope capture is not supported). The
+    /// compiled program is kept alive for the VM's lifetime.
+    fn evalSource(self: *Vm, src8: []const u8) Error!Value {
+        const parser_mod = @import("parser.zig");
+        const compiler_mod = @import("compiler.zig");
+        const pr = parser_mod.parse(self.gpa, src8, .script) catch return error.OutOfMemory;
+        var tree = switch (pr) {
+            .syntax_error => return self.throwSyntaxError("eval: invalid or unsupported source"),
+            .ok => |t| t,
+        };
+        defer tree.deinit();
+        const cr = compiler_mod.compile(self.gpa, tree.root, src8) catch return error.OutOfMemory;
+        const program = switch (cr) {
+            .compile_error => return self.throwSyntaxError("eval: invalid or unsupported source"),
+            .ok => |p| p,
+        };
+        try self.eval_programs.append(self.gpa, program);
+        const root = self.eval_programs.items[self.eval_programs.items.len - 1].root;
+        const env = try self.createEnv(null, root.num_env_slots);
+        return self.execute(root, env, Value.fromObject(self.global_object.?));
+    }
+
     /// True once the current `run` has exceeded its wall-clock deadline.
     fn overBudget(self: *Vm) bool {
         return std.Io.Clock.now(.awake, self.threaded.io()).nanoseconds > self.deadline_ns;
@@ -956,7 +1062,7 @@ pub const Vm = struct {
             .enum_keys => regs[inst.a] = Value.fromObject(try self.enumKeys(regs[inst.b])),
             .gen_yield => return Step{ .yielded = regs[inst.b] },
 
-            .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env),
+            .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env, this_value),
             .call => {
                 const receiver = regs[inst.b];
                 const callee = regs[inst.b + 1];
@@ -997,21 +1103,28 @@ pub const Vm = struct {
 
     // ---- calls & closures --------------------------------------------------
 
-    fn makeClosure(self: *Vm, child: *const bc.CodeBlock, env: *gc.Environment) Error!Value {
+    fn makeClosure(self: *Vm, child: *const bc.CodeBlock, env: *gc.Environment, creator_this: Value) Error!Value {
         self.maybeStress();
         const clo = try self.heap.create(gc.Closure);
         clo.code = child;
         clo.env = env;
         clo.constructor = !child.is_generator and !child.is_arrow; // generators/arrows aren't `new`-able
+        if (child.is_arrow) clo.captured_this = creator_this; // lexical `this`
         const fn_obj = try self.heap.create(gc.Object);
         fn_obj.callable = clo;
         fn_obj.prototype = self.function_proto;
-        // Every ordinary function gets a `prototype` object with a back-
-        // reference, so `new f()` has a prototype to inherit from.
-        const proto = try self.heap.create(gc.Object);
-        proto.prototype = self.object_proto;
-        try self.defineData(fn_obj, "prototype", Value.fromObject(proto), true, false, false);
-        try self.defineData(proto, "constructor", Value.fromObject(fn_obj), true, false, true);
+        try self.protect(Value.fromObject(fn_obj));
+        defer self.unprotect();
+        try self.defineData(fn_obj, "length", Value.fromNumber(@floatFromInt(child.fn_length)), false, false, true);
+        try self.defineData(fn_obj, "name", try self.makeString(child.name), false, false, true);
+        // Ordinary functions get a `prototype` object with a back-reference so
+        // `new f()` has a prototype to inherit from; arrows have none.
+        if (!child.is_arrow) {
+            const proto = try self.heap.create(gc.Object);
+            proto.prototype = self.object_proto;
+            try self.defineData(fn_obj, "prototype", Value.fromObject(proto), true, false, false);
+            try self.defineData(proto, "constructor", Value.fromObject(fn_obj), true, false, true);
+        }
         return Value.fromObject(fn_obj);
     }
 
@@ -1076,7 +1189,9 @@ pub const Vm = struct {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
         }
         if (code.arguments_slot) |slot| env.slots[slot] = args_obj.?;
-        return self.execute(code, env, this_value);
+        // Arrows ignore the call receiver: `this` is the creation site's.
+        const effective_this = if (code.is_arrow) (clo.captured_this orelse Value.undefined_value) else this_value;
+        return self.execute(code, env, effective_this);
     }
 
     /// Build an `arguments` object: an ordinary object with own indexed
@@ -1281,28 +1396,41 @@ pub const Vm = struct {
         try self.protect(Value.fromObject(arr));
         defer self.unprotect();
 
+        // Keys already visited (or shadowed by a non-enumerable own property on
+        // a nearer object). Owns its keys.
         var seen = std.StringHashMap(void).init(self.gpa);
-        defer seen.deinit();
+        defer {
+            var kit = seen.keyIterator();
+            while (kit.next()) |k| self.gpa.free(k.*);
+            seen.deinit();
+        }
 
         var o: ?*gc.Object = base.asObject();
         while (o) |cur| {
-            if (cur.is_array) {
-                var idxs: std.ArrayList(u32) = .empty;
-                defer idxs.deinit(self.gpa);
-                try self.arrayPresentIndices(cur, &idxs);
-                for (idxs.items) |i| {
-                    var b: [16]u8 = undefined;
-                    const s = std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable;
-                    try self.arrayAppend(arr, try self.makeString(s)); // array indices are unique
-                }
+            // Emit this level's enumerable keys (spec order) not yet visited.
+            var emit: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (emit.items) |k| self.gpa.free(k);
+                emit.deinit(self.gpa);
             }
-            var it = cur.properties.iterator();
-            while (it.next()) |entry| {
-                if (!entry.value_ptr.enumerable) continue;
-                const k = entry.key_ptr.*;
-                if (k.len > 0 and k[0] == 0) continue; // internal/symbol keys
-                if ((try seen.getOrPut(k)).found_existing) continue;
+            try orderedOwnKeys(self, cur, true, &emit);
+            for (emit.items) |k| {
+                if (seen.contains(k)) continue;
                 try self.arrayAppend(arr, try self.makeString(k));
+            }
+            // Then mark ALL own keys — a non-enumerable own property shadows
+            // an enumerable prototype property of the same name.
+            var all: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (all.items) |k| self.gpa.free(k);
+                all.deinit(self.gpa);
+            }
+            try orderedOwnKeys(self, cur, false, &all);
+            for (all.items) |k| {
+                const gop = try seen.getOrPut(k);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try self.gpa.dupe(u8, k);
+                }
             }
             o = cur.prototype;
         }
@@ -1558,6 +1686,7 @@ pub const Vm = struct {
             }
             // Number/boolean primitives: consult their prototype.
             if (base.isNumber()) return self.getFromProto(self.number_proto, base, key);
+            if (base.isBoolean()) return self.getFromProto(self.boolean_proto, base, key);
             if (base.isSymbol()) return self.getFromProto(self.symbol_proto, base, key);
             return Value.undefined_value;
         }
@@ -1806,7 +1935,15 @@ pub const Vm = struct {
     fn materializeConst(self: *Vm, c: bc.Const) Error!Value {
         switch (c) {
             .number => |n| return Value.fromNumber(n),
-            .string => |bytes| return self.makeString(bytes),
+            // Constant strings are interned by content (V8-style heap
+            // constants): a hot `load_const` in a loop allocates once, ever.
+            .string => |bytes| {
+                if (self.intern.get(bytes)) |v| return v;
+                const v = try self.makeString(bytes);
+                const key = try self.gpa.dupe(u8, bytes);
+                try self.intern.put(self.gpa, key, v);
+                return v;
+            },
             .bigint => |digits| {
                 self.maybeStress();
                 const b = try self.heap.create(gc.BigInt);
@@ -2375,10 +2512,29 @@ fn nativeObjectValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!
 
 fn nativeHasOwnProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    if (!this.isObject()) return Value.fromBool(false);
     const key = try vm.toPropertyKey(argAt(args, 0));
     defer vm.gpa.free(key);
-    return Value.fromBool(this.asObject().properties.contains(key));
+    if (this.isString()) {
+        // String primitive: indices and `length` are own properties.
+        if (std.mem.eql(u8, key, "length")) return Value.fromBool(true);
+        if (arrayIndex(key)) |i| return Value.fromBool(i < this.asString().units.len);
+        return Value.fromBool(false);
+    }
+    if (!this.isObject()) return Value.fromBool(false);
+    const o = this.asObject();
+    if (o.is_array) {
+        if (std.mem.eql(u8, key, "length")) return Value.fromBool(true);
+        if (arrayIndex(key)) |i| {
+            if (Vm.arrayHasOwn(o, i)) return Value.fromBool(true);
+        }
+    }
+    // String wrapper: the boxed string's indices are own properties.
+    if (o.properties.get(prim_key)) |d| {
+        if (d.value.isString()) {
+            if (arrayIndex(key)) |i| return Value.fromBool(i < d.value.asString().units.len);
+        }
+    }
+    return Value.fromBool(o.properties.contains(key));
 }
 
 fn nativeIsPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -2618,9 +2774,33 @@ fn nativeNumber(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
 }
 
 fn nativeBoolean(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    return Value.fromBool(toBoolean(argAt(args, 0)));
+    const vm = castVm(ctx);
+    const b = toBoolean(argAt(args, 0));
+    if (this.isObject() and this.asObject().prototype == vm.boolean_proto) {
+        try vm.defineData(this.asObject(), prim_key, Value.fromBool(b), false, false, false);
+    }
+    return Value.fromBool(b);
+}
+
+fn thisBoolean(vm: *Vm, this: Value) Error!bool {
+    if (this.isBoolean()) return this.asBool();
+    if (this.isObject()) {
+        if (this.asObject().properties.get(prim_key)) |d| {
+            if (d.value.isBoolean()) return d.value.asBool();
+        }
+    }
+    return vm.throwTypeError("Boolean.prototype method called on non-boolean");
+}
+
+fn nativeBooleanToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    return vm.makeString(if (try thisBoolean(vm, this)) "true" else "false");
+}
+
+fn nativeBooleanValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return Value.fromBool(try thisBoolean(castVm(ctx), this));
 }
 
 fn mathUnary(ctx: *anyopaque, args: []const Value, comptime op: anytype) Error!Value {
@@ -2974,16 +3154,27 @@ fn nativeArrayIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!V
         try vm.checkBudget();
         var kb: [24]u8 = undefined;
         const key = std.fmt.bufPrint(&kb, "{d}", .{k}) catch unreachable;
-        const present = if (this.isObject())
-            vm.hasProperty(this.asObject(), key)
-        else if (this.isString())
-            k < this.asString().units.len
-        else
-            false;
-        if (!present) continue; // indexOf skips holes/absent indices
+        if (!hasPropertyGeneric(vm, this, key)) continue; // indexOf skips holes/absent indices
         if (sameTypeStrictEq(try vm.getProperty(this, key), target)) return Value.fromNumber(@floatFromInt(k));
     }
     return Value.fromNumber(-1);
+}
+
+/// HasProperty for any base value: objects walk their chain; primitives check
+/// their exotic own keys and then their wrapper prototype's chain.
+fn hasPropertyGeneric(vm: *Vm, base: Value, key: []const u8) bool {
+    if (base.isObject()) return vm.hasProperty(base.asObject(), key);
+    if (base.isString()) {
+        if (arrayIndex(key)) |i| {
+            if (i < base.asString().units.len) return true;
+        }
+        if (std.mem.eql(u8, key, "length")) return true;
+        if (vm.string_proto) |p| return vm.hasProperty(p, key);
+        return false;
+    }
+    const proto: ?*gc.Object = if (base.isNumber()) vm.number_proto else if (base.isBoolean()) vm.boolean_proto else null;
+    if (proto) |p| return vm.hasProperty(p, key);
+    return false;
 }
 
 fn nativeArrayIncludes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -3166,33 +3357,69 @@ fn relativeIndex(n: f64, len: i64) i64 {
 
 // ---- Object.keys / values / entries ----------------------------------------
 
-/// Collect an object's own enumerable string keys in spec order (integer
-/// indices ascending, then insertion-order string keys).
-fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
-    if (obj.is_array) {
-        var idxs: std.ArrayList(u32) = .empty;
-        defer idxs.deinit(vm.gpa);
-        try vm.arrayPresentIndices(obj, &idxs);
-        for (idxs.items) |i| {
-            var buf: [16]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
-            try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
-        }
-    }
+/// Collect `obj`'s own string keys in spec order: integer-like keys ascending
+/// first (array elements and numeric property names together), then the rest
+/// in insertion order. Internal (NUL-prefixed) keys are skipped. When
+/// `enumerable_only`, non-enumerable properties are omitted. Keys are duped.
+fn orderedOwnKeys(vm: *Vm, obj: *gc.Object, enumerable_only: bool, out: *std.ArrayList([]const u8)) Error!void {
+    var ints: std.ArrayList(u32) = .empty;
+    defer ints.deinit(vm.gpa);
+    if (obj.is_array) try vm.arrayPresentIndices(obj, &ints);
     var it = obj.properties.iterator();
     while (it.next()) |entry| {
-        if (!entry.value_ptr.enumerable) continue;
         const k = entry.key_ptr.*;
         if (k.len > 0 and k[0] == 0) continue; // internal slots + symbol keys
+        if (enumerable_only and !entry.value_ptr.enumerable) continue;
+        if (arrayIndex(k)) |i| try ints.append(vm.gpa, i);
+    }
+    std.mem.sort(u32, ints.items, {}, std.sort.asc(u32));
+    for (ints.items) |i| {
+        var buf: [16]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+        try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
+    }
+    it = obj.properties.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (k.len > 0 and k[0] == 0) continue;
+        if (enumerable_only and !entry.value_ptr.enumerable) continue;
+        if (arrayIndex(k) != null) continue; // already emitted, sorted
         try out.append(vm.gpa, try vm.gpa.dupe(u8, k));
     }
+}
+
+/// Own enumerable string keys in spec order (Object.keys/values/entries).
+fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
+    return orderedOwnKeys(vm, obj, true, out);
+}
+
+/// ES2015 ToObject coercion for Object.keys and friends: nullish throws, a
+/// string exposes its indices as own keys, other primitives have none.
+/// Returns null when `v` is a real object (caller proceeds normally).
+fn primitiveOwnKeysResult(vm: *Vm, v: Value, include_length: bool) Error!?Value {
+    if (v.isObject()) return null;
+    if (v.isNullish()) return vm.throwTypeError("cannot convert null or undefined to object");
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    if (v.isString()) {
+        const n = v.asString().units.len;
+        var i: usize = 0;
+        var buf: [16]u8 = undefined;
+        while (i < n) : (i += 1) {
+            const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+            try vm.arrayAppend(result, try vm.makeString(s));
+        }
+        if (include_length) try vm.arrayAppend(result, try vm.makeString("length"));
+    }
+    return Value.fromObject(result);
 }
 
 fn nativeObjectKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = this;
     const vm = castVm(ctx);
     const v = argAt(args, 0);
-    if (!v.isObject()) return vm.throwTypeError("Object.keys called on non-object");
+    if (try primitiveOwnKeysResult(vm, v, false)) |r| return r;
     var keys: std.ArrayList([]const u8) = .empty;
     defer {
         for (keys.items) |k| vm.gpa.free(k);
@@ -3213,7 +3440,8 @@ fn nativeObjectValues(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     _ = this;
     const vm = castVm(ctx);
     const v = argAt(args, 0);
-    if (!v.isObject()) return vm.throwTypeError("Object.values called on non-object");
+    if (v.isNullish()) return vm.throwTypeError("cannot convert null or undefined to object");
+    if (!v.isObject()) return Value.fromObject(try vm.newArray(0));
     var keys: std.ArrayList([]const u8) = .empty;
     defer {
         for (keys.items) |k| vm.gpa.free(k);
@@ -3233,22 +3461,7 @@ fn nativeObjectValues(ctx: *anyopaque, this: Value, args: []const Value) Error!V
 /// All own string-keyed property names (enumerable and not), skipping symbol
 /// and internal-slot keys. Array indices and `length` are included for arrays.
 fn ownPropertyNames(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
-    if (obj.is_array) {
-        var idxs: std.ArrayList(u32) = .empty;
-        defer idxs.deinit(vm.gpa);
-        try vm.arrayPresentIndices(obj, &idxs);
-        for (idxs.items) |i| {
-            var buf: [16]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
-            try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
-        }
-    }
-    var it = obj.properties.iterator();
-    while (it.next()) |entry| {
-        const k = entry.key_ptr.*;
-        if (k.len > 0 and k[0] == 0) continue; // internal slots + symbol keys
-        try out.append(vm.gpa, try vm.gpa.dupe(u8, k));
-    }
+    try orderedOwnKeys(vm, obj, false, out);
     if (obj.is_array) try out.append(vm.gpa, try vm.gpa.dupe(u8, "length"));
 }
 
@@ -3256,7 +3469,7 @@ fn nativeObjectGetOwnPropertyNames(ctx: *anyopaque, this: Value, args: []const V
     _ = this;
     const vm = castVm(ctx);
     const v = argAt(args, 0);
-    if (!v.isObject()) return vm.throwTypeError("Object.getOwnPropertyNames called on non-object");
+    if (try primitiveOwnKeysResult(vm, v, true)) |r| return r;
     var keys: std.ArrayList([]const u8) = .empty;
     defer {
         for (keys.items) |k| vm.gpa.free(k);
@@ -3293,7 +3506,8 @@ fn nativeObjectEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!
     _ = this;
     const vm = castVm(ctx);
     const v = argAt(args, 0);
-    if (!v.isObject()) return vm.throwTypeError("Object.entries called on non-object");
+    if (v.isNullish()) return vm.throwTypeError("cannot convert null or undefined to object");
+    if (!v.isObject()) return Value.fromObject(try vm.newArray(0));
     var keys: std.ArrayList([]const u8) = .empty;
     defer {
         for (keys.items) |k| vm.gpa.free(k);
@@ -4267,6 +4481,53 @@ fn nativeRegExp(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     return Value.fromObject(try vm.makeRegExp(source, flags));
 }
 
+/// Getter backing for the RegExp.prototype flag accessors. Non-RegExp `this`
+/// (including RegExp.prototype itself) yields undefined per spec-adjacent
+/// leniency rather than throwing.
+fn regexpFlagGetter(comptime field: []const u8) gc.NativeFn {
+    return struct {
+        fn get(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+            _ = ctx;
+            _ = args;
+            if (this.isObject()) {
+                if (this.asObject().regex) |re| return Value.fromBool(@field(re.flags, field));
+            }
+            return Value.undefined_value;
+        }
+    }.get;
+}
+
+fn nativeRegExpGetSource(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (this.isObject()) {
+        if (this.asObject().properties.get(regexp_source_key)) |d| return d.value;
+    }
+    return vm.makeString("(?:)"); // %RegExp.prototype%.source
+}
+
+fn nativeRegExpGetFlags(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (this.isObject()) {
+        if (this.asObject().properties.get(regexp_flags_key)) |d| return d.value;
+    }
+    return vm.makeString("");
+}
+
+/// Write `lastIndex` with strict [[Set]] semantics: a non-writable own
+/// `lastIndex` makes exec throw TypeError (spec: Set(..., true)).
+fn regexpSetLastIndex(vm: *Vm, this: Value, n: f64) Error!void {
+    if (this.isObject()) {
+        if (this.asObject().properties.getPtr("lastIndex")) |desc| {
+            if (!desc.is_accessor and !desc.writable) {
+                return vm.throwTypeError("cannot assign to read-only property 'lastIndex'");
+            }
+        }
+    }
+    try vm.setProperty(this, "lastIndex", Value.fromNumber(n));
+}
+
 /// RegExp.prototype.test — spec: equivalent to `exec(s) !== null`.
 fn nativeRegExpTest(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const r = try nativeRegExpExec(ctx, this, args);
@@ -4287,13 +4548,14 @@ fn nativeRegExpExec(ctx: *anyopaque, this: Value, args: []const Value) Error!Val
     defer vm.unprotect();
     const units = subject.asString().units;
 
-    // Global/sticky regexes resume from (and update) `lastIndex`.
+    // Spec: lastIndex is read (once) unconditionally, but only used — and
+    // later written — for global/sticky regexes.
+    const li = try vm.toNumber(try vm.getProperty(this, "lastIndex"));
     const track_last = re.flags.global or re.flags.sticky;
     var start: usize = 0;
     if (track_last) {
-        const li = try vm.toNumber(try vm.getProperty(this, "lastIndex"));
         if (li > @as(f64, @floatFromInt(units.len))) {
-            try vm.setProperty(this, "lastIndex", Value.fromNumber(0));
+            try regexpSetLastIndex(vm, this, 0);
             return Value.null_value;
         }
         if (li >= 1) start = @intFromFloat(li);
@@ -4305,13 +4567,13 @@ fn nativeRegExpExec(ctx: *anyopaque, this: Value, args: []const Value) Error!Val
         else => return vm.throwRangeError("regular expression too complex"),
     };
     const m = maybe orelse {
-        if (track_last) try vm.setProperty(this, "lastIndex", Value.fromNumber(0));
+        if (track_last) try regexpSetLastIndex(vm, this, 0);
         return Value.null_value;
     };
     defer m.deinit(vm.gpa);
 
     const whole = m.groups[0].?;
-    if (track_last) try vm.setProperty(this, "lastIndex", Value.fromNumber(@floatFromInt(whole.end)));
+    if (track_last) try regexpSetLastIndex(vm, this, @floatFromInt(whole.end));
 
     // Result array: [$0, $1, …] plus index / input / groups properties.
     const arr = try vm.newArray(0);
@@ -5782,11 +6044,46 @@ fn nativeBoundTrampoline(ctx: *anyopaque, this: Value, args: []const Value) Erro
     return castVm(ctx).throwTypeError("bound function dispatched without interception");
 }
 
-/// The dynamic `Function(...)` code-evaluating constructor is not supported.
+/// `eval(x)`: non-strings pass through; strings run in the global scope.
+fn nativeEval(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const a = argAt(args, 0);
+    if (!a.isString()) return a;
+    const src8 = try utf16ToUtf8Alloc(vm.gpa, a.asString().units);
+    defer vm.gpa.free(src8);
+    return vm.evalSource(src8);
+}
+
+/// The dynamic `Function(p1, …, body)` constructor: assemble a function
+/// expression and evaluate it in the global scope.
 fn nativeFunctionCtor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = this;
-    _ = args;
-    return castVm(ctx).throwTypeError("dynamic Function() is not supported");
+    const vm = castVm(ctx);
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(vm.gpa);
+    try src.appendSlice(vm.gpa, "return (function anonymous(");
+    const nparams = if (args.len == 0) 0 else args.len - 1;
+    for (args[0..nparams], 0..) |p, i| {
+        if (i > 0) try src.appendSlice(vm.gpa, ", ");
+        const ps = try vm.toStringVal(p);
+        try vm.protect(ps);
+        defer vm.unprotect();
+        const p8 = try utf16ToUtf8Alloc(vm.gpa, ps.asString().units);
+        defer vm.gpa.free(p8);
+        try src.appendSlice(vm.gpa, p8);
+    }
+    try src.appendSlice(vm.gpa, "\n) {\n");
+    if (args.len > 0) {
+        const bs = try vm.toStringVal(args[args.len - 1]);
+        try vm.protect(bs);
+        defer vm.unprotect();
+        const b8 = try utf16ToUtf8Alloc(vm.gpa, bs.asString().units);
+        defer vm.gpa.free(b8);
+        try src.appendSlice(vm.gpa, b8);
+    }
+    try src.appendSlice(vm.gpa, "\n});");
+    return vm.evalSource(src.items);
 }
 
 fn clampIndex(n: f64, len: i64) i64 {
@@ -6040,6 +6337,25 @@ test "new and constructors" {
         \\var c = new Counter();
         \\c.inc().inc().inc();
         \\return c.n;
+    ));
+}
+
+test "arrow functions capture lexical this" {
+    try testing.expectEqual(@as(f64, 42), try evalNumber(
+        \\var o = {
+        \\  x: 42,
+        \\  get: function () {
+        \\    var f = () => this.x;
+        \\    return f();
+        \\  }
+        \\};
+        \\return o.get();
+    ));
+    // The arrow's `this` survives extraction and .call() with another receiver.
+    try testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\var o = { x: 7, mk: function () { return () => this.x; } };
+        \\var f = o.mk();
+        \\return f.call({ x: 99 });
     ));
 }
 

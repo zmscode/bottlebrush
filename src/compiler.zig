@@ -49,6 +49,7 @@ const FnState = struct {
     is_generator: bool = false,
     is_arrow: bool = false,
     num_params: u32 = 0,
+    fn_length: u32 = 0,
     arguments_slot: ?u32 = null,
     env_slot_count: u32 = 0,
     reg_top: u32 = 0,
@@ -218,11 +219,17 @@ pub const Compiler = struct {
 
         try self.pushBlock();
 
-        // Parameters occupy the first env slots.
+        // Parameters occupy the first env slots. `fn_length` counts only the
+        // ones before the first default/rest parameter (the `length` property).
+        var counting_length = true;
         for (params) |p| {
             switch (p.kind) {
-                .ident => |pn| _ = try self.declare(pn),
+                .ident => |pn| {
+                    _ = try self.declare(pn);
+                    if (counting_length) fs.fn_length += 1;
+                },
                 .assignment_pattern => |ap| {
+                    counting_length = false;
                     if (ap.left.kind == .ident) {
                         _ = try self.declare(ap.left.kind.ident);
                     } else return self.fail("destructuring params unsupported", p.start);
@@ -232,6 +239,24 @@ pub const Compiler = struct {
             }
         }
         fs.num_params = @intCast(params.len);
+
+        // Default parameter values: `param = param === undefined ? dflt : param`.
+        for (params, 0..) |p, slot| {
+            if (p.kind != .assignment_pattern) continue;
+            const ap = p.kind.assignment_pattern;
+            const cur = self.allocReg();
+            _ = try self.emit(.{ .op = .get_var, .a = cur, .b = 0, .c = @intCast(slot) });
+            const und = self.allocReg();
+            _ = try self.emit(.{ .op = .load_undefined, .a = und });
+            const cmp = self.allocReg();
+            _ = try self.emit(.{ .op = .strict_eq, .a = cmp, .b = cur, .c = und });
+            const jskip = try self.emit(.{ .op = .jump_if_false, .a = cmp });
+            const dflt = self.allocReg();
+            try self.compileExprInto(dflt, ap.right);
+            _ = try self.emit(.{ .op = .set_var, .a = 0, .b = @intCast(slot), .c = dflt });
+            self.patchTarget(jskip, self.here());
+            self.freeTo(cur);
+        }
 
         // Ordinary (non-arrow) functions get an implicit `arguments` binding,
         // materialized at run time. Skip the top-level script (parent == null)
@@ -288,6 +313,7 @@ pub const Compiler = struct {
             .num_env_slots = fs.env_slot_count,
             .is_generator = fs.is_generator,
             .is_arrow = fs.is_arrow,
+            .fn_length = fs.fn_length,
             .arguments_slot = fs.arguments_slot,
             .code = try self.arena.dupe(Inst, fs.code.items),
             .constants = try self.dupeConstants(fs.constants.items),
@@ -1158,6 +1184,9 @@ pub const Compiler = struct {
     }
 
     fn compileYield(self: *Compiler, dst: u32, y: anytype) CompileError!void {
+        // `yield` outside a generator (e.g. as a sloppy-mode identifier) is not
+        // supported — reject at compile time rather than yield from a plain frame.
+        if (!self.fs.is_generator) return self.fail("yield outside generator", 0);
         if (y.delegate) return self.compileYieldStar(dst, y);
         const val_reg = self.allocReg();
         if (y.argument) |arg| {
