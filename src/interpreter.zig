@@ -23,6 +23,11 @@ const Value = @import("value.zig").Value;
 pub const Error = gc.VmError;
 
 const max_call_depth = 2000;
+
+/// Internal property key holding a wrapper object's boxed primitive
+/// ([[StringData]]/[[NumberData]]/[[BooleanData]]). NUL-prefixed so it is
+/// invisible to enumeration, like symbol keys.
+const prim_key = "\x00prim";
 /// Instruction budget per `run`. A hung/looping test throws `error.Timeout`
 /// (scored as an engine limit, not a conformance failure) instead of spinning
 /// forever. Generous enough for legitimately heavy tests.
@@ -298,6 +303,7 @@ pub const Vm = struct {
         try self.defineMethod(fn_proto, "call", nativeFunctionCall, 1);
         try self.defineMethod(fn_proto, "apply", nativeFunctionApply, 2);
         try self.defineMethod(fn_proto, "bind", nativeFunctionBind, 1);
+        try self.defineMethod(fn_proto, "toString", nativeFunctionToString, 0);
         const function_ctor = asCtor(try self.makeNative("Function", nativeFunctionCtor, 1));
         try self.defineData(function_ctor, "prototype", Value.fromObject(fn_proto), false, false, false);
         try self.defineData(fn_proto, "constructor", Value.fromObject(function_ctor), true, false, true);
@@ -309,6 +315,7 @@ pub const Vm = struct {
         try self.defineMethod(self.object_proto.?, "valueOf", nativeObjectValueOf, 0);
         try self.defineMethod(self.object_proto.?, "isPrototypeOf", nativeIsPrototypeOf, 1);
         try self.defineMethod(self.object_proto.?, "propertyIsEnumerable", nativePropertyIsEnumerable, 1);
+        try self.defineMethod(self.object_proto.?, "toLocaleString", nativeObjectToLocaleString, 0);
 
         const object_ctor = asCtor(try self.makeNative("Object", nativeObject, 1));
         try self.defineData(object_ctor, "prototype", Value.fromObject(self.object_proto.?), false, false, false);
@@ -321,6 +328,13 @@ pub const Vm = struct {
         try self.defineMethod(object_ctor, "defineProperty", nativeObjectDefineProperty, 3);
         try self.defineMethod(object_ctor, "getOwnPropertyDescriptor", nativeObjectGetOwnPropertyDescriptor, 2);
         try self.defineMethod(object_ctor, "getOwnPropertyNames", nativeObjectGetOwnPropertyNames, 1);
+        try self.defineMethod(object_ctor, "defineProperties", nativeObjectDefineProperties, 2);
+        try self.defineMethod(object_ctor, "freeze", nativeObjectFreeze, 1);
+        try self.defineMethod(object_ctor, "isFrozen", nativeObjectIsFrozen, 1);
+        try self.defineMethod(object_ctor, "seal", nativeObjectSeal, 1);
+        try self.defineMethod(object_ctor, "isSealed", nativeObjectIsSealed, 1);
+        try self.defineMethod(object_ctor, "preventExtensions", nativeObjectPreventExtensions, 1);
+        try self.defineMethod(object_ctor, "isExtensible", nativeObjectIsExtensible, 1);
         try self.defineData(global, "Object", Value.fromObject(object_ctor), true, false, true);
 
         // ---- Error hierarchy ----
@@ -384,6 +398,13 @@ pub const Vm = struct {
         try self.defineMethod(string_proto, "repeat", nativeStringRepeat, 1);
         try self.defineMethod(string_proto, "concat", nativeStringConcat, 1);
         try self.defineMethod(string_proto, "split", nativeStringSplit, 2);
+        try self.defineMethod(string_proto, "match", nativeStringMatch, 1);
+        try self.defineMethod(string_proto, "search", nativeStringSearch, 1);
+        try self.defineMethod(string_proto, "replace", nativeStringReplace, 2);
+        try self.defineMethod(string_proto, "lastIndexOf", nativeStringLastIndexOf, 1);
+        try self.defineMethod(string_proto, "localeCompare", nativeStringLocaleCompare, 1);
+        try self.defineMethod(string_proto, "toLocaleLowerCase", nativeStringToLowerCase, 0);
+        try self.defineMethod(string_proto, "toLocaleUpperCase", nativeStringToUpperCase, 0);
         try self.defineData(string_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("[Symbol.iterator]", nativeIterableValues, 0)), true, false, true);
         try self.defineMethod(string_proto, "toString", nativeStringToString, 0);
         try self.defineMethod(string_proto, "valueOf", nativeStringToString, 0);
@@ -399,6 +420,9 @@ pub const Vm = struct {
         try self.defineMethod(number_proto, "toFixed", nativeNumberToFixed, 1);
         try self.defineMethod(number_proto, "toString", nativeNumberToString, 1);
         try self.defineMethod(number_proto, "valueOf", nativeNumberValueOf, 0);
+        try self.defineMethod(number_proto, "toExponential", nativeNumberToExponential, 1);
+        try self.defineMethod(number_proto, "toPrecision", nativeNumberToPrecision, 1);
+        try self.defineMethod(number_proto, "toLocaleString", nativeNumberToString, 0);
         const number_ctor = asCtor(try self.makeNative("Number", nativeNumber, 1));
         try self.defineData(number_ctor, "prototype", Value.fromObject(number_proto), false, false, false);
         try self.defineData(number_proto, "constructor", Value.fromObject(number_ctor), true, false, true);
@@ -536,6 +560,29 @@ pub const Vm = struct {
         try self.defineMethod(date_proto, "toISOString", nativeDateToISOString, 0);
         try self.defineMethod(date_proto, "toJSON", nativeDateToISOString, 1);
         try self.defineMethod(date_proto, "toString", nativeDateToISOString, 0);
+        try self.defineMethod(date_proto, "getUTCMilliseconds", nativeDateGetMs, 0);
+        try self.defineMethod(date_proto, "getTimezoneOffset", nativeDateGetTimezoneOffset, 0);
+        try self.defineMethod(date_proto, "toDateString", nativeDateToDateString, 0);
+        try self.defineMethod(date_proto, "toTimeString", nativeDateToTimeString, 0);
+        try self.defineMethod(date_proto, "toUTCString", nativeDateToUTCString, 0);
+        try self.defineMethod(date_proto, "toLocaleString", nativeDateToISOString, 0);
+        try self.defineMethod(date_proto, "toLocaleDateString", nativeDateToDateString, 0);
+        try self.defineMethod(date_proto, "toLocaleTimeString", nativeDateToTimeString, 0);
+        // Local time == UTC in this engine, so each setter serves both names.
+        try self.defineMethod(date_proto, "setFullYear", nativeDateSetFullYear, 3);
+        try self.defineMethod(date_proto, "setUTCFullYear", nativeDateSetFullYear, 3);
+        try self.defineMethod(date_proto, "setMonth", nativeDateSetMonth, 2);
+        try self.defineMethod(date_proto, "setUTCMonth", nativeDateSetMonth, 2);
+        try self.defineMethod(date_proto, "setDate", nativeDateSetDate, 1);
+        try self.defineMethod(date_proto, "setUTCDate", nativeDateSetDate, 1);
+        try self.defineMethod(date_proto, "setHours", nativeDateSetHours, 4);
+        try self.defineMethod(date_proto, "setUTCHours", nativeDateSetHours, 4);
+        try self.defineMethod(date_proto, "setMinutes", nativeDateSetMinutes, 3);
+        try self.defineMethod(date_proto, "setUTCMinutes", nativeDateSetMinutes, 3);
+        try self.defineMethod(date_proto, "setSeconds", nativeDateSetSeconds, 2);
+        try self.defineMethod(date_proto, "setUTCSeconds", nativeDateSetSeconds, 2);
+        try self.defineMethod(date_proto, "setMilliseconds", nativeDateSetMilliseconds, 1);
+        try self.defineMethod(date_proto, "setUTCMilliseconds", nativeDateSetMilliseconds, 1);
         const date_ctor = asCtor(try self.makeNative("Date", nativeDate, 7));
         try self.defineData(date_ctor, "prototype", Value.fromObject(date_proto), false, false, false);
         try self.defineData(date_proto, "constructor", Value.fromObject(date_ctor), true, false, true);
@@ -659,6 +706,14 @@ pub const Vm = struct {
         // ---- global functions ----
         try self.defineMethod(global, "isNaN", nativeIsNaN, 1);
         try self.defineMethod(global, "isFinite", nativeIsFinite, 1);
+        try self.defineMethod(global, "parseInt", nativeParseInt, 2);
+        try self.defineMethod(global, "parseFloat", nativeParseFloat, 1);
+        try self.defineMethod(global, "encodeURI", nativeEncodeURI, 1);
+        try self.defineMethod(global, "encodeURIComponent", nativeEncodeURIComponent, 1);
+        try self.defineMethod(global, "decodeURI", nativeDecodeURIComponent, 1);
+        try self.defineMethod(global, "decodeURIComponent", nativeDecodeURIComponent, 1);
+        try self.defineMethod(number_ctor, "parseInt", nativeParseInt, 2);
+        try self.defineMethod(number_ctor, "parseFloat", nativeParseFloat, 1);
     }
 
     fn installErrorSubtype(self: *Vm, name: []const u8) Error!*gc.Object {
@@ -1506,6 +1561,16 @@ pub const Vm = struct {
             if (base.isSymbol()) return self.getFromProto(self.symbol_proto, base, key);
             return Value.undefined_value;
         }
+        // String wrapper exotic: indexed access reads the boxed string.
+        if (arrayIndex(key)) |i| {
+            if (base.asObject().properties.get(prim_key)) |d| {
+                if (d.value.isString()) {
+                    const su = d.value.asString().units;
+                    if (i < su.len) return self.makeStringFromUtf16(su[i .. i + 1]);
+                    return Value.undefined_value;
+                }
+            }
+        }
         // Array exotic own access (length + own elements). A hole/absent index
         // falls through to the prototype chain below.
         if (base.asObject().is_array) {
@@ -1609,6 +1674,7 @@ pub const Vm = struct {
             }
             obj = o.prototype;
         }
+        if (!receiver.extensible) return; // sloppy: silently refuse new props
         try self.defineData(receiver, key, value, true, true, true);
     }
 
@@ -2344,17 +2410,10 @@ fn nativeObjectCreate(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     return Value.fromObject(try vm.newObject(proto));
 }
 
-fn nativeObjectDefineProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    _ = this;
-    const obj_v = argAt(args, 0);
-    if (!obj_v.isObject()) return vm.throwTypeError("Object.defineProperty called on non-object");
-    const obj = obj_v.asObject();
-    const key = try vm.toPropertyKey(argAt(args, 1));
-    defer vm.gpa.free(key);
-    const desc_v = argAt(args, 2);
+/// Parse a JS property-descriptor object and define `key` on `obj` with it
+/// (shared by Object.defineProperty / Object.defineProperties).
+fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value) Error!void {
     if (!desc_v.isObject()) return vm.throwTypeError("property descriptor must be an object");
-
     var desc = gc.PropertyDescriptor{ .enumerable = false, .writable = false, .configurable = false };
     const get_v = try vm.getProperty(desc_v, "get");
     const set_v = try vm.getProperty(desc_v, "set");
@@ -2372,18 +2431,144 @@ fn nativeObjectDefineProperty(ctx: *anyopaque, this: Value, args: []const Value)
     const gop = try obj.properties.getOrPut(vm.gpa, key);
     if (!gop.found_existing) gop.key_ptr.* = try vm.gpa.dupe(u8, key);
     gop.value_ptr.* = desc;
+}
+
+fn nativeObjectDefineProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    const obj_v = argAt(args, 0);
+    if (!obj_v.isObject()) return vm.throwTypeError("Object.defineProperty called on non-object");
+    const key = try vm.toPropertyKey(argAt(args, 1));
+    defer vm.gpa.free(key);
+    try applyDescriptor(vm, obj_v.asObject(), key, argAt(args, 2));
     return obj_v;
+}
+
+fn nativeObjectDefineProperties(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    _ = this;
+    const obj_v = argAt(args, 0);
+    if (!obj_v.isObject()) return vm.throwTypeError("Object.defineProperties called on non-object");
+    const props_v = argAt(args, 1);
+    if (!props_v.isObject()) return vm.throwTypeError("properties argument must be an object");
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| vm.gpa.free(k);
+        keys.deinit(vm.gpa);
+    }
+    try ownEnumerableKeys(vm, props_v.asObject(), &keys);
+    for (keys.items) |k| {
+        try applyDescriptor(vm, obj_v.asObject(), k, try vm.getProperty(props_v, k));
+    }
+    return obj_v;
+}
+
+fn nativeObjectPreventExtensions(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    const v = argAt(args, 0);
+    if (v.isObject()) v.asObject().extensible = false;
+    return v; // ES2015: non-objects pass through
+}
+
+fn nativeObjectIsExtensible(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    const v = argAt(args, 0);
+    return Value.fromBool(v.isObject() and v.asObject().extensible);
+}
+
+fn nativeObjectSeal(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    const v = argAt(args, 0);
+    if (v.isObject()) {
+        const o = v.asObject();
+        o.extensible = false;
+        var it = o.properties.iterator();
+        while (it.next()) |entry| entry.value_ptr.configurable = false;
+    }
+    return v;
+}
+
+fn nativeObjectIsSealed(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    const v = argAt(args, 0);
+    if (!v.isObject()) return Value.fromBool(true);
+    const o = v.asObject();
+    if (o.extensible) return Value.fromBool(false);
+    var it = o.properties.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.configurable) return Value.fromBool(false);
+    }
+    return Value.fromBool(true);
+}
+
+fn nativeObjectFreeze(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    const v = argAt(args, 0);
+    if (v.isObject()) {
+        const o = v.asObject();
+        o.extensible = false;
+        var it = o.properties.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.configurable = false;
+            if (!entry.value_ptr.is_accessor) entry.value_ptr.writable = false;
+        }
+    }
+    return v;
+}
+
+fn nativeObjectIsFrozen(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    const v = argAt(args, 0);
+    if (!v.isObject()) return Value.fromBool(true);
+    const o = v.asObject();
+    if (o.extensible) return Value.fromBool(false);
+    var it = o.properties.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.configurable) return Value.fromBool(false);
+        if (!entry.value_ptr.is_accessor and entry.value_ptr.writable) return Value.fromBool(false);
+    }
+    return Value.fromBool(true);
 }
 
 fn nativeObjectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     _ = this;
     const obj_v = argAt(args, 0);
-    if (!obj_v.isObject()) return vm.throwTypeError("called on non-object");
     const key = try vm.toPropertyKey(argAt(args, 1));
     defer vm.gpa.free(key);
+    if (!obj_v.isObject()) {
+        // ES2015 ToObject semantics: null/undefined throw; a string primitive
+        // exposes index/length own properties; other primitives have none.
+        if (obj_v.isNullish()) return vm.throwTypeError("Object.getOwnPropertyDescriptor called on null or undefined");
+        if (obj_v.isString()) {
+            const su = obj_v.asString().units;
+            if (std.mem.eql(u8, key, "length")) {
+                return vm.makeDataDescriptor(Value.fromNumber(@floatFromInt(su.len)), false, false, false);
+            }
+            if (arrayIndex(key)) |i| {
+                if (i < su.len) return vm.makeDataDescriptor(try vm.makeStringFromUtf16(su[i .. i + 1]), false, true, false);
+            }
+        }
+        return Value.undefined_value;
+    }
     // Array exotic own properties: indices and `length` don't live in the map.
     const o = obj_v.asObject();
+    // String wrapper: indexed own properties read the boxed [[StringData]].
+    if (o.properties.get(prim_key)) |d| {
+        if (d.value.isString()) {
+            if (arrayIndex(key)) |i| {
+                const su = d.value.asString().units;
+                if (i < su.len) return vm.makeDataDescriptor(try vm.makeStringFromUtf16(su[i .. i + 1]), false, true, false);
+                return Value.undefined_value;
+            }
+        }
+    }
     if (o.is_array) {
         if (std.mem.eql(u8, key, "length")) {
             return vm.makeDataDescriptor(Value.fromNumber(@floatFromInt(o.array_length)), true, false, false);
@@ -2411,16 +2596,25 @@ fn nativeObjectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: []co
 
 fn nativeString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    _ = this;
-    if (args.len == 0) return vm.makeString("");
-    return vm.toStringVal(args[0]);
+    const s = if (args.len == 0) try vm.makeString("") else try vm.toStringVal(args[0]);
+    // As a constructor, `this` is a fresh object inheriting String.prototype:
+    // store [[StringData]] so wrapper coercions and methods reach the primitive.
+    if (this.isObject() and this.asObject().prototype == vm.string_proto) {
+        try vm.protect(s);
+        defer vm.unprotect();
+        try vm.defineData(this.asObject(), prim_key, s, false, false, false);
+        try vm.defineData(this.asObject(), "length", Value.fromNumber(@floatFromInt(s.asString().units.len)), false, false, false);
+    }
+    return s;
 }
 
 fn nativeNumber(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    _ = this;
-    if (args.len == 0) return Value.fromNumber(0);
-    return Value.fromNumber(try vm.toNumber(args[0]));
+    const n: f64 = if (args.len == 0) 0 else try vm.toNumber(args[0]);
+    if (this.isObject() and this.asObject().prototype == vm.number_proto) {
+        try vm.defineData(this.asObject(), prim_key, Value.fromNumber(n), false, false, false);
+    }
+    return Value.fromNumber(n);
 }
 
 fn nativeBoolean(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -2729,53 +2923,133 @@ fn nativeArrayPop(ctx: *anyopaque, this: Value, args: []const Value) Error!Value
     return v;
 }
 
+/// ToIntegerOrInfinity: NaN -> 0, else truncate toward zero.
+fn toIntegerOrInfinity(vm: *Vm, v: Value) Error!f64 {
+    const n = try vm.toNumber(v);
+    if (std.math.isNan(n)) return 0;
+    return std.math.trunc(n);
+}
+
+/// ToLength(Get(base, "length")) — the generic array-like length.
+fn lengthOfArrayLike(vm: *Vm, base: Value) Error!u64 {
+    const n = try vm.toNumber(try vm.getProperty(base, "length"));
+    if (std.math.isNan(n) or n <= 0) return 0;
+    return @intFromFloat(@min(n, 9007199254740991.0)); // 2^53 - 1
+}
+
+/// Resolve a `fromIndex` argument against `len` (negative counts from the
+/// end). Returns null when the search can never succeed (fromIndex >= len).
+fn resolveFromIndex(vm: *Vm, args: []const Value, len: u64) Error!?u64 {
+    const flen: f64 = @floatFromInt(len);
+    var from: f64 = if (args.len >= 2) try toIntegerOrInfinity(vm, args[1]) else 0;
+    if (from >= flen) return null;
+    if (from < 0) from = @max(flen + from, 0);
+    return @intFromFloat(from);
+}
+
 fn nativeArrayIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
     const target = argAt(args, 0);
-    var idxs: std.ArrayList(u32) = .empty;
-    defer idxs.deinit(vm.gpa);
-    try vm.arrayPresentIndices(arr, &idxs);
-    for (idxs.items) |i| {
-        if (sameTypeStrictEq(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromNumber(@floatFromInt(i));
+
+    // Fast path: a real array — scan only present indices.
+    if (this.isObject() and this.asObject().is_array) {
+        const arr = this.asObject();
+        if (arr.array_length == 0) return Value.fromNumber(-1);
+        const start = (try resolveFromIndex(vm, args, arr.array_length)) orelse return Value.fromNumber(-1);
+        var idxs: std.ArrayList(u32) = .empty;
+        defer idxs.deinit(vm.gpa);
+        try vm.arrayPresentIndices(arr, &idxs);
+        for (idxs.items) |i| {
+            if (i < start) continue;
+            if (sameTypeStrictEq(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromNumber(@floatFromInt(i));
+        }
+        return Value.fromNumber(-1);
+    }
+
+    // Generic array-like path (spec: ToLength + HasProperty + Get per index).
+    const len = try lengthOfArrayLike(vm, this);
+    if (len == 0) return Value.fromNumber(-1);
+    var k = (try resolveFromIndex(vm, args, len)) orelse return Value.fromNumber(-1);
+    while (k < len) : (k += 1) {
+        try vm.checkBudget();
+        var kb: [24]u8 = undefined;
+        const key = std.fmt.bufPrint(&kb, "{d}", .{k}) catch unreachable;
+        const present = if (this.isObject())
+            vm.hasProperty(this.asObject(), key)
+        else if (this.isString())
+            k < this.asString().units.len
+        else
+            false;
+        if (!present) continue; // indexOf skips holes/absent indices
+        if (sameTypeStrictEq(try vm.getProperty(this, key), target)) return Value.fromNumber(@floatFromInt(k));
     }
     return Value.fromNumber(-1);
 }
 
 fn nativeArrayIncludes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
     const target = argAt(args, 0);
-    var idxs: std.ArrayList(u32) = .empty;
-    defer idxs.deinit(vm.gpa);
-    try vm.arrayPresentIndices(arr, &idxs);
-    for (idxs.items) |i| {
-        if (sameValueZero(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromBool(true);
+
+    if (this.isObject() and this.asObject().is_array) {
+        const arr = this.asObject();
+        if (arr.array_length == 0) return Value.fromBool(false);
+        const start = (try resolveFromIndex(vm, args, arr.array_length)) orelse return Value.fromBool(false);
+        var idxs: std.ArrayList(u32) = .empty;
+        defer idxs.deinit(vm.gpa);
+        try vm.arrayPresentIndices(arr, &idxs);
+        var present_after_start: usize = 0;
+        for (idxs.items) |i| {
+            if (i < start) continue;
+            present_after_start += 1;
+            if (sameValueZero(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromBool(true);
+        }
+        // Unlike indexOf, includes reads holes as `undefined`.
+        const searched: u64 = arr.array_length - start;
+        if (target.isUndefined() and present_after_start < searched) return Value.fromBool(true);
+        return Value.fromBool(false);
     }
-    // Unlike indexOf, includes reads holes as `undefined`.
-    if (target.isUndefined() and idxs.items.len < arr.array_length) return Value.fromBool(true);
+
+    // Generic array-like path: absent indices read as `undefined`.
+    const len = try lengthOfArrayLike(vm, this);
+    if (len == 0) return Value.fromBool(false);
+    var k = (try resolveFromIndex(vm, args, len)) orelse return Value.fromBool(false);
+    while (k < len) : (k += 1) {
+        try vm.checkBudget();
+        var kb: [24]u8 = undefined;
+        const key = std.fmt.bufPrint(&kb, "{d}", .{k}) catch unreachable;
+        if (sameValueZero(try vm.getProperty(this, key), target)) return Value.fromBool(true);
+    }
     return Value.fromBool(false);
 }
 
 fn nativeArrayJoin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
     const sep_v = argAt(args, 0);
     const sep = if (sep_v.isUndefined()) try vm.makeString(",") else try vm.toStringVal(sep_v);
     try vm.protect(sep);
     defer vm.unprotect();
 
+    const is_real_array = this.isObject() and this.asObject().is_array;
+    const len: u64 = if (is_real_array) this.asObject().array_length else try lengthOfArrayLike(vm, this);
+
     var buf: std.ArrayList(u16) = .empty;
     defer buf.deinit(vm.gpa);
-    var i: u32 = 0;
-    const n = arr.array_length;
-    while (i < n) : (i += 1) {
+    var i: u64 = 0;
+    while (i < len) : (i += 1) {
         try vm.checkBudget();
         if (i > 0) try buf.appendSlice(vm.gpa, sep.asString().units);
-        // Holes and null/undefined join as empty.
-        const el = Vm.arrayGetOwn(arr, i) orelse continue;
+        // Holes/absent and null/undefined join as empty.
+        const el = if (is_real_array)
+            Vm.arrayGetOwn(this.asObject(), @intCast(i)) orelse continue
+        else blk: {
+            var kb: [24]u8 = undefined;
+            const key = std.fmt.bufPrint(&kb, "{d}", .{i}) catch unreachable;
+            break :blk try vm.getProperty(this, key);
+        };
         if (el.isNullish()) continue;
         const s = try vm.toStringVal(el);
+        try vm.protect(s);
+        defer vm.unprotect();
         try buf.appendSlice(vm.gpa, s.asString().units);
     }
     return vm.makeStringFromUtf16(buf.items);
@@ -3059,7 +3333,309 @@ fn indexOfUtf16(haystack: []const u16, needle: []const u16, from: usize) ?usize 
 
 fn nativeStringToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = args;
-    return coerceToString(castVm(ctx), this);
+    if (this.isString()) return this;
+    // A String wrapper returns its boxed [[StringData]]. Anything else throws
+    // (per spec) — which also breaks the toString -> ToPrimitive recursion.
+    if (this.isObject()) {
+        if (this.asObject().properties.get(prim_key)) |d| {
+            if (d.value.isString()) return d.value;
+        }
+    }
+    return castVm(ctx).throwTypeError("String.prototype.toString requires a String");
+}
+
+fn nativeStringLastIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    const needle_s = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(needle_s);
+    defer vm.unprotect();
+    const needle = needle_s.asString().units;
+
+    // fromIndex clamps the latest allowed *start* position (NaN -> +inf).
+    var limit: usize = units.len;
+    if (args.len >= 2 and !args[1].isUndefined()) {
+        const n = try vm.toNumber(args[1]);
+        if (!std.math.isNan(n)) {
+            if (n < 0) {
+                limit = 0;
+            } else if (n < @as(f64, @floatFromInt(units.len))) {
+                limit = @intFromFloat(n);
+            }
+        }
+    }
+    if (needle.len > units.len) return Value.fromNumber(-1);
+    var start = @min(limit, units.len - needle.len);
+    while (true) {
+        if (std.mem.eql(u16, units[start .. start + needle.len], needle)) return Value.fromNumber(@floatFromInt(start));
+        if (start == 0) return Value.fromNumber(-1);
+        start -= 1;
+    }
+}
+
+fn nativeStringLocaleCompare(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const other = try coerceToString(vm, argAt(args, 0));
+    return Value.fromNumber(@floatFromInt(compareUtf16(sv.asString().units, other.asString().units)));
+}
+
+fn nativeFunctionToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.toString requires a function");
+    const name_v = try vm.getProperty(this, "name");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.gpa);
+    try buf.appendSlice(vm.gpa, "function ");
+    if (name_v.isString()) {
+        const n8 = try utf16ToUtf8Alloc(vm.gpa, name_v.asString().units);
+        defer vm.gpa.free(n8);
+        try buf.appendSlice(vm.gpa, n8);
+    }
+    try buf.appendSlice(vm.gpa, "() { [native code] }");
+    return vm.makeString(buf.items);
+}
+
+fn nativeObjectToLocaleString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const m = try vm.getProperty(this, "toString");
+    if (!isCallable(m)) return vm.throwTypeError("toString is not callable");
+    return vm.callValue(m, this, &.{});
+}
+
+// ---- global numeric parsing + URI coding ------------------------------------
+
+fn nativeParseInt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
+    defer vm.unprotect();
+    var s = sv.asString().units;
+    while (s.len > 0 and isJsSpace(s[0])) s = s[1..];
+    var sign: f64 = 1;
+    if (s.len > 0 and (s[0] == '+' or s[0] == '-')) {
+        if (s[0] == '-') sign = -1;
+        s = s[1..];
+    }
+    var radix: u32 = if (args.len >= 2) (try vm.toUint32(args[1])) & 0xffff_ffff else 0;
+    if (radix != 0 and (radix < 2 or radix > 36)) return Value.fromNumber(std.math.nan(f64));
+    if ((radix == 0 or radix == 16) and s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
+        s = s[2..];
+        radix = 16;
+    }
+    if (radix == 0) radix = 10;
+    var value: f64 = 0;
+    var any = false;
+    for (s) |c| {
+        const d = hexLikeDigit(c) orelse break;
+        if (d >= radix) break;
+        value = value * @as(f64, @floatFromInt(radix)) + @as(f64, @floatFromInt(d));
+        any = true;
+    }
+    if (!any) return Value.fromNumber(std.math.nan(f64));
+    return Value.fromNumber(sign * value);
+}
+
+fn hexLikeDigit(c: u16) ?u32 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'z' => c - 'a' + 10,
+        'A'...'Z' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+fn nativeParseFloat(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
+    defer vm.unprotect();
+    var s = sv.asString().units;
+    while (s.len > 0 and isJsSpace(s[0])) s = s[1..];
+
+    // Consume the longest prefix that forms a StrDecimalLiteral.
+    var i: usize = 0;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.gpa);
+    if (i < s.len and (s[i] == '+' or s[i] == '-')) {
+        try buf.append(vm.gpa, @intCast(s[i]));
+        i += 1;
+    }
+    if (i + 8 <= s.len and std.mem.eql(u16, s[i .. i + 8], &[_]u16{ 'I', 'n', 'f', 'i', 'n', 'i', 't', 'y' })) {
+        const neg = buf.items.len > 0 and buf.items[0] == '-';
+        return Value.fromNumber(if (neg) -std.math.inf(f64) else std.math.inf(f64));
+    }
+    var digits: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        try buf.append(vm.gpa, @intCast(s[i]));
+        digits += 1;
+    }
+    if (i < s.len and s[i] == '.') {
+        try buf.append(vm.gpa, '.');
+        i += 1;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            try buf.append(vm.gpa, @intCast(s[i]));
+            digits += 1;
+        }
+    }
+    if (digits == 0) return Value.fromNumber(std.math.nan(f64));
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        const mark = buf.items.len;
+        var j = i + 1;
+        var ebuf: std.ArrayList(u8) = .empty;
+        defer ebuf.deinit(vm.gpa);
+        try ebuf.append(vm.gpa, 'e');
+        if (j < s.len and (s[j] == '+' or s[j] == '-')) {
+            try ebuf.append(vm.gpa, @intCast(s[j]));
+            j += 1;
+        }
+        var edigits: usize = 0;
+        while (j < s.len and s[j] >= '0' and s[j] <= '9') : (j += 1) {
+            try ebuf.append(vm.gpa, @intCast(s[j]));
+            edigits += 1;
+        }
+        if (edigits > 0) {
+            try buf.appendSlice(vm.gpa, ebuf.items);
+        } else {
+            buf.shrinkRetainingCapacity(mark);
+        }
+    }
+    const parsed = std.fmt.parseFloat(f64, buf.items) catch return Value.fromNumber(std.math.nan(f64));
+    return Value.fromNumber(parsed);
+}
+
+fn uriUnreserved(c: u8, comptime component: bool) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '!', '~', '*', '\'', '(', ')' => true,
+        // encodeURI additionally leaves the reserved set unescaped.
+        ';', '/', '?', ':', '@', '&', '=', '+', '$', ',', '#' => !component,
+        else => false,
+    };
+}
+
+fn uriEncode(ctx: *anyopaque, this: Value, args: []const Value, comptime component: bool) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const utf8 = try utf16ToUtf8Alloc(vm.gpa, sv.asString().units);
+    defer vm.gpa.free(utf8);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    const hex = "0123456789ABCDEF";
+    for (utf8) |b| {
+        if (uriUnreserved(b, component)) {
+            try out.append(vm.gpa, b);
+        } else {
+            try out.append(vm.gpa, '%');
+            try out.append(vm.gpa, hex[b >> 4]);
+            try out.append(vm.gpa, hex[b & 15]);
+        }
+    }
+    return vm.makeString(out.items);
+}
+
+fn nativeEncodeURIComponent(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return uriEncode(ctx, this, args, true);
+}
+fn nativeEncodeURI(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return uriEncode(ctx, this, args, false);
+}
+
+fn nativeDecodeURIComponent(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const utf8 = try utf16ToUtf8Alloc(vm.gpa, sv.asString().units);
+    defer vm.gpa.free(utf8);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    var i: usize = 0;
+    while (i < utf8.len) {
+        if (utf8[i] == '%') {
+            if (i + 2 >= utf8.len) return vm.throwTypeError("URI malformed");
+            const hi = hexLikeDigit(utf8[i + 1]) orelse return vm.throwTypeError("URI malformed");
+            const lo = hexLikeDigit(utf8[i + 2]) orelse return vm.throwTypeError("URI malformed");
+            if (hi > 15 or lo > 15) return vm.throwTypeError("URI malformed");
+            try out.append(vm.gpa, @intCast(hi * 16 + lo));
+            i += 3;
+        } else {
+            try out.append(vm.gpa, utf8[i]);
+            i += 1;
+        }
+    }
+    return vm.makeString(out.items);
+}
+
+fn nativeNumberToExponential(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const x = try thisNumber(vm, this);
+    var buf: [64]u8 = undefined;
+    if (std.math.isNan(x) or std.math.isInf(x)) return vm.makeString(numberToString(x, &buf));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    if (argAt(args, 0).isUndefined()) {
+        try out.print(vm.gpa, "{e}", .{x});
+    } else {
+        const d = try vm.toNumber(args[0]);
+        if (std.math.isNan(d) or d < 0 or d > 100) return vm.throwRangeError("toExponential() argument must be between 0 and 100");
+        const digits: usize = @intFromFloat(d);
+        try out.print(vm.gpa, "{e:.[1]}", .{ x, digits });
+    }
+    // Zig prints "1.5e2"; JS wants "1.5e+2".
+    if (std.mem.indexOfScalar(u8, out.items, 'e')) |epos| {
+        if (epos + 1 < out.items.len and out.items[epos + 1] != '-') {
+            try out.insert(vm.gpa, epos + 1, '+');
+        }
+    }
+    return vm.makeString(out.items);
+}
+
+fn nativeNumberToPrecision(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const x = try thisNumber(vm, this);
+    var buf: [64]u8 = undefined;
+    if (argAt(args, 0).isUndefined()) return vm.makeString(numberToString(x, &buf));
+    const p_f = try vm.toNumber(args[0]);
+    if (std.math.isNan(p_f) or p_f < 1 or p_f > 100) return vm.throwRangeError("toPrecision() argument must be between 1 and 100");
+    const p: i32 = @intFromFloat(p_f);
+    if (std.math.isNan(x) or std.math.isInf(x)) return vm.makeString(numberToString(x, &buf));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    if (x == 0) {
+        try out.append(vm.gpa, '0');
+        if (p > 1) {
+            try out.append(vm.gpa, '.');
+            var i: i32 = 1;
+            while (i < p) : (i += 1) try out.append(vm.gpa, '0');
+        }
+        return vm.makeString(out.items);
+    }
+    const e10: i32 = @intFromFloat(@floor(std.math.log10(@abs(x))));
+    if (e10 < -6 or e10 >= p) {
+        // Exponential with p-1 fractional digits.
+        try out.print(vm.gpa, "{e:.[1]}", .{ x, @as(usize, @intCast(p - 1)) });
+        if (std.mem.indexOfScalar(u8, out.items, 'e')) |epos| {
+            if (epos + 1 < out.items.len and out.items[epos + 1] != '-') try out.insert(vm.gpa, epos + 1, '+');
+        }
+    } else {
+        const frac: usize = @intCast(@max(p - 1 - e10, 0));
+        try out.print(vm.gpa, "{d:.[1]}", .{ x, frac });
+    }
+    return vm.makeString(out.items);
 }
 
 fn nativeStringCharAt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -3241,20 +3817,63 @@ fn nativeStringSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
     defer vm.unprotect();
 
     const sep_v = argAt(args, 0);
+    const limit_v = argAt(args, 1);
+    const lim: u32 = if (limit_v.isUndefined()) std.math.maxInt(u32) else try vm.toUint32(limit_v);
+    if (lim == 0) return Value.fromObject(result);
+
     if (sep_v.isUndefined()) {
-        try vm.arrayAppend(result,sv);
+        try vm.arrayAppend(result, sv);
         return Value.fromObject(result);
     }
+
+    // RegExp separator: split between matches; captures are spliced in.
+    if (sep_v.isObject() and sep_v.asObject().regex != null) {
+        const re = sep_v.asObject().regex.?;
+        if (units.len == 0) {
+            // Empty subject: [] if the pattern matches empty, else [S].
+            if (try regexFind(vm, re, units, 0)) |m| {
+                m.deinit(vm.gpa);
+            } else {
+                try vm.arrayAppend(result, sv);
+            }
+            return Value.fromObject(result);
+        }
+        var p: usize = 0; // start of the current unmatched piece
+        var pos: usize = 0;
+        while (pos < units.len) {
+            const m = (try regexFind(vm, re, units, pos)) orelse break;
+            defer m.deinit(vm.gpa);
+            const w = m.groups[0].?;
+            if (w.start >= units.len) break; // separator may not match at the very end
+            if (w.end == p) {
+                pos = w.start + 1; // empty/degenerate match: advance, no split
+                continue;
+            }
+            try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..w.start]));
+            if (result.array_length >= lim) return Value.fromObject(result);
+            for (m.groups[1..]) |g| {
+                const v = if (g) |sp| try vm.makeStringFromUtf16(units[sp.start..sp.end]) else Value.undefined_value;
+                try vm.arrayAppend(result, v);
+                if (result.array_length >= lim) return Value.fromObject(result);
+            }
+            p = w.end;
+            pos = if (w.end == w.start) w.start + 1 else w.end;
+        }
+        try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..]));
+        return Value.fromObject(result);
+    }
+
     const sep = try coerceToString(vm, sep_v);
     try vm.protect(sep);
     defer vm.unprotect();
     const sep_units = sep.asString().units;
 
     if (sep_units.len == 0) {
-        // Split into individual code units.
+        // Split into individual code units (bounded by limit).
         for (units) |u| {
+            if (result.array_length >= lim) break;
             const piece = try vm.makeStringFromUtf16(&[_]u16{u});
-            try vm.arrayAppend(result,piece);
+            try vm.arrayAppend(result, piece);
         }
         return Value.fromObject(result);
     }
@@ -3262,12 +3881,267 @@ fn nativeStringSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
     var start: usize = 0;
     while (indexOfUtf16(units, sep_units, start)) |idx| {
         const piece = try vm.makeStringFromUtf16(units[start..idx]);
-        try vm.arrayAppend(result,piece);
+        try vm.arrayAppend(result, piece);
+        if (result.array_length >= lim) return Value.fromObject(result);
         start = idx + sep_units.len;
     }
     const last = try vm.makeStringFromUtf16(units[start..]);
-    try vm.arrayAppend(result,last);
+    try vm.arrayAppend(result, last);
     return Value.fromObject(result);
+}
+
+// ---- String methods that consume RegExp (phase-4 §5 integration) ------------
+
+/// Get the RegExp object for a String-method argument. Per spec, a non-RegExp
+/// argument is coerced via `new RegExp(ToString(arg))` (undefined -> empty
+/// pattern). Caller should protect the returned object across allocations.
+fn regexArgObject(vm: *Vm, v: Value) Error!*gc.Object {
+    if (v.isObject() and v.asObject().regex != null) return v.asObject();
+    var src_owned: ?[]u8 = null;
+    defer if (src_owned) |s| vm.gpa.free(s);
+    var source: []const u8 = "";
+    if (!v.isUndefined()) {
+        const s = try vm.toStringVal(v);
+        try vm.protect(s);
+        defer vm.unprotect();
+        src_owned = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
+        source = src_owned.?;
+    }
+    return vm.makeRegExp(source, "");
+}
+
+/// Run `re` against `units` from `start`, mapping engine errors to JS throws.
+fn regexFind(vm: *Vm, re: *const bilby.Regex, units: []const u16, start: usize) Error!?bilby.Match {
+    return re.find(vm.gpa, units, start) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return vm.throwRangeError("regular expression too complex"),
+    };
+}
+
+fn nativeStringSearch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const rx = try regexArgObject(vm, argAt(args, 0));
+    try vm.protect(Value.fromObject(rx));
+    defer vm.unprotect();
+    // search ignores (and does not mutate) lastIndex.
+    const m = (try regexFind(vm, rx.regex.?, sv.asString().units, 0)) orelse return Value.fromNumber(-1);
+    defer m.deinit(vm.gpa);
+    return Value.fromNumber(@floatFromInt(m.groups[0].?.start));
+}
+
+fn nativeStringMatch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const rx = try regexArgObject(vm, argAt(args, 0));
+    try vm.protect(Value.fromObject(rx));
+    defer vm.unprotect();
+    const re = rx.regex.?;
+
+    // Non-global: identical to rx.exec(S).
+    if (!re.flags.global) return nativeRegExpExec(ctx, Value.fromObject(rx), &.{sv});
+
+    // Global: an array of all matched substrings (no captures), or null.
+    try vm.setProperty(Value.fromObject(rx), "lastIndex", Value.fromNumber(0));
+    const units = sv.asString().units;
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    var pos: usize = 0;
+    var found = false;
+    while (pos <= units.len) {
+        const m = (try regexFind(vm, re, units, pos)) orelse break;
+        const w = m.groups[0].?;
+        m.deinit(vm.gpa);
+        found = true;
+        try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[w.start..w.end]));
+        pos = if (w.end == w.start) w.end + 1 else w.end;
+    }
+    if (!found) return Value.null_value;
+    return Value.fromObject(result);
+}
+
+/// GetSubstitution: expand `$$ $& $` $' $n $nn $<name>` in a replacement
+/// string. Unrecognized `$` sequences are literal.
+fn appendSubstitution(
+    vm: *Vm,
+    out: *std.ArrayList(u16),
+    rep: []const u16,
+    units: []const u16,
+    groups: []const ?bilby.Span,
+    names: *const std.StringHashMapUnmanaged(u32),
+) Error!void {
+    const whole = groups[0].?;
+    var i: usize = 0;
+    while (i < rep.len) {
+        const c = rep[i];
+        if (c != '$' or i + 1 >= rep.len) {
+            try out.append(vm.gpa, c);
+            i += 1;
+            continue;
+        }
+        switch (rep[i + 1]) {
+            '$' => {
+                try out.append(vm.gpa, '$');
+                i += 2;
+            },
+            '&' => {
+                try out.appendSlice(vm.gpa, units[whole.start..whole.end]);
+                i += 2;
+            },
+            '`' => {
+                try out.appendSlice(vm.gpa, units[0..whole.start]);
+                i += 2;
+            },
+            '\'' => {
+                try out.appendSlice(vm.gpa, units[whole.end..]);
+                i += 2;
+            },
+            '0'...'9' => {
+                var num: usize = rep[i + 1] - '0';
+                var consumed: usize = 2;
+                // Prefer the two-digit reference when it names a real group.
+                if (i + 2 < rep.len and rep[i + 2] >= '0' and rep[i + 2] <= '9') {
+                    const two = num * 10 + (rep[i + 2] - '0');
+                    if (two >= 1 and two < groups.len) {
+                        num = two;
+                        consumed = 3;
+                    }
+                }
+                if (num >= 1 and num < groups.len) {
+                    if (groups[num]) |sp| try out.appendSlice(vm.gpa, units[sp.start..sp.end]);
+                    i += consumed;
+                } else {
+                    try out.append(vm.gpa, '$');
+                    i += 1;
+                }
+            },
+            '<' => {
+                // $<name> — only meaningful when the pattern has named groups.
+                const close = std.mem.indexOfScalarPos(u16, rep, i + 2, '>') orelse {
+                    try out.append(vm.gpa, '$');
+                    i += 1;
+                    continue;
+                };
+                if (names.count() == 0) {
+                    try out.append(vm.gpa, '$');
+                    i += 1;
+                    continue;
+                }
+                var name8: std.ArrayList(u8) = .empty;
+                defer name8.deinit(vm.gpa);
+                for (rep[i + 2 .. close]) |u| try name8.append(vm.gpa, @intCast(u & 0xff));
+                if (names.get(name8.items)) |idx| {
+                    if (groups[idx]) |sp| try out.appendSlice(vm.gpa, units[sp.start..sp.end]);
+                }
+                i = close + 1;
+            },
+            else => {
+                try out.append(vm.gpa, '$');
+                i += 1;
+            },
+        }
+    }
+}
+
+/// Invoke a replacer callback with (matched, p1.., offset, string) and append
+/// the ToString of its result.
+fn appendReplacerCall(
+    vm: *Vm,
+    out: *std.ArrayList(u16),
+    cb: Value,
+    units: []const u16,
+    groups: []const ?bilby.Span,
+    subject: Value,
+) Error!void {
+    var argv: std.ArrayList(Value) = .empty;
+    defer argv.deinit(vm.gpa);
+    var protected: usize = 0;
+    defer {
+        var k: usize = 0;
+        while (k < protected) : (k += 1) vm.unprotect();
+    }
+    for (groups) |g| {
+        if (g) |sp| {
+            const s = try vm.makeStringFromUtf16(units[sp.start..sp.end]);
+            try vm.protect(s);
+            protected += 1;
+            try argv.append(vm.gpa, s);
+        } else {
+            try argv.append(vm.gpa, Value.undefined_value);
+        }
+    }
+    try argv.append(vm.gpa, Value.fromNumber(@floatFromInt(groups[0].?.start)));
+    try argv.append(vm.gpa, subject);
+    const r = try vm.callValue(cb, Value.undefined_value, argv.items);
+    try vm.protect(r);
+    defer vm.unprotect();
+    const rs = try vm.toStringVal(r);
+    try out.appendSlice(vm.gpa, rs.asString().units);
+}
+
+fn nativeStringReplace(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    const pat = argAt(args, 0);
+    const rep = argAt(args, 1);
+    const rep_is_fn = isCallable(rep);
+
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(vm.gpa);
+
+    if (pat.isObject() and pat.asObject().regex != null) {
+        const rx = pat.asObject();
+        const re = rx.regex.?;
+        var last_end: usize = 0;
+        var pos: usize = 0;
+        while (pos <= units.len) {
+            const m = (try regexFind(vm, re, units, pos)) orelse break;
+            defer m.deinit(vm.gpa);
+            const w = m.groups[0].?;
+            try out.appendSlice(vm.gpa, units[last_end..w.start]);
+            if (rep_is_fn) {
+                try appendReplacerCall(vm, &out, rep, units, m.groups, sv);
+            } else {
+                const rs = try vm.toStringVal(rep);
+                try vm.protect(rs);
+                defer vm.unprotect();
+                try appendSubstitution(vm, &out, rs.asString().units, units, m.groups, &re.names);
+            }
+            last_end = w.end;
+            pos = if (w.end == w.start) w.end + 1 else w.end;
+            if (!re.flags.global) break;
+        }
+        try out.appendSlice(vm.gpa, units[last_end..]);
+        return vm.makeStringFromUtf16(out.items);
+    }
+
+    // String pattern: replace the first occurrence only.
+    const pat_s = try vm.toStringVal(pat);
+    try vm.protect(pat_s);
+    defer vm.unprotect();
+    const pat_units = pat_s.asString().units;
+    const idx = indexOfUtf16(units, pat_units, 0) orelse return sv;
+    const span = [_]?bilby.Span{.{ .start = idx, .end = idx + pat_units.len }};
+    try out.appendSlice(vm.gpa, units[0..idx]);
+    if (rep_is_fn) {
+        try appendReplacerCall(vm, &out, rep, units, &span, sv);
+    } else {
+        const rs = try vm.toStringVal(rep);
+        try vm.protect(rs);
+        defer vm.unprotect();
+        const no_names: std.StringHashMapUnmanaged(u32) = .empty;
+        try appendSubstitution(vm, &out, rs.asString().units, units, &span, &no_names);
+    }
+    try out.appendSlice(vm.gpa, units[idx + pat_units.len ..]);
+    return vm.makeStringFromUtf16(out.items);
 }
 
 fn nativeStringFromCharCode(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -3286,6 +4160,12 @@ fn nativeStringFromCharCode(ctx: *anyopaque, this: Value, args: []const Value) E
 
 fn thisNumber(vm: *Vm, this: Value) Error!f64 {
     if (this.isNumber()) return this.asNumber();
+    // Number wrapper: unbox [[NumberData]].
+    if (this.isObject()) {
+        if (this.asObject().properties.get(prim_key)) |d| {
+            if (d.value.isNumber()) return d.value.asNumber();
+        }
+    }
     return vm.throwTypeError("Number.prototype method called on non-number");
 }
 
@@ -4230,6 +5110,110 @@ fn nativeDateGetSeconds(ctx: *anyopaque, this: Value, args: []const Value) Error
 fn nativeDateGetMs(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = args;
     return dateField(castVm(ctx), this, "millis");
+}
+
+const weekday_names = [7][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const month_names = [12][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+/// One component-setter for the whole set*/setUTC* family (local == UTC here).
+/// `first` indexes [year, month, day, hours, minutes, seconds, ms]; `count`
+/// arguments starting there are replaced (missing ones keep current values).
+fn dateSet(vm: *Vm, this: Value, args: []const Value, first: usize, count: usize) Error!Value {
+    const t = try dateTimeOf(vm, this);
+    var comps: [7]f64 = undefined;
+    if (std.math.isNan(t)) {
+        if (first == 0) {
+            // setFullYear on an invalid date starts from +0 per spec.
+            comps = .{ 1970, 0, 1, 0, 0, 0, 0 };
+        } else {
+            @memset(&comps, std.math.nan(f64));
+        }
+    } else {
+        const p = msToParts(t);
+        comps = .{
+            @floatFromInt(p.year),    @floatFromInt(p.month),   @floatFromInt(p.day),
+            @floatFromInt(p.hours),   @floatFromInt(p.minutes), @floatFromInt(p.seconds),
+            @floatFromInt(p.millis),
+        };
+    }
+    var i: usize = 0;
+    while (i < count and i < args.len) : (i += 1) {
+        comps[first + i] = try vm.toNumber(args[i]);
+    }
+    const nt = timeClip(makeDateTime(comps[0], comps[1], comps[2], comps[3], comps[4], comps[5], comps[6]));
+    if (!this.isObject()) return vm.throwTypeError("this is not a Date");
+    try setDateTime(vm, this.asObject(), nt);
+    return Value.fromNumber(nt);
+}
+
+fn nativeDateSetFullYear(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return dateSet(castVm(ctx), this, args, 0, 3);
+}
+fn nativeDateSetMonth(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return dateSet(castVm(ctx), this, args, 1, 2);
+}
+fn nativeDateSetDate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return dateSet(castVm(ctx), this, args, 2, 1);
+}
+fn nativeDateSetHours(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return dateSet(castVm(ctx), this, args, 3, 4);
+}
+fn nativeDateSetMinutes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return dateSet(castVm(ctx), this, args, 4, 3);
+}
+fn nativeDateSetSeconds(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return dateSet(castVm(ctx), this, args, 5, 2);
+}
+fn nativeDateSetMilliseconds(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return dateSet(castVm(ctx), this, args, 6, 1);
+}
+
+fn nativeDateGetTimezoneOffset(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const t = try dateTimeOf(castVm(ctx), this);
+    if (std.math.isNan(t)) return Value.fromNumber(std.math.nan(f64));
+    return Value.fromNumber(0); // local time == UTC in this engine
+}
+
+fn nativeDateToDateString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const t = try dateTimeOf(vm, this);
+    if (std.math.isNan(t)) return vm.makeString("Invalid Date");
+    const p = msToParts(t);
+    var buf: [48]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{s} {s} {d:0>2} {d}", .{
+        weekday_names[@intCast(p.weekday)], month_names[@intCast(p.month)], @as(u64, @intCast(p.day)), p.year,
+    }) catch unreachable;
+    return vm.makeString(s);
+}
+
+fn nativeDateToTimeString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const t = try dateTimeOf(vm, this);
+    if (std.math.isNan(t)) return vm.makeString("Invalid Date");
+    const p = msToParts(t);
+    var buf: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d:0>2}:{d:0>2}:{d:0>2} GMT+0000 (Coordinated Universal Time)", .{
+        @as(u64, @intCast(p.hours)), @as(u64, @intCast(p.minutes)), @as(u64, @intCast(p.seconds)),
+    }) catch unreachable;
+    return vm.makeString(s);
+}
+
+fn nativeDateToUTCString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    const t = try dateTimeOf(vm, this);
+    if (std.math.isNan(t)) return vm.makeString("Invalid Date");
+    const p = msToParts(t);
+    var buf: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        weekday_names[@intCast(p.weekday)], @as(u64, @intCast(p.day)),     month_names[@intCast(p.month)],
+        p.year,                             @as(u64, @intCast(p.hours)),   @as(u64, @intCast(p.minutes)),
+        @as(u64, @intCast(p.seconds)),
+    }) catch unreachable;
+    return vm.makeString(s);
 }
 
 /// Write `val` right-aligned, zero-padded to `width` digits into `dst`.
@@ -5428,6 +6412,49 @@ test "RegExp invalid pattern throws SyntaxError" {
     const utf8 = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
     defer testing.allocator.free(utf8);
     try testing.expectEqualStrings("syntax", utf8);
+}
+
+test "String.prototype.search and match" {
+    try testing.expectEqual(@as(f64, 4), try evalNumber("return 'abc 123'.search(/\\d+/);"));
+    try testing.expectEqual(@as(f64, -1), try evalNumber("return 'abc'.search(/z/);"));
+    try testing.expectEqual(@as(f64, 2), try evalNumber("return 'ab3'.search('3');")); // string coerced to regex
+    // Non-global match = exec.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var m = "id-42".match(/(\d+)/);
+        \\return (m[0] === "42" && m[1] === "42" && m.index === 3) ? 1 : 0;
+    ));
+    // Global match = all matched substrings.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var m = "a1 b22 c333".match(/\d+/g);
+        \\return (m.length === 3 && m[0] === "1" && m[1] === "22" && m[2] === "333") ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'abc'.match(/z/g) === null ? 1 : 0;"));
+}
+
+test "String.prototype.replace" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a-b-c'.replace('-', '+') === 'a+b-c' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a-b-c'.replace(/-/g, '+') === 'a+b+c' ? 1 : 0;"));
+    // $& $1 $` $' substitutions.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'John Smith'.replace(/(\\w+) (\\w+)/, '$2 $1') === 'Smith John' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'abc'.replace(/b/, '[$&]') === 'a[b]c' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'x$y'.replace('$', '$$') === 'x$y' ? 1 : 0;"));
+    // Named-group substitution.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return '2026-07'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$<m>/$<y>') === '07/2026' ? 1 : 0;"));
+    // Function replacer.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var s = "a1b2".replace(/\d/g, function (m, off) { return "<" + m + "@" + off + ">"; });
+        \\return s === "a<1@1>b<2@3>" ? 1 : 0;
+    ));
+}
+
+test "String.prototype.split with regex and limit" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a1b22c'.split(/\\d+/).join(',') === 'a,b,c' ? 1 : 0;"));
+    // Captures are spliced into the result.
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a1b'.split(/(\\d)/).join(',') === 'a,1,b' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 2), try evalNumber("return 'a-b-c'.split('-', 2).length;"));
+    try testing.expectEqual(@as(f64, 0), try evalNumber("return 'a-b'.split('-', 0).length;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'ab'.split(/a*/).join(',') === ',b' ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return ''.split('x').join('|') === '' ? 1 : 0;"));
 }
 
 test "RegExp under GC stress" {
