@@ -645,9 +645,9 @@ test "punctuators and operators" {
     const kinds = try collectKinds(testing.allocator, "a >>>= b ??= c ?. d ... => ** === !==");
     defer testing.allocator.free(kinds);
     const expect = [_]Kind{
-        .identifier, .ushr_eq,  .identifier,        .question_question_eq, .identifier,
-        .question_dot, .identifier, .ellipsis,      .arrow,                .star_star,
-        .eq_eq_eq,   .not_eq_eq, .eof,
+        .identifier,   .ushr_eq,    .identifier, .question_question_eq, .identifier,
+        .question_dot, .identifier, .ellipsis,   .arrow,                .star_star,
+        .eq_eq_eq,     .not_eq_eq,  .eof,
     };
     try testing.expectEqualSlices(Kind, &expect, kinds);
 }

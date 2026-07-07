@@ -14,35 +14,66 @@
 //! Error objects arrive with the object model. These are documented
 //! simplifications, not final behavior.
 
+const realm = @import("runtime/realm.zig");
+const errors_mod = @import("runtime/builtins/errors.zig");
+const nativeError = errors_mod.nativeError;
+const json_mod = @import("runtime/builtins/json.zig");
+const JsonParser = json_mod.JsonParser;
+const appendJsonChar = json_mod.appendJsonChar;
+const support_mod = @import("runtime/support.zig");
+const arrayIndex = support_mod.arrayIndex;
+const compareUtf16 = support_mod.compareUtf16;
+const doubleToInt32 = support_mod.doubleToInt32;
+const isCallable = support_mod.isCallable;
+const isConstructorValue = support_mod.isConstructorValue;
+const jsMod = support_mod.jsMod;
+const jsPow = support_mod.jsPow;
+const jsShl = support_mod.jsShl;
+const jsShr = support_mod.jsShr;
+const jsUshr = support_mod.jsUshr;
+const numberToString = support_mod.numberToString;
+const orderedOwnKeys = support_mod.orderedOwnKeys;
+const ownEnumerableKeys = support_mod.ownEnumerableKeys;
+const prim_key = support_mod.prim_key;
+const readTypedElement = support_mod.readTypedElement;
+const regexp_flags_key = support_mod.regexp_flags_key;
+const regexp_source_key = support_mod.regexp_source_key;
+const sameTypeStrictEq = support_mod.sameTypeStrictEq;
+const stringToNumber = support_mod.stringToNumber;
+const toBoolean = support_mod.toBoolean;
+const utf16ToUtf8Alloc = support_mod.utf16ToUtf8Alloc;
+const writeTypedElement = support_mod.writeTypedElement;
+
 const std = @import("std");
+
 const gc = @import("gc.zig");
+
 const bc = @import("bytecode.zig");
+
 const bilby = @import("bilby");
+
 const Value = @import("value.zig").Value;
 
 pub const Error = gc.VmError;
 
 const max_call_depth = 2000;
+
 /// One segment of the register stack. `top` is the allocation watermark.
 const RegSlab = struct { mem: []Value, top: usize };
+
 /// Initial register-slab size (Values); each additional slab doubles.
 const reg_slab_initial = 1 << 12;
 
-/// Internal property key holding a wrapper object's boxed primitive
-/// ([[StringData]]/[[NumberData]]/[[BooleanData]]). NUL-prefixed so it is
-/// invisible to enumeration, like symbol keys.
-const prim_key = "\x00prim";
-/// Internal keys for a RegExp's [[OriginalSource]] / [[OriginalFlags]].
-const regexp_source_key = "\x00resrc";
-const regexp_flags_key = "\x00reflg";
 /// Instruction budget per `run`. A hung/looping test throws `error.Timeout`
 /// (scored as an engine limit, not a conformance failure) instead of spinning
 /// forever. Generous enough for legitimately heavy tests.
 const max_steps = 50_000_000;
+
 /// Wall-clock budget per `run` (nanoseconds). Catches runaways whose cost is in
 /// GC or native loops rather than raw instruction count. Checked every
 /// `wall_check_mask + 1` steps to keep the clock read off the hot path.
 const max_wall_ns: i96 = 2 * std.time.ns_per_s;
+
 const wall_check_mask: u64 = 0x3FFF; // ~16k steps
 
 const Frame = struct {
@@ -174,17 +205,17 @@ pub const Vm = struct {
         }
     }
 
-    fn protect(self: *Vm, v: Value) Error!void {
+    pub fn protect(self: *Vm, v: Value) Error!void {
         try self.temp_roots.append(self.gpa, v);
     }
-    fn unprotect(self: *Vm) void {
+    pub fn unprotect(self: *Vm) void {
         _ = self.temp_roots.pop();
     }
 
     /// Allocation safe-point: under stress, collect every time; otherwise
     /// collect when the live set reaches the threshold, then re-arm it at ~2x
     /// the survivors (V8-style growth factor).
-    fn maybeStress(self: *Vm) void {
+    pub fn maybeStress(self: *Vm) void {
         if (self.heap.stress) {
             _ = self.heap.collect(self);
             return;
@@ -196,7 +227,7 @@ pub const Vm = struct {
     }
 
     /// Create the base intrinsics if they don't exist yet.
-    fn bootstrap(self: *Vm) Error!void {
+    pub fn bootstrap(self: *Vm) Error!void {
         if (self.object_proto != null) return;
         const obj_proto = try self.heap.create(gc.Object); // [[Prototype]] = null
         self.object_proto = obj_proto;
@@ -220,10 +251,10 @@ pub const Vm = struct {
         const saved_stress = self.heap.stress;
         self.heap.stress = false;
         defer self.heap.stress = saved_stress;
-        try self.installBuiltins();
+        try realm.installBuiltins(self);
     }
 
-    fn makeNative(self: *Vm, name: []const u8, func: gc.NativeFn, length: u32) Error!*gc.Object {
+    pub fn makeNative(self: *Vm, name: []const u8, func: gc.NativeFn, length: u32) Error!*gc.Object {
         const clo = try self.heap.create(gc.Closure);
         clo.native = func;
         clo.env = null;
@@ -237,19 +268,19 @@ pub const Vm = struct {
 
     /// Mark a native function object as a constructor (implements [[Construct]])
     /// and return it, so ctor definitions can wrap `makeNative` inline.
-    fn asCtor(obj: *gc.Object) *gc.Object {
+    pub fn asCtor(obj: *gc.Object) *gc.Object {
         obj.callable.?.constructor = true;
         return obj;
     }
 
     /// Define a method (native function) on `obj`, writable + configurable,
     /// non-enumerable (as built-in methods are).
-    fn defineMethod(self: *Vm, obj: *gc.Object, name: []const u8, func: gc.NativeFn, length: u32) Error!void {
+    pub fn defineMethod(self: *Vm, obj: *gc.Object, name: []const u8, func: gc.NativeFn, length: u32) Error!void {
         try self.defineData(obj, name, Value.fromObject(try self.makeNative(name, func, length)), true, false, true);
     }
 
     /// Define an accessor property with a native getter (no setter).
-    fn defineGetter(self: *Vm, obj: *gc.Object, name: []const u8, getter: gc.NativeFn) Error!void {
+    pub fn defineGetter(self: *Vm, obj: *gc.Object, name: []const u8, getter: gc.NativeFn) Error!void {
         const getter_obj = try self.makeNative(name, getter, 0);
         const gop = try obj.properties.getOrPut(self.gpa, name);
         if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, name);
@@ -262,14 +293,14 @@ pub const Vm = struct {
         };
     }
 
-    fn newMap(self: *Vm) Error!*gc.Object {
+    pub fn newMap(self: *Vm) Error!*gc.Object {
         self.maybeStress();
         const o = try self.heap.create(gc.Object);
         o.prototype = self.map_proto;
         o.collection = .map;
         return o;
     }
-    fn newSet(self: *Vm) Error!*gc.Object {
+    pub fn newSet(self: *Vm) Error!*gc.Object {
         self.maybeStress();
         const o = try self.heap.create(gc.Object);
         o.prototype = self.set_proto;
@@ -280,7 +311,7 @@ pub const Vm = struct {
     /// Create a RegExp object: compile the pattern with bilby (the sibling regex
     /// engine) and attach the compiled matcher to the object. Throws SyntaxError
     /// for an invalid pattern or flags, per spec.
-    fn makeRegExp(self: *Vm, source: []const u8, flags: []const u8) Error!*gc.Object {
+    pub fn makeRegExp(self: *Vm, source: []const u8, flags: []const u8) Error!*gc.Object {
         const obj = try self.newObject(self.regexp_proto);
         try self.protect(Value.fromObject(obj));
         defer self.unprotect();
@@ -311,7 +342,7 @@ pub const Vm = struct {
     }
 
     /// Create an Error object directly (for engine-thrown exceptions).
-    fn makeError(self: *Vm, proto: ?*gc.Object, msg: []const u8) Error!*gc.Object {
+    pub fn makeError(self: *Vm, proto: ?*gc.Object, msg: []const u8) Error!*gc.Object {
         const obj = try self.newObject(proto);
         try self.protect(Value.fromObject(obj));
         defer self.unprotect();
@@ -319,460 +350,7 @@ pub const Vm = struct {
         return obj;
     }
 
-    fn installBuiltins(self: *Vm) Error!void {
-        const global = self.global_object.?;
-
-        // ---- @@iterator + %IteratorPrototype% (iterables below reference it) ----
-        const sym_iter = try self.makeSymbol("Symbol.iterator");
-        self.symbol_iterator = sym_iter;
-        self.symbol_iterator_key = try self.toPropertyKey(sym_iter);
-        const iter_proto = try self.newObject(self.object_proto);
-        self.iterator_proto = iter_proto;
-        try self.defineMethod(iter_proto, "next", nativeIteratorNext, 0);
-        try self.defineData(iter_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("[Symbol.iterator]", nativeIterSelf, 0)), true, false, true);
-
-        // %GeneratorPrototype% inherits %IteratorPrototype% (so generators are iterable).
-        const gen_proto = try self.newObject(self.iterator_proto);
-        self.generator_proto = gen_proto;
-        try self.defineMethod(gen_proto, "next", nativeGeneratorNext, 1);
-        try self.defineMethod(gen_proto, "return", nativeGeneratorReturn, 1);
-        try self.defineMethod(gen_proto, "throw", nativeGeneratorThrow, 1);
-
-        // ---- Function.prototype methods + Function constructor ----
-        const fn_proto = self.function_proto.?;
-        try self.defineMethod(fn_proto, "call", nativeFunctionCall, 1);
-        try self.defineMethod(fn_proto, "apply", nativeFunctionApply, 2);
-        try self.defineMethod(fn_proto, "bind", nativeFunctionBind, 1);
-        try self.defineMethod(fn_proto, "toString", nativeFunctionToString, 0);
-        const function_ctor = asCtor(try self.makeNative("Function", nativeFunctionCtor, 1));
-        try self.defineData(function_ctor, "prototype", Value.fromObject(fn_proto), false, false, false);
-        try self.defineData(fn_proto, "constructor", Value.fromObject(function_ctor), true, false, true);
-        try self.defineData(global, "Function", Value.fromObject(function_ctor), true, false, true);
-
-        // ---- Object.prototype methods + Object constructor ----
-        try self.defineMethod(self.object_proto.?, "hasOwnProperty", nativeHasOwnProperty, 1);
-        try self.defineMethod(self.object_proto.?, "toString", nativeObjectToString, 0);
-        try self.defineMethod(self.object_proto.?, "valueOf", nativeObjectValueOf, 0);
-        try self.defineMethod(self.object_proto.?, "isPrototypeOf", nativeIsPrototypeOf, 1);
-        try self.defineMethod(self.object_proto.?, "propertyIsEnumerable", nativePropertyIsEnumerable, 1);
-        try self.defineMethod(self.object_proto.?, "toLocaleString", nativeObjectToLocaleString, 0);
-
-        const object_ctor = asCtor(try self.makeNative("Object", nativeObject, 1));
-        try self.defineData(object_ctor, "prototype", Value.fromObject(self.object_proto.?), false, false, false);
-        try self.defineData(self.object_proto.?, "constructor", Value.fromObject(object_ctor), true, false, true);
-        try self.defineMethod(object_ctor, "keys", nativeObjectKeys, 1);
-        try self.defineMethod(object_ctor, "values", nativeObjectValues, 1);
-        try self.defineMethod(object_ctor, "entries", nativeObjectEntries, 1);
-        try self.defineMethod(object_ctor, "getPrototypeOf", nativeObjectGetPrototypeOf, 1);
-        try self.defineMethod(object_ctor, "create", nativeObjectCreate, 2);
-        try self.defineMethod(object_ctor, "defineProperty", nativeObjectDefineProperty, 3);
-        try self.defineMethod(object_ctor, "getOwnPropertyDescriptor", nativeObjectGetOwnPropertyDescriptor, 2);
-        try self.defineMethod(object_ctor, "getOwnPropertyNames", nativeObjectGetOwnPropertyNames, 1);
-        try self.defineMethod(object_ctor, "defineProperties", nativeObjectDefineProperties, 2);
-        try self.defineMethod(object_ctor, "freeze", nativeObjectFreeze, 1);
-        try self.defineMethod(object_ctor, "isFrozen", nativeObjectIsFrozen, 1);
-        try self.defineMethod(object_ctor, "seal", nativeObjectSeal, 1);
-        try self.defineMethod(object_ctor, "isSealed", nativeObjectIsSealed, 1);
-        try self.defineMethod(object_ctor, "preventExtensions", nativeObjectPreventExtensions, 1);
-        try self.defineMethod(object_ctor, "isExtensible", nativeObjectIsExtensible, 1);
-        try self.defineData(global, "Object", Value.fromObject(object_ctor), true, false, true);
-
-        // ---- Error hierarchy ----
-        const error_proto = try self.newObject(self.object_proto);
-        self.error_proto = error_proto;
-        try self.defineData(error_proto, "name", try self.makeString("Error"), true, false, true);
-        try self.defineData(error_proto, "message", try self.makeString(""), true, false, true);
-        try self.defineMethod(error_proto, "toString", nativeErrorToString, 0);
-        const error_ctor = asCtor(try self.makeNative("Error", nativeError, 1));
-        try self.defineData(error_ctor, "prototype", Value.fromObject(error_proto), false, false, false);
-        try self.defineData(error_proto, "constructor", Value.fromObject(error_ctor), true, false, true);
-        try self.defineData(global, "Error", Value.fromObject(error_ctor), true, false, true);
-
-        self.type_error_proto = try self.installErrorSubtype("TypeError");
-        self.range_error_proto = try self.installErrorSubtype("RangeError");
-        self.reference_error_proto = try self.installErrorSubtype("ReferenceError");
-        self.syntax_error_proto = try self.installErrorSubtype("SyntaxError");
-        _ = try self.installErrorSubtype("EvalError");
-        _ = try self.installErrorSubtype("URIError");
-
-        // ---- Array ----
-        const array_proto = try self.heap.create(gc.Object);
-        array_proto.prototype = self.object_proto;
-        array_proto.is_array = true; // Array.prototype is itself an (empty) array
-        self.array_proto = array_proto;
-        try self.defineMethod(array_proto, "push", nativeArrayPush, 1);
-        try self.defineMethod(array_proto, "pop", nativeArrayPop, 0);
-        try self.defineMethod(array_proto, "indexOf", nativeArrayIndexOf, 1);
-        try self.defineMethod(array_proto, "includes", nativeArrayIncludes, 1);
-        try self.defineMethod(array_proto, "join", nativeArrayJoin, 1);
-        try self.defineMethod(array_proto, "slice", nativeArraySlice, 2);
-        try self.defineMethod(array_proto, "concat", nativeArrayConcat, 1);
-        try self.defineMethod(array_proto, "forEach", nativeArrayForEach, 1);
-        try self.defineMethod(array_proto, "map", nativeArrayMap, 1);
-        try self.defineMethod(array_proto, "filter", nativeArrayFilter, 1);
-        try self.defineMethod(array_proto, "values", nativeIterableValues, 0);
-        try self.defineMethod(array_proto, "keys", nativeIterableKeys, 0);
-        try self.defineMethod(array_proto, "entries", nativeIterableEntries, 0);
-        try self.defineData(array_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
-        try self.defineMethod(array_proto, "toString", nativeArrayToString, 0);
-        const array_ctor = asCtor(try self.makeNative("Array", nativeArray, 1));
-        try self.defineData(array_ctor, "prototype", Value.fromObject(array_proto), false, false, false);
-        try self.defineData(array_proto, "constructor", Value.fromObject(array_ctor), true, false, true);
-        try self.defineMethod(array_ctor, "isArray", nativeArrayIsArray, 1);
-        try self.defineData(global, "Array", Value.fromObject(array_ctor), true, false, true);
-
-        // ---- String (+ prototype methods for primitive strings) ----
-        const string_proto = try self.newObject(self.object_proto);
-        self.string_proto = string_proto;
-        try self.defineMethod(string_proto, "charAt", nativeStringCharAt, 1);
-        try self.defineMethod(string_proto, "charCodeAt", nativeStringCharCodeAt, 1);
-        try self.defineMethod(string_proto, "indexOf", nativeStringIndexOf, 1);
-        try self.defineMethod(string_proto, "includes", nativeStringIncludes, 1);
-        try self.defineMethod(string_proto, "startsWith", nativeStringStartsWith, 1);
-        try self.defineMethod(string_proto, "endsWith", nativeStringEndsWith, 1);
-        try self.defineMethod(string_proto, "slice", nativeStringSlice, 2);
-        try self.defineMethod(string_proto, "substring", nativeStringSubstring, 2);
-        try self.defineMethod(string_proto, "toUpperCase", nativeStringToUpperCase, 0);
-        try self.defineMethod(string_proto, "toLowerCase", nativeStringToLowerCase, 0);
-        try self.defineMethod(string_proto, "trim", nativeStringTrim, 0);
-        try self.defineMethod(string_proto, "repeat", nativeStringRepeat, 1);
-        try self.defineMethod(string_proto, "concat", nativeStringConcat, 1);
-        try self.defineMethod(string_proto, "split", nativeStringSplit, 2);
-        try self.defineMethod(string_proto, "match", nativeStringMatch, 1);
-        try self.defineMethod(string_proto, "search", nativeStringSearch, 1);
-        try self.defineMethod(string_proto, "replace", nativeStringReplace, 2);
-        try self.defineMethod(string_proto, "lastIndexOf", nativeStringLastIndexOf, 1);
-        try self.defineMethod(string_proto, "localeCompare", nativeStringLocaleCompare, 1);
-        try self.defineMethod(string_proto, "toLocaleLowerCase", nativeStringToLowerCase, 0);
-        try self.defineMethod(string_proto, "toLocaleUpperCase", nativeStringToUpperCase, 0);
-        try self.defineData(string_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("[Symbol.iterator]", nativeIterableValues, 0)), true, false, true);
-        try self.defineMethod(string_proto, "toString", nativeStringToString, 0);
-        try self.defineMethod(string_proto, "valueOf", nativeStringToString, 0);
-        const string_ctor = asCtor(try self.makeNative("String", nativeString, 1));
-        try self.defineData(string_ctor, "prototype", Value.fromObject(string_proto), false, false, false);
-        try self.defineData(string_proto, "constructor", Value.fromObject(string_ctor), true, false, true);
-        try self.defineMethod(string_ctor, "fromCharCode", nativeStringFromCharCode, 1);
-        try self.defineData(global, "String", Value.fromObject(string_ctor), true, false, true);
-
-        // ---- Number (+ prototype) / Boolean ----
-        const number_proto = try self.newObject(self.object_proto);
-        self.number_proto = number_proto;
-        try self.defineMethod(number_proto, "toFixed", nativeNumberToFixed, 1);
-        try self.defineMethod(number_proto, "toString", nativeNumberToString, 1);
-        try self.defineMethod(number_proto, "valueOf", nativeNumberValueOf, 0);
-        try self.defineMethod(number_proto, "toExponential", nativeNumberToExponential, 1);
-        try self.defineMethod(number_proto, "toPrecision", nativeNumberToPrecision, 1);
-        try self.defineMethod(number_proto, "toLocaleString", nativeNumberToString, 0);
-        const number_ctor = asCtor(try self.makeNative("Number", nativeNumber, 1));
-        try self.defineData(number_ctor, "prototype", Value.fromObject(number_proto), false, false, false);
-        try self.defineData(number_proto, "constructor", Value.fromObject(number_ctor), true, false, true);
-        try self.defineData(number_ctor, "MAX_SAFE_INTEGER", Value.fromNumber(9007199254740991), false, false, false);
-        try self.defineData(number_ctor, "MIN_SAFE_INTEGER", Value.fromNumber(-9007199254740991), false, false, false);
-        try self.defineData(number_ctor, "POSITIVE_INFINITY", Value.fromNumber(std.math.inf(f64)), false, false, false);
-        try self.defineData(number_ctor, "NEGATIVE_INFINITY", Value.fromNumber(-std.math.inf(f64)), false, false, false);
-        try self.defineData(number_ctor, "NaN", Value.fromNumber(std.math.nan(f64)), false, false, false);
-        try self.defineData(number_ctor, "MAX_VALUE", Value.fromNumber(1.7976931348623157e308), false, false, false);
-        try self.defineData(number_ctor, "MIN_VALUE", Value.fromNumber(5e-324), false, false, false);
-        try self.defineData(number_ctor, "EPSILON", Value.fromNumber(2.220446049250313e-16), false, false, false);
-        try self.defineMethod(number_ctor, "isInteger", nativeNumberIsInteger, 1);
-        try self.defineMethod(number_ctor, "isFinite", nativeNumberIsFinite, 1);
-        try self.defineMethod(number_ctor, "isNaN", nativeNumberIsNaN, 1);
-        try self.defineData(global, "Number", Value.fromObject(number_ctor), true, false, true);
-
-        const boolean_proto = try self.newObject(self.object_proto);
-        self.boolean_proto = boolean_proto;
-        try self.defineMethod(boolean_proto, "toString", nativeBooleanToString, 0);
-        try self.defineMethod(boolean_proto, "valueOf", nativeBooleanValueOf, 0);
-        const boolean_ctor = asCtor(try self.makeNative("Boolean", nativeBoolean, 1));
-        try self.defineData(boolean_ctor, "prototype", Value.fromObject(boolean_proto), false, false, false);
-        try self.defineData(boolean_proto, "constructor", Value.fromObject(boolean_ctor), true, false, true);
-        try self.defineData(global, "Boolean", Value.fromObject(boolean_ctor), true, false, true);
-
-        // ---- Math ----
-        const math = try self.newObject(self.object_proto);
-        try self.defineData(math, "PI", Value.fromNumber(std.math.pi), false, false, false);
-        try self.defineData(math, "E", Value.fromNumber(std.math.e), false, false, false);
-        try self.defineMethod(math, "abs", nativeMathAbs, 1);
-        try self.defineMethod(math, "floor", nativeMathFloor, 1);
-        try self.defineMethod(math, "ceil", nativeMathCeil, 1);
-        try self.defineMethod(math, "round", nativeMathRound, 1);
-        try self.defineMethod(math, "trunc", nativeMathTrunc, 1);
-        try self.defineMethod(math, "sqrt", nativeMathSqrt, 1);
-        try self.defineMethod(math, "sign", nativeMathSign, 1);
-        try self.defineMethod(math, "max", nativeMathMax, 2);
-        try self.defineMethod(math, "min", nativeMathMin, 2);
-        try self.defineMethod(math, "pow", nativeMathPow, 2);
-        try self.defineMethod(math, "sin", mathUnaryFn(opSin), 1);
-        try self.defineMethod(math, "cos", mathUnaryFn(opCos), 1);
-        try self.defineMethod(math, "tan", mathUnaryFn(opTan), 1);
-        try self.defineMethod(math, "asin", mathUnaryFn(opAsin), 1);
-        try self.defineMethod(math, "acos", mathUnaryFn(opAcos), 1);
-        try self.defineMethod(math, "atan", mathUnaryFn(opAtan), 1);
-        try self.defineMethod(math, "sinh", mathUnaryFn(opSinh), 1);
-        try self.defineMethod(math, "cosh", mathUnaryFn(opCosh), 1);
-        try self.defineMethod(math, "tanh", mathUnaryFn(opTanh), 1);
-        try self.defineMethod(math, "asinh", mathUnaryFn(opAsinh), 1);
-        try self.defineMethod(math, "acosh", mathUnaryFn(opAcosh), 1);
-        try self.defineMethod(math, "atanh", mathUnaryFn(opAtanh), 1);
-        try self.defineMethod(math, "exp", mathUnaryFn(opExp), 1);
-        try self.defineMethod(math, "expm1", mathUnaryFn(opExpm1), 1);
-        try self.defineMethod(math, "log", mathUnaryFn(opLog), 1);
-        try self.defineMethod(math, "log2", mathUnaryFn(opLog2), 1);
-        try self.defineMethod(math, "log10", mathUnaryFn(opLog10), 1);
-        try self.defineMethod(math, "log1p", mathUnaryFn(opLog1p), 1);
-        try self.defineMethod(math, "cbrt", mathUnaryFn(opCbrt), 1);
-        try self.defineMethod(math, "fround", mathUnaryFn(opFround), 1);
-        try self.defineMethod(math, "atan2", nativeMathAtan2, 2);
-        try self.defineMethod(math, "hypot", nativeMathHypot, 2);
-        try self.defineMethod(math, "clz32", nativeMathClz32, 1);
-        try self.defineMethod(math, "imul", nativeMathImul, 2);
-        try self.defineMethod(math, "random", nativeMathRandom, 0);
-        try self.defineData(math, "LN2", Value.fromNumber(0.6931471805599453), false, false, false);
-        try self.defineData(math, "LN10", Value.fromNumber(2.302585092994046), false, false, false);
-        try self.defineData(math, "LOG2E", Value.fromNumber(1.4426950408889634), false, false, false);
-        try self.defineData(math, "LOG10E", Value.fromNumber(0.4342944819032518), false, false, false);
-        try self.defineData(math, "SQRT2", Value.fromNumber(1.4142135623730951), false, false, false);
-        try self.defineData(math, "SQRT1_2", Value.fromNumber(0.7071067811865476), false, false, false);
-        try self.defineData(global, "Math", Value.fromObject(math), true, false, true);
-
-        // ---- RegExp (matching powered by bilby) ----
-        const regexp_proto = try self.newObject(self.object_proto);
-        self.regexp_proto = regexp_proto;
-        try self.defineMethod(regexp_proto, "test", nativeRegExpTest, 1);
-        try self.defineMethod(regexp_proto, "exec", nativeRegExpExec, 1);
-        try self.defineMethod(regexp_proto, "toString", nativeRegExpToString, 0);
-        try self.defineGetter(regexp_proto, "source", nativeRegExpGetSource);
-        try self.defineGetter(regexp_proto, "flags", nativeRegExpGetFlags);
-        try self.defineGetter(regexp_proto, "global", regexpFlagGetter("global"));
-        try self.defineGetter(regexp_proto, "ignoreCase", regexpFlagGetter("ignore_case"));
-        try self.defineGetter(regexp_proto, "multiline", regexpFlagGetter("multiline"));
-        try self.defineGetter(regexp_proto, "sticky", regexpFlagGetter("sticky"));
-        try self.defineGetter(regexp_proto, "dotAll", regexpFlagGetter("dot_all"));
-        try self.defineGetter(regexp_proto, "unicode", regexpFlagGetter("unicode"));
-        const regexp_ctor = asCtor(try self.makeNative("RegExp", nativeRegExp, 2));
-        try self.defineData(regexp_ctor, "prototype", Value.fromObject(regexp_proto), false, false, false);
-        try self.defineData(regexp_proto, "constructor", Value.fromObject(regexp_ctor), true, false, true);
-        try self.defineData(global, "RegExp", Value.fromObject(regexp_ctor), true, false, true);
-
-        // ---- Map ----
-        const map_proto = try self.newObject(self.object_proto);
-        self.map_proto = map_proto;
-        try self.defineMethod(map_proto, "get", nativeMapGet, 1);
-        try self.defineMethod(map_proto, "set", nativeMapSet, 2);
-        try self.defineMethod(map_proto, "has", nativeMapHas, 1);
-        try self.defineMethod(map_proto, "delete", nativeMapDelete, 1);
-        try self.defineMethod(map_proto, "clear", nativeCollectionClear, 0);
-        try self.defineMethod(map_proto, "forEach", nativeMapForEach, 1);
-        try self.defineMethod(map_proto, "entries", nativeIterableEntries, 0);
-        try self.defineMethod(map_proto, "keys", nativeIterableKeys, 0);
-        try self.defineMethod(map_proto, "values", nativeIterableValues, 0);
-        try self.defineData(map_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("entries", nativeIterableEntries, 0)), true, false, true);
-        try self.defineGetter(map_proto, "size", nativeMapSize);
-        const map_ctor = asCtor(try self.makeNative("Map", nativeMap, 0));
-        try self.defineData(map_ctor, "prototype", Value.fromObject(map_proto), false, false, false);
-        try self.defineData(map_proto, "constructor", Value.fromObject(map_ctor), true, false, true);
-        try self.defineData(global, "Map", Value.fromObject(map_ctor), true, false, true);
-
-        // ---- Set ----
-        const set_proto = try self.newObject(self.object_proto);
-        self.set_proto = set_proto;
-        try self.defineMethod(set_proto, "add", nativeSetAdd, 1);
-        try self.defineMethod(set_proto, "has", nativeSetHas, 1);
-        try self.defineMethod(set_proto, "delete", nativeSetDelete, 1);
-        try self.defineMethod(set_proto, "clear", nativeCollectionClear, 0);
-        try self.defineMethod(set_proto, "forEach", nativeSetForEach, 1);
-        try self.defineMethod(set_proto, "values", nativeIterableValues, 0);
-        try self.defineMethod(set_proto, "keys", nativeIterableValues, 0);
-        try self.defineMethod(set_proto, "entries", nativeIterableEntries, 0);
-        try self.defineData(set_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
-        try self.defineGetter(set_proto, "size", nativeSetSize);
-        const set_ctor = asCtor(try self.makeNative("Set", nativeSet, 0));
-        try self.defineData(set_ctor, "prototype", Value.fromObject(set_proto), false, false, false);
-        try self.defineData(set_proto, "constructor", Value.fromObject(set_ctor), true, false, true);
-        try self.defineData(global, "Set", Value.fromObject(set_ctor), true, false, true);
-
-        // ---- Date ----
-        const date_proto = try self.newObject(self.object_proto);
-        self.date_proto = date_proto;
-        try self.defineMethod(date_proto, "getTime", nativeDateGetTime, 0);
-        try self.defineMethod(date_proto, "valueOf", nativeDateGetTime, 0);
-        try self.defineMethod(date_proto, "setTime", nativeDateSetTime, 1);
-        try self.defineMethod(date_proto, "getFullYear", nativeDateGetFullYear, 0);
-        try self.defineMethod(date_proto, "getUTCFullYear", nativeDateGetFullYear, 0);
-        try self.defineMethod(date_proto, "getMonth", nativeDateGetMonth, 0);
-        try self.defineMethod(date_proto, "getUTCMonth", nativeDateGetMonth, 0);
-        try self.defineMethod(date_proto, "getDate", nativeDateGetDate, 0);
-        try self.defineMethod(date_proto, "getUTCDate", nativeDateGetDate, 0);
-        try self.defineMethod(date_proto, "getDay", nativeDateGetDay, 0);
-        try self.defineMethod(date_proto, "getUTCDay", nativeDateGetDay, 0);
-        try self.defineMethod(date_proto, "getHours", nativeDateGetHours, 0);
-        try self.defineMethod(date_proto, "getUTCHours", nativeDateGetHours, 0);
-        try self.defineMethod(date_proto, "getMinutes", nativeDateGetMinutes, 0);
-        try self.defineMethod(date_proto, "getUTCMinutes", nativeDateGetMinutes, 0);
-        try self.defineMethod(date_proto, "getSeconds", nativeDateGetSeconds, 0);
-        try self.defineMethod(date_proto, "getUTCSeconds", nativeDateGetSeconds, 0);
-        try self.defineMethod(date_proto, "getMilliseconds", nativeDateGetMs, 0);
-        try self.defineMethod(date_proto, "toISOString", nativeDateToISOString, 0);
-        try self.defineMethod(date_proto, "toJSON", nativeDateToISOString, 1);
-        try self.defineMethod(date_proto, "toString", nativeDateToISOString, 0);
-        try self.defineMethod(date_proto, "getUTCMilliseconds", nativeDateGetMs, 0);
-        try self.defineMethod(date_proto, "getTimezoneOffset", nativeDateGetTimezoneOffset, 0);
-        try self.defineMethod(date_proto, "toDateString", nativeDateToDateString, 0);
-        try self.defineMethod(date_proto, "toTimeString", nativeDateToTimeString, 0);
-        try self.defineMethod(date_proto, "toUTCString", nativeDateToUTCString, 0);
-        try self.defineMethod(date_proto, "toLocaleString", nativeDateToISOString, 0);
-        try self.defineMethod(date_proto, "toLocaleDateString", nativeDateToDateString, 0);
-        try self.defineMethod(date_proto, "toLocaleTimeString", nativeDateToTimeString, 0);
-        // Local time == UTC in this engine, so each setter serves both names.
-        try self.defineMethod(date_proto, "setFullYear", nativeDateSetFullYear, 3);
-        try self.defineMethod(date_proto, "setUTCFullYear", nativeDateSetFullYear, 3);
-        try self.defineMethod(date_proto, "setMonth", nativeDateSetMonth, 2);
-        try self.defineMethod(date_proto, "setUTCMonth", nativeDateSetMonth, 2);
-        try self.defineMethod(date_proto, "setDate", nativeDateSetDate, 1);
-        try self.defineMethod(date_proto, "setUTCDate", nativeDateSetDate, 1);
-        try self.defineMethod(date_proto, "setHours", nativeDateSetHours, 4);
-        try self.defineMethod(date_proto, "setUTCHours", nativeDateSetHours, 4);
-        try self.defineMethod(date_proto, "setMinutes", nativeDateSetMinutes, 3);
-        try self.defineMethod(date_proto, "setUTCMinutes", nativeDateSetMinutes, 3);
-        try self.defineMethod(date_proto, "setSeconds", nativeDateSetSeconds, 2);
-        try self.defineMethod(date_proto, "setUTCSeconds", nativeDateSetSeconds, 2);
-        try self.defineMethod(date_proto, "setMilliseconds", nativeDateSetMilliseconds, 1);
-        try self.defineMethod(date_proto, "setUTCMilliseconds", nativeDateSetMilliseconds, 1);
-        const date_ctor = asCtor(try self.makeNative("Date", nativeDate, 7));
-        try self.defineData(date_ctor, "prototype", Value.fromObject(date_proto), false, false, false);
-        try self.defineData(date_proto, "constructor", Value.fromObject(date_ctor), true, false, true);
-        try self.defineMethod(date_ctor, "now", nativeDateNow, 0);
-        try self.defineMethod(date_ctor, "UTC", nativeDateUTC, 7);
-        try self.defineMethod(date_ctor, "parse", nativeDateParse, 1);
-        try self.defineData(global, "Date", Value.fromObject(date_ctor), true, false, true);
-
-        // ---- ArrayBuffer + TypedArrays ----
-        const ab_proto = try self.newObject(self.object_proto);
-        self.arraybuffer_proto = ab_proto;
-        const ab_ctor = asCtor(try self.makeNative("ArrayBuffer", nativeArrayBuffer, 1));
-        try self.defineData(ab_ctor, "prototype", Value.fromObject(ab_proto), false, false, false);
-        try self.defineData(ab_proto, "constructor", Value.fromObject(ab_ctor), true, false, true);
-        try self.defineData(global, "ArrayBuffer", Value.fromObject(ab_ctor), true, false, true);
-
-        const ta_proto = try self.newObject(self.object_proto);
-        self.typed_array_proto = ta_proto;
-        try self.defineMethod(ta_proto, "fill", nativeTAFill, 1);
-        try self.defineMethod(ta_proto, "set", nativeTASet, 1);
-        try self.defineMethod(ta_proto, "subarray", nativeTASubarray, 2);
-        try self.defineMethod(ta_proto, "join", nativeTAJoin, 1);
-        try self.defineMethod(ta_proto, "toString", nativeTAJoin, 0);
-        try self.defineMethod(ta_proto, "forEach", nativeTAForEach, 1);
-        try self.defineMethod(ta_proto, "indexOf", nativeTAIndexOf, 1);
-        try self.defineMethod(ta_proto, "values", nativeIterableValues, 0);
-        try self.defineData(ta_proto, self.symbol_iterator_key, Value.fromObject(try self.makeNative("values", nativeIterableValues, 0)), true, false, true);
-
-        const ta_types = .{
-            .{ "Int8Array", gc.TAKind.i8 },
-            .{ "Uint8Array", gc.TAKind.u8 },
-            .{ "Uint8ClampedArray", gc.TAKind.u8c },
-            .{ "Int16Array", gc.TAKind.i16 },
-            .{ "Uint16Array", gc.TAKind.u16 },
-            .{ "Int32Array", gc.TAKind.i32 },
-            .{ "Uint32Array", gc.TAKind.u32 },
-            .{ "Float32Array", gc.TAKind.f32 },
-            .{ "Float64Array", gc.TAKind.f64 },
-        };
-        inline for (ta_types) |t| {
-            const proto = try self.newObject(self.typed_array_proto);
-            const ctor = asCtor(try self.makeNative(t[0], typedArrayConstructor(t[1]), 3));
-            try self.defineData(ctor, "prototype", Value.fromObject(proto), false, false, false);
-            try self.defineData(proto, "constructor", Value.fromObject(ctor), true, false, true);
-            const bpe: f64 = @floatFromInt(gc.bytesPerElement(t[1]));
-            try self.defineData(ctor, "BYTES_PER_ELEMENT", Value.fromNumber(bpe), false, false, false);
-            try self.defineData(proto, "BYTES_PER_ELEMENT", Value.fromNumber(bpe), false, false, false);
-            try self.defineData(global, t[0], Value.fromObject(ctor), true, false, true);
-        }
-
-        // ---- DataView ----
-        const dv_proto = try self.newObject(self.object_proto);
-        self.dataview_proto = dv_proto;
-        try self.defineMethod(dv_proto, "getInt8", dataViewGet(i8, false, true), 1);
-        try self.defineMethod(dv_proto, "getUint8", dataViewGet(u8, false, true), 1);
-        try self.defineMethod(dv_proto, "getInt16", dataViewGet(i16, false, false), 1);
-        try self.defineMethod(dv_proto, "getUint16", dataViewGet(u16, false, false), 1);
-        try self.defineMethod(dv_proto, "getInt32", dataViewGet(i32, false, false), 1);
-        try self.defineMethod(dv_proto, "getUint32", dataViewGet(u32, false, false), 1);
-        try self.defineMethod(dv_proto, "getFloat32", dataViewGet(f32, true, false), 1);
-        try self.defineMethod(dv_proto, "getFloat64", dataViewGet(f64, true, false), 1);
-        try self.defineMethod(dv_proto, "setInt8", dataViewSet(i8, false, true), 2);
-        try self.defineMethod(dv_proto, "setUint8", dataViewSet(u8, false, true), 2);
-        try self.defineMethod(dv_proto, "setInt16", dataViewSet(i16, false, false), 2);
-        try self.defineMethod(dv_proto, "setUint16", dataViewSet(u16, false, false), 2);
-        try self.defineMethod(dv_proto, "setInt32", dataViewSet(i32, false, false), 2);
-        try self.defineMethod(dv_proto, "setUint32", dataViewSet(u32, false, false), 2);
-        try self.defineMethod(dv_proto, "setFloat32", dataViewSet(f32, true, false), 2);
-        try self.defineMethod(dv_proto, "setFloat64", dataViewSet(f64, true, false), 2);
-        const dv_ctor = asCtor(try self.makeNative("DataView", nativeDataView, 1));
-        try self.defineData(dv_ctor, "prototype", Value.fromObject(dv_proto), false, false, false);
-        try self.defineData(dv_proto, "constructor", Value.fromObject(dv_ctor), true, false, true);
-        try self.defineData(global, "DataView", Value.fromObject(dv_ctor), true, false, true);
-
-        // ---- Symbol ----
-        const symbol_proto = try self.newObject(self.object_proto);
-        self.symbol_proto = symbol_proto;
-        try self.defineMethod(symbol_proto, "toString", nativeSymbolToString, 0);
-        try self.defineMethod(symbol_proto, "valueOf", nativeSymbolValueOf, 0);
-        try self.defineGetter(symbol_proto, "description", nativeSymbolDescription);
-        const symbol_ctor = try self.makeNative("Symbol", nativeSymbol, 0);
-        try self.defineData(symbol_ctor, "prototype", Value.fromObject(symbol_proto), false, false, false);
-        try self.defineData(symbol_proto, "constructor", Value.fromObject(symbol_ctor), true, false, true);
-        try self.defineMethod(symbol_ctor, "for", nativeSymbolFor, 1);
-        try self.defineMethod(symbol_ctor, "keyFor", nativeSymbolKeyFor, 1);
-        const well_known = [_][]const u8{
-            "iterator", "asyncIterator", "hasInstance", "isConcatSpreadable",
-            "match",    "replace",       "search",      "split",
-            "species",  "toPrimitive",   "toStringTag", "unscopables",
-        };
-        inline for (well_known) |name| {
-            const sym = if (comptime std.mem.eql(u8, name, "iterator"))
-                self.symbol_iterator.?
-            else
-                try self.makeSymbol("Symbol." ++ name);
-            try self.defineData(symbol_ctor, name, sym, false, false, false);
-        }
-        try self.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
-
-        // ---- Proxy + Reflect ----
-        const proxy_ctor = asCtor(try self.makeNative("Proxy", nativeProxy, 2));
-        try self.defineData(global, "Proxy", Value.fromObject(proxy_ctor), true, false, true);
-
-        const reflect = try self.newObject(self.object_proto);
-        try self.defineMethod(reflect, "get", nativeReflectGet, 2);
-        try self.defineMethod(reflect, "set", nativeReflectSet, 3);
-        try self.defineMethod(reflect, "has", nativeReflectHas, 2);
-        try self.defineMethod(reflect, "deleteProperty", nativeReflectDelete, 2);
-        try self.defineMethod(reflect, "ownKeys", nativeReflectOwnKeys, 1);
-        try self.defineMethod(reflect, "getPrototypeOf", nativeReflectGetProto, 1);
-        try self.defineMethod(reflect, "apply", nativeReflectApply, 3);
-        try self.defineMethod(reflect, "construct", nativeReflectConstruct, 2);
-        try self.defineData(global, "Reflect", Value.fromObject(reflect), true, false, true);
-
-        // ---- JSON ----
-        const json = try self.newObject(self.object_proto);
-        try self.defineMethod(json, "stringify", nativeJSONStringify, 3);
-        try self.defineMethod(json, "parse", nativeJSONParse, 2);
-        try self.defineData(global, "JSON", Value.fromObject(json), true, false, true);
-
-        // ---- global functions ----
-        try self.defineMethod(global, "isNaN", nativeIsNaN, 1);
-        try self.defineMethod(global, "isFinite", nativeIsFinite, 1);
-        try self.defineMethod(global, "eval", nativeEval, 1);
-        try self.defineMethod(global, "parseInt", nativeParseInt, 2);
-        try self.defineMethod(global, "parseFloat", nativeParseFloat, 1);
-        try self.defineMethod(global, "encodeURI", nativeEncodeURI, 1);
-        try self.defineMethod(global, "encodeURIComponent", nativeEncodeURIComponent, 1);
-        try self.defineMethod(global, "decodeURI", nativeDecodeURIComponent, 1);
-        try self.defineMethod(global, "decodeURIComponent", nativeDecodeURIComponent, 1);
-        try self.defineMethod(number_ctor, "parseInt", nativeParseInt, 2);
-        try self.defineMethod(number_ctor, "parseFloat", nativeParseFloat, 1);
-    }
-
-    fn installErrorSubtype(self: *Vm, name: []const u8) Error!*gc.Object {
+    pub fn installErrorSubtype(self: *Vm, name: []const u8) Error!*gc.Object {
         const proto = try self.newObject(self.error_proto);
         try self.defineData(proto, "name", try self.makeString(name), true, false, true);
         try self.defineData(proto, "message", try self.makeString(""), true, false, true);
@@ -819,7 +397,7 @@ pub const Vm = struct {
         return utf16ToUtf8Alloc(gpa, msg_v.asString().units) catch return null;
     }
 
-    fn createEnv(self: *Vm, parent: ?*gc.Environment, n: u32) Error!*gc.Environment {
+    pub fn createEnv(self: *Vm, parent: ?*gc.Environment, n: u32) Error!*gc.Environment {
         self.maybeStress();
         const e = try self.heap.create(gc.Environment);
         e.parent = parent;
@@ -838,7 +416,7 @@ pub const Vm = struct {
 
     /// Carve `need` registers off the segmented stack. Returns the slab index
     /// and base; the caller restores `top` on frame exit (strict LIFO).
-    fn pushRegs(self: *Vm, need: usize) Error!struct { slab: usize, base: usize, regs: []Value } {
+    pub fn pushRegs(self: *Vm, need: usize) Error!struct { slab: usize, base: usize, regs: []Value } {
         // Find room in the topmost slab, else append a bigger one. Older
         // slabs' outstanding slices are never moved.
         if (self.reg_slabs.items.len == 0) {
@@ -860,7 +438,7 @@ pub const Vm = struct {
         return .{ .slab = idx, .base = base, .regs = regs };
     }
 
-    fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, this_value: Value) Error!Value {
+    pub fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, this_value: Value) Error!Value {
         // Registers come from the segmented slab stack (no per-call allocation).
         const r = try self.pushRegs(code.num_registers);
         defer self.reg_slabs.items[r.slab].top = r.base;
@@ -883,7 +461,7 @@ pub const Vm = struct {
     /// Parse, compile, and run `src8` in the global scope (indirect-eval
     /// semantics; direct eval's caller-scope capture is not supported). The
     /// compiled program is kept alive for the VM's lifetime.
-    fn evalSource(self: *Vm, src8: []const u8) Error!Value {
+    pub fn evalSource(self: *Vm, src8: []const u8) Error!Value {
         const parser_mod = @import("parser.zig");
         const compiler_mod = @import("compiler.zig");
         const pr = parser_mod.parse(self.gpa, src8, .script) catch return error.OutOfMemory;
@@ -904,20 +482,20 @@ pub const Vm = struct {
     }
 
     /// True once the current `run` has exceeded its wall-clock deadline.
-    fn overBudget(self: *Vm) bool {
+    pub fn overBudget(self: *Vm) bool {
         return std.Io.Clock.now(.awake, self.threaded.io()).nanoseconds > self.deadline_ns;
     }
 
     /// Tick the execution budget once and raise `error.Timeout` if the step or
     /// wall-clock limit is exceeded. Called from the dispatch loop and from
     /// native loops whose trip count is controlled by a JS `length`.
-    fn checkBudget(self: *Vm) Error!void {
+    pub fn checkBudget(self: *Vm) Error!void {
         self.steps += 1;
         if (self.steps > max_steps) return error.Timeout;
         if (self.steps & wall_check_mask == 0 and self.overBudget()) return error.Timeout;
     }
 
-    fn runLoop(self: *Vm, frame: *Frame) Error!RunResult {
+    pub fn runLoop(self: *Vm, frame: *Frame) Error!RunResult {
         const code = frame.code;
         while (true) {
             try self.checkBudget();
@@ -941,7 +519,7 @@ pub const Vm = struct {
         }
     }
 
-    fn findHandler(self: *const Vm, code: *const bc.CodeBlock, pc: u32) ?bc.Handler {
+    pub fn findHandler(self: *const Vm, code: *const bc.CodeBlock, pc: u32) ?bc.Handler {
         _ = self;
         var best: ?bc.Handler = null;
         for (code.handlers) |h| {
@@ -956,7 +534,7 @@ pub const Vm = struct {
         return best;
     }
 
-    fn exec(
+    pub fn exec(
         self: *Vm,
         code: *const bc.CodeBlock,
         env: *gc.Environment,
@@ -1093,7 +671,7 @@ pub const Vm = struct {
         return .advance;
     }
 
-    fn envAt(self: *const Vm, env: *gc.Environment, depth: u32) *gc.Environment {
+    pub fn envAt(self: *const Vm, env: *gc.Environment, depth: u32) *gc.Environment {
         _ = self;
         var e = env;
         var d = depth;
@@ -1103,7 +681,7 @@ pub const Vm = struct {
 
     // ---- calls & closures --------------------------------------------------
 
-    fn makeClosure(self: *Vm, child: *const bc.CodeBlock, env: *gc.Environment, creator_this: Value) Error!Value {
+    pub fn makeClosure(self: *Vm, child: *const bc.CodeBlock, env: *gc.Environment, creator_this: Value) Error!Value {
         self.maybeStress();
         const clo = try self.heap.create(gc.Closure);
         clo.code = child;
@@ -1131,14 +709,14 @@ pub const Vm = struct {
     /// Allocate `bound ++ call` into a fresh gpa buffer. The individual Values
     /// remain reachable via their owners (the bound function / caller frame),
     /// so only the backing memory needs to be freed by the caller.
-    fn concatBoundArgs(self: *Vm, bound: []const Value, call: []const Value) Error![]Value {
+    pub fn concatBoundArgs(self: *Vm, bound: []const Value, call: []const Value) Error![]Value {
         const buf = try self.gpa.alloc(Value, bound.len + call.len);
         @memcpy(buf[0..bound.len], bound);
         @memcpy(buf[bound.len..], call);
         return buf;
     }
 
-    fn callValue(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!Value {
+    pub fn callValue(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!Value {
         // Callable proxy: dispatch to the `apply` trap, else forward to target.
         if (callee.isObject()) {
             if (callee.asObject().proxy_target) |target| {
@@ -1196,7 +774,7 @@ pub const Vm = struct {
 
     /// Build an `arguments` object: an ordinary object with own indexed
     /// properties for each argument plus a writable, non-enumerable `length`.
-    fn makeArgumentsObject(self: *Vm, args: []const Value) Error!*gc.Object {
+    pub fn makeArgumentsObject(self: *Vm, args: []const Value) Error!*gc.Object {
         const obj = try self.newObject(self.object_proto);
         try self.protect(Value.fromObject(obj));
         defer self.unprotect();
@@ -1212,7 +790,7 @@ pub const Vm = struct {
     /// The `new` operator: create an ordinary object inheriting the
     /// constructor's `prototype`, run the constructor with it as `this`, and
     /// return the constructor's object result or that object.
-    fn constructValue(self: *Vm, callee: Value, args: []const Value) Error!Value {
+    pub fn constructValue(self: *Vm, callee: Value, args: []const Value) Error!Value {
         // Constructor proxy: dispatch to the `construct` trap, else forward.
         if (callee.isObject()) {
             if (callee.asObject().proxy_target) |target| {
@@ -1249,7 +827,7 @@ pub const Vm = struct {
 
     // ---- generators --------------------------------------------------------
 
-    fn makeGenerator(self: *Vm, code: *const bc.CodeBlock, closure_env: ?*gc.Environment, this_value: Value, args: []const Value) Error!Value {
+    pub fn makeGenerator(self: *Vm, code: *const bc.CodeBlock, closure_env: ?*gc.Environment, this_value: Value, args: []const Value) Error!Value {
         const obj = try self.newObject(self.generator_proto);
         try self.protect(Value.fromObject(obj));
         defer self.unprotect();
@@ -1276,7 +854,7 @@ pub const Vm = struct {
 
     /// Resume a generator. mode: 0=next(v), 1=return(v), 2=throw(v). Returns an
     /// iterator-result object (or throws for mode 2 propagation).
-    fn generatorResume(self: *Vm, this: Value, sent: Value, mode: u8) Error!Value {
+    pub fn generatorResume(self: *Vm, this: Value, sent: Value, mode: u8) Error!Value {
         if (!this.isObject() or this.asObject().generator == null) return self.throwTypeError("not a generator");
         const g = this.asObject().generator.?;
         if (g.status == .executing) return self.throwTypeError("generator is already running");
@@ -1352,20 +930,20 @@ pub const Vm = struct {
 
     // ---- object model ------------------------------------------------------
 
-    fn newObject(self: *Vm, prototype: ?*gc.Object) Error!*gc.Object {
+    pub fn newObject(self: *Vm, prototype: ?*gc.Object) Error!*gc.Object {
         self.maybeStress();
         const o = try self.heap.create(gc.Object);
         o.prototype = prototype;
         return o;
     }
-    fn newObjectValue(self: *Vm) Error!Value {
+    pub fn newObjectValue(self: *Vm) Error!Value {
         return Value.fromObject(try self.newObject(self.object_proto));
     }
 
     /// Append the iterated elements of `src` to array `dst`. Arrays copy
     /// directly; everything else goes through the @@iterator protocol (so Sets,
     /// Maps, generators, and custom iterables all work).
-    fn spreadInto(self: *Vm, dst: *gc.Object, src: Value) Error!void {
+    pub fn spreadInto(self: *Vm, dst: *gc.Object, src: Value) Error!void {
         if (src.isObject() and src.asObject().is_array) {
             // Array spread visits 0..length (holes yield `undefined`). `n` is
             // snapshotted so a self-spread appends past the original range.
@@ -1390,7 +968,7 @@ pub const Vm = struct {
 
     /// Collect the enumerable string keys of an object and its prototype chain
     /// (deduplicated), as an array — for `for-in`.
-    fn enumKeys(self: *Vm, base: Value) Error!*gc.Object {
+    pub fn enumKeys(self: *Vm, base: Value) Error!*gc.Object {
         const arr = try self.newArray(0);
         if (!base.isObject()) return arr;
         try self.protect(Value.fromObject(arr));
@@ -1439,7 +1017,7 @@ pub const Vm = struct {
 
     // ---- iteration protocol ------------------------------------------------
 
-    fn makeIterResult(self: *Vm, value: Value, done: bool) Error!Value {
+    pub fn makeIterResult(self: *Vm, value: Value, done: bool) Error!Value {
         const o = try self.newObject(self.object_proto);
         try self.protect(Value.fromObject(o));
         defer self.unprotect();
@@ -1449,7 +1027,7 @@ pub const Vm = struct {
     }
 
     /// A built-in iterator over `target`. kind: 0=values, 1=keys, 2=entries.
-    fn makeIterator(self: *Vm, target: Value, kind: u8) Error!Value {
+    pub fn makeIterator(self: *Vm, target: Value, kind: u8) Error!Value {
         const it = try self.newObject(self.iterator_proto);
         try self.protect(Value.fromObject(it));
         defer self.unprotect();
@@ -1460,7 +1038,7 @@ pub const Vm = struct {
     }
 
     /// GetIterator(obj): obj[@@iterator]().
-    fn getIterator(self: *Vm, iterable: Value) Error!Value {
+    pub fn getIterator(self: *Vm, iterable: Value) Error!Value {
         const method = try self.getProperty(iterable, self.symbol_iterator_key);
         if (!isCallable(method)) return self.throwTypeError("value is not iterable");
         const iter = try self.callValue(method, iterable, &.{});
@@ -1469,14 +1047,14 @@ pub const Vm = struct {
     }
 
     /// IteratorNext(iter): iter.next().
-    fn iteratorNext(self: *Vm, iter: Value) Error!Value {
+    pub fn iteratorNext(self: *Vm, iter: Value) Error!Value {
         const next = try self.getProperty(iter, "next");
         const r = try self.callValue(next, iter, &.{});
         if (!r.isObject()) return self.throwTypeError("iterator result is not an object");
         return r;
     }
 
-    fn iterPair(self: *Vm, a: Value, b: Value) Error!Value {
+    pub fn iterPair(self: *Vm, a: Value, b: Value) Error!Value {
         const arr = try self.newArray(0);
         try self.protect(Value.fromObject(arr));
         defer self.unprotect();
@@ -1484,7 +1062,7 @@ pub const Vm = struct {
         try self.arrayAppend(arr, b);
         return Value.fromObject(arr);
     }
-    fn iterEntryValue(self: *Vm, kind: u8, index: Value, element: Value) Error!Value {
+    pub fn iterEntryValue(self: *Vm, kind: u8, index: Value, element: Value) Error!Value {
         return switch (kind) {
             1 => index, // keys
             2 => self.iterPair(index, element), // entries
@@ -1495,7 +1073,7 @@ pub const Vm = struct {
     /// Create an array of logical length `len`. Elements are absent (holes)
     /// until written — the dense store is not pre-materialized, so
     /// `new Array(1e9)` costs nothing.
-    fn newArray(self: *Vm, len: u32) Error!*gc.Object {
+    pub fn newArray(self: *Vm, len: u32) Error!*gc.Object {
         self.maybeStress();
         const o = try self.heap.create(gc.Object);
         o.prototype = self.array_proto;
@@ -1504,7 +1082,7 @@ pub const Vm = struct {
         return o;
     }
 
-    fn newArrayBuffer(self: *Vm, len: u32) Error!*gc.Object {
+    pub fn newArrayBuffer(self: *Vm, len: u32) Error!*gc.Object {
         self.maybeStress();
         const o = try self.heap.create(gc.Object);
         o.prototype = self.arraybuffer_proto;
@@ -1515,7 +1093,7 @@ pub const Vm = struct {
     }
 
     /// Create a typed-array view object over a (possibly new) buffer.
-    fn newTypedArray(self: *Vm, proto: ?*gc.Object, buffer: *gc.Object, offset: u32, length: u32, kind: gc.TAKind) Error!*gc.Object {
+    pub fn newTypedArray(self: *Vm, proto: ?*gc.Object, buffer: *gc.Object, offset: u32, length: u32, kind: gc.TAKind) Error!*gc.Object {
         self.maybeStress();
         const o = try self.heap.create(gc.Object);
         o.prototype = proto;
@@ -1531,7 +1109,7 @@ pub const Vm = struct {
 
     /// The array's own element at `i`, or null if it's a hole/absent. No
     /// prototype lookup — callers that need the JS `[[Get]]` fall back themselves.
-    fn arrayGetOwn(arr: *gc.Object, i: u32) ?Value {
+    pub fn arrayGetOwn(arr: *gc.Object, i: u32) ?Value {
         if (arr.dictionary_mode) return arr.array_dict.get(i);
         if (i < arr.elements.items.len) {
             const v = arr.elements.items[i];
@@ -1540,17 +1118,17 @@ pub const Vm = struct {
         return null;
     }
 
-    fn arrayHasOwn(arr: *gc.Object, i: u32) bool {
+    pub fn arrayHasOwn(arr: *gc.Object, i: u32) bool {
         return arrayGetOwn(arr, i) != null;
     }
 
-    fn bumpArrayLength(arr: *gc.Object, i: u32) void {
+    pub fn bumpArrayLength(arr: *gc.Object, i: u32) void {
         const want: u64 = @as(u64, i) + 1;
         if (want > arr.array_length) arr.array_length = @intCast(want);
     }
 
     /// Move all present dense elements into the dictionary store and switch mode.
-    fn arrayToDictionary(self: *Vm, arr: *gc.Object) Error!void {
+    pub fn arrayToDictionary(self: *Vm, arr: *gc.Object) Error!void {
         for (arr.elements.items, 0..) |v, idx| {
             if (v.isHole()) continue;
             try arr.array_dict.put(self.gpa, @intCast(idx), v);
@@ -1562,7 +1140,7 @@ pub const Vm = struct {
     /// `arr[i] = value` (an ordinary value, never a hole). Grows the dense store
     /// (filling the gap with holes) for small gaps, else converts to dictionary
     /// mode so a far-out write can't balloon the backing store.
-    fn setArrayElement(self: *Vm, arr: *gc.Object, i: u32, value: Value) Error!void {
+    pub fn setArrayElement(self: *Vm, arr: *gc.Object, i: u32, value: Value) Error!void {
         if (arr.dictionary_mode) {
             try arr.array_dict.put(self.gpa, i, value);
             bumpArrayLength(arr, i);
@@ -1583,12 +1161,12 @@ pub const Vm = struct {
     }
 
     /// Append `value` at the current length.
-    fn arrayAppend(self: *Vm, arr: *gc.Object, value: Value) Error!void {
+    pub fn arrayAppend(self: *Vm, arr: *gc.Object, value: Value) Error!void {
         try self.setArrayElement(arr, arr.array_length, value);
     }
 
     /// Delete the own element at `i` (leaves a hole; length unchanged).
-    fn deleteArrayElement(self: *Vm, arr: *gc.Object, i: u32) void {
+    pub fn deleteArrayElement(self: *Vm, arr: *gc.Object, i: u32) void {
         _ = self;
         if (arr.dictionary_mode) {
             _ = arr.array_dict.remove(i);
@@ -1597,7 +1175,7 @@ pub const Vm = struct {
         }
     }
 
-    fn setArrayLength(self: *Vm, arr: *gc.Object, n: u32) Error!void {
+    pub fn setArrayLength(self: *Vm, arr: *gc.Object, n: u32) Error!void {
         if (arr.dictionary_mode) {
             if (n < arr.array_length) {
                 var doomed: std.ArrayList(u32) = .empty;
@@ -1617,7 +1195,7 @@ pub const Vm = struct {
     /// Collect the present (non-hole) own indices in ascending order. Bounded by
     /// the number of stored elements, never by the logical length — so builtins
     /// stay cheap on sparse arrays. Caller owns `out`.
-    fn arrayPresentIndices(self: *Vm, arr: *gc.Object, out: *std.ArrayList(u32)) Error!void {
+    pub fn arrayPresentIndices(self: *Vm, arr: *gc.Object, out: *std.ArrayList(u32)) Error!void {
         if (arr.dictionary_mode) {
             var it = arr.array_dict.keyIterator();
             while (it.next()) |k| try out.append(self.gpa, k.*);
@@ -1632,7 +1210,7 @@ pub const Vm = struct {
     /// Materialize an array value's 0..length elements (holes -> undefined) into
     /// a fresh gpa buffer, for use as an argument list (`apply`/`Reflect`). The
     /// values stay reachable via the source array; the caller frees the buffer.
-    fn argListFromArray(self: *Vm, v: Value) Error![]Value {
+    pub fn argListFromArray(self: *Vm, v: Value) Error![]Value {
         if (!v.isObject() or !v.asObject().is_array) return self.gpa.alloc(Value, 0);
         const a = v.asObject();
         const buf = try self.gpa.alloc(Value, a.array_length);
@@ -1642,7 +1220,7 @@ pub const Vm = struct {
 
     /// Build a `{value, writable, enumerable, configurable}` descriptor object
     /// (as returned by `Object.getOwnPropertyDescriptor`).
-    fn makeDataDescriptor(self: *Vm, value: Value, w: bool, e: bool, c: bool) Error!Value {
+    pub fn makeDataDescriptor(self: *Vm, value: Value, w: bool, e: bool, c: bool) Error!Value {
         const result = try self.newObject(self.object_proto);
         try self.protect(Value.fromObject(result));
         defer self.unprotect();
@@ -1654,14 +1232,14 @@ pub const Vm = struct {
     }
 
     /// Define an own data property with explicit attributes (key is duplicated).
-    fn defineData(self: *Vm, obj: *gc.Object, key: []const u8, value: Value, w: bool, e: bool, c: bool) Error!void {
+    pub fn defineData(self: *Vm, obj: *gc.Object, key: []const u8, value: Value, w: bool, e: bool, c: bool) Error!void {
         const gop = try obj.properties.getOrPut(self.gpa, key);
         if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, key);
         gop.value_ptr.* = .{ .value = value, .writable = w, .enumerable = e, .configurable = c, .is_accessor = false };
     }
 
     /// [[Get]] on a value: walk the prototype chain; invoke getters.
-    fn getProperty(self: *Vm, base: Value, key: []const u8) Error!Value {
+    pub fn getProperty(self: *Vm, base: Value, key: []const u8) Error!Value {
         if (base.isObject()) {
             if (base.asObject().proxy_target) |target| {
                 const handler = base.asObject().proxy_handler.?;
@@ -1748,7 +1326,7 @@ pub const Vm = struct {
 
     /// [[Set]] on a value: honor setters and writability; create own data
     /// property on the receiver otherwise.
-    fn setProperty(self: *Vm, base: Value, key: []const u8, value: Value) Error!void {
+    pub fn setProperty(self: *Vm, base: Value, key: []const u8, value: Value) Error!void {
         if (base.isObject()) {
             if (base.asObject().proxy_target) |target| {
                 const handler = base.asObject().proxy_handler.?;
@@ -1809,7 +1387,7 @@ pub const Vm = struct {
 
     /// Look up `key` on a prototype chain, invoking getters with `receiver` as
     /// `this`. Used for primitive (string/number) property access.
-    fn getFromProto(self: *Vm, proto: ?*gc.Object, receiver: Value, key: []const u8) Error!Value {
+    pub fn getFromProto(self: *Vm, proto: ?*gc.Object, receiver: Value, key: []const u8) Error!Value {
         var obj = proto;
         while (obj) |o| {
             if (o.properties.getPtr(key)) |desc| {
@@ -1826,7 +1404,7 @@ pub const Vm = struct {
 
     /// [[Delete]]: remove an own property. Returns false only when the property
     /// exists and is non-configurable (per the spec), true otherwise.
-    fn deleteProperty(self: *Vm, base: Value, key: []const u8) bool {
+    pub fn deleteProperty(self: *Vm, base: Value, key: []const u8) bool {
         if (!base.isObject()) return true;
         const o = base.asObject();
         if (o.is_array) {
@@ -1842,7 +1420,7 @@ pub const Vm = struct {
         return true;
     }
 
-    fn hasProperty(self: *Vm, obj: *gc.Object, key: []const u8) bool {
+    pub fn hasProperty(self: *Vm, obj: *gc.Object, key: []const u8) bool {
         _ = self;
         var o: ?*gc.Object = obj;
         while (o) |cur| {
@@ -1858,7 +1436,7 @@ pub const Vm = struct {
         return false;
     }
 
-    fn getGlobal(self: *Vm, name: []const u8, for_typeof: bool) Error!Value {
+    pub fn getGlobal(self: *Vm, name: []const u8, for_typeof: bool) Error!Value {
         const global = self.global_object.?;
         if (self.hasProperty(global, name)) {
             return self.getProperty(Value.fromObject(global), name);
@@ -1867,7 +1445,7 @@ pub const Vm = struct {
         return self.throwReferenceError(name);
     }
 
-    fn instanceOf(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+    pub fn instanceOf(self: *Vm, lhs: Value, rhs: Value) Error!bool {
         if (!rhs.isObject() or rhs.asObject().callable == null) {
             return self.throwTypeError("right-hand side of 'instanceof' is not callable");
         }
@@ -1883,7 +1461,7 @@ pub const Vm = struct {
         return false;
     }
 
-    fn inOperator(self: *Vm, key: Value, obj: Value) Error!bool {
+    pub fn inOperator(self: *Vm, key: Value, obj: Value) Error!bool {
         if (!obj.isObject()) return self.throwTypeError("cannot use 'in' on a non-object");
         const k = try self.toPropertyKey(key);
         defer self.gpa.free(k);
@@ -1899,7 +1477,7 @@ pub const Vm = struct {
         return self.hasProperty(obj.asObject(), k);
     }
 
-    fn toPropertyKey(self: *Vm, v: Value) Error![]u8 {
+    pub fn toPropertyKey(self: *Vm, v: Value) Error![]u8 {
         if (v.isString()) {
             return utf16ToUtf8Alloc(self.gpa, v.asString().units);
         }
@@ -1918,7 +1496,7 @@ pub const Vm = struct {
 
     /// ToPrimitive with a number hint: try valueOf then toString (spec 7.1.1
     /// OrdinaryToPrimitive, number-hint order).
-    fn toPrimitive(self: *Vm, v: Value) Error!Value {
+    pub fn toPrimitive(self: *Vm, v: Value) Error!Value {
         if (!v.isObject()) return v;
         inline for (.{ "valueOf", "toString" }) |method_name| {
             const method = try self.getProperty(v, method_name);
@@ -1932,7 +1510,7 @@ pub const Vm = struct {
 
     // ---- constant materialization ------------------------------------------
 
-    fn materializeConst(self: *Vm, c: bc.Const) Error!Value {
+    pub fn materializeConst(self: *Vm, c: bc.Const) Error!Value {
         switch (c) {
             .number => |n| return Value.fromNumber(n),
             // Constant strings are interned by content (V8-style heap
@@ -1953,7 +1531,7 @@ pub const Vm = struct {
         }
     }
 
-    fn makeString(self: *Vm, utf8: []const u8) Error!Value {
+    pub fn makeString(self: *Vm, utf8: []const u8) Error!Value {
         self.maybeStress();
         const s = try self.heap.create(gc.String);
         s.units = std.unicode.utf8ToUtf16LeAlloc(self.gpa, utf8) catch |e| switch (e) {
@@ -1963,14 +1541,14 @@ pub const Vm = struct {
         return Value.fromString(s);
     }
 
-    fn makeStringFromUtf16(self: *Vm, units: []const u16) Error!Value {
+    pub fn makeStringFromUtf16(self: *Vm, units: []const u16) Error!Value {
         self.maybeStress();
         const s = try self.heap.create(gc.String);
         s.units = try self.gpa.dupe(u16, units);
         return Value.fromString(s);
     }
 
-    fn makeSymbol(self: *Vm, description: ?[]const u8) Error!Value {
+    pub fn makeSymbol(self: *Vm, description: ?[]const u8) Error!Value {
         self.maybeStress();
         const s = try self.heap.create(gc.Symbol);
         if (description) |d| {
@@ -1984,7 +1562,7 @@ pub const Vm = struct {
 
     // ---- coercions ---------------------------------------------------------
 
-    fn toNumber(self: *Vm, v: Value) Error!f64 {
+    pub fn toNumber(self: *Vm, v: Value) Error!f64 {
         return switch (v) {
             .undefined => std.math.nan(f64),
             .null => 0,
@@ -1998,16 +1576,16 @@ pub const Vm = struct {
         };
     }
 
-    fn toInt32(self: *Vm, v: Value) Error!i32 {
+    pub fn toInt32(self: *Vm, v: Value) Error!i32 {
         const n = try self.toNumber(v);
         return doubleToInt32(n);
     }
-    fn toUint32(self: *Vm, v: Value) Error!u32 {
+    pub fn toUint32(self: *Vm, v: Value) Error!u32 {
         const n = try self.toNumber(v);
         return @bitCast(doubleToInt32(n));
     }
 
-    fn opAdd(self: *Vm, l: Value, r: Value) Error!Value {
+    pub fn opAdd(self: *Vm, l: Value, r: Value) Error!Value {
         const lp = try self.toPrimitive(l);
         try self.protect(lp);
         defer self.unprotect();
@@ -2027,7 +1605,7 @@ pub const Vm = struct {
         return Value.fromNumber((try self.toNumber(lp)) + (try self.toNumber(rp)));
     }
 
-    fn concat(self: *Vm, a: []const u16, b: []const u16) Error!Value {
+    pub fn concat(self: *Vm, a: []const u16, b: []const u16) Error!Value {
         self.maybeStress();
         const s = try self.heap.create(gc.String);
         const units = try self.gpa.alloc(u16, a.len + b.len);
@@ -2039,7 +1617,7 @@ pub const Vm = struct {
 
     /// ToString as a string `Value` (so callers can root it). Objects go
     /// through ToPrimitive(string) first.
-    fn toStringVal(self: *Vm, v: Value) Error!Value {
+    pub fn toStringVal(self: *Vm, v: Value) Error!Value {
         const p = if (v.isObject()) try self.toPrimitive(v) else v;
         if (p.isString()) return p;
         var buf: [64]u8 = undefined;
@@ -2047,7 +1625,7 @@ pub const Vm = struct {
         return self.makeString(utf8);
     }
 
-    fn primitiveToUtf8(self: *Vm, v: Value, buf: []u8) ![]const u8 {
+    pub fn primitiveToUtf8(self: *Vm, v: Value, buf: []u8) ![]const u8 {
         _ = self;
         return switch (v) {
             .undefined => "undefined",
@@ -2062,7 +1640,7 @@ pub const Vm = struct {
         };
     }
 
-    fn typeOf(self: *Vm, v: Value) Error!Value {
+    pub fn typeOf(self: *Vm, v: Value) Error!Value {
         const name: []const u8 = switch (v) {
             .undefined => "undefined",
             .null => "object",
@@ -2079,12 +1657,12 @@ pub const Vm = struct {
 
     // ---- equality & comparison ---------------------------------------------
 
-    fn strictEquals(self: *const Vm, a: Value, b: Value) bool {
+    pub fn strictEquals(self: *const Vm, a: Value, b: Value) bool {
         _ = self;
         return sameTypeStrictEq(a, b);
     }
 
-    fn looseEquals(self: *Vm, a: Value, b: Value) Error!bool {
+    pub fn looseEquals(self: *Vm, a: Value, b: Value) Error!bool {
         // Same-type: strict semantics.
         if (@intFromEnum(std.meta.activeTag(a)) == @intFromEnum(std.meta.activeTag(b))) {
             return sameTypeStrictEq(a, b);
@@ -2100,7 +1678,7 @@ pub const Vm = struct {
 
     const Cmp = enum { lt, le, gt, ge };
 
-    fn compare(self: *Vm, a: Value, b: Value, op: Cmp) Error!bool {
+    pub fn compare(self: *Vm, a: Value, b: Value, op: Cmp) Error!bool {
         if (a.isString() and b.isString()) {
             const order = compareUtf16(a.asString().units, b.asString().units);
             return switch (op) {
@@ -2124,7 +1702,7 @@ pub const Vm = struct {
     // ---- error throwing (placeholder string errors) ------------------------
 
     /// Throw a real Error object with the given prototype and message.
-    fn throwError(self: *Vm, proto: ?*gc.Object, msg: []const u8) Error {
+    pub fn throwError(self: *Vm, proto: ?*gc.Object, msg: []const u8) Error {
         const obj = self.makeError(proto, msg) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.JsThrow,
@@ -2132,16 +1710,16 @@ pub const Vm = struct {
         self.pending_exception = Value.fromObject(obj);
         return error.JsThrow;
     }
-    fn throwTypeError(self: *Vm, msg: []const u8) Error {
+    pub fn throwTypeError(self: *Vm, msg: []const u8) Error {
         return self.throwError(self.type_error_proto, msg);
     }
-    fn throwRangeError(self: *Vm, msg: []const u8) Error {
+    pub fn throwRangeError(self: *Vm, msg: []const u8) Error {
         return self.throwError(self.range_error_proto, msg);
     }
-    fn throwReferenceError(self: *Vm, msg: []const u8) Error {
+    pub fn throwReferenceError(self: *Vm, msg: []const u8) Error {
         return self.throwError(self.reference_error_proto, msg);
     }
-    fn throwSyntaxError(self: *Vm, msg: []const u8) Error {
+    pub fn throwSyntaxError(self: *Vm, msg: []const u8) Error {
         return self.throwError(self.syntax_error_proto, msg);
     }
 
@@ -2151,7 +1729,7 @@ pub const Vm = struct {
     /// the value has no JSON representation (undefined/function/symbol) and
     /// should be omitted. `stack` detects cycles. Indentation (`space`) is not
     /// yet supported.
-    const JsonCtx = struct {
+    pub const JsonCtx = struct {
         out: *std.ArrayList(u8),
         stack: *std.ArrayList(*gc.Object),
         indent: *std.ArrayList(u8),
@@ -2161,7 +1739,7 @@ pub const Vm = struct {
     };
 
     /// SerializeJSONProperty: read holder[key], apply toJSON + replacer, emit.
-    fn jsonSerializeProperty(self: *Vm, ctx: JsonCtx, holder: Value, key: []const u8) Error!bool {
+    pub fn jsonSerializeProperty(self: *Vm, ctx: JsonCtx, holder: Value, key: []const u8) Error!bool {
         var value = try self.getProperty(holder, key);
         if (value.isObject()) {
             const to_json = try self.getProperty(value, "toJSON");
@@ -2181,7 +1759,7 @@ pub const Vm = struct {
         return self.jsonSerializeValue(ctx, value);
     }
 
-    fn jsonSerializeValue(self: *Vm, ctx: JsonCtx, value: Value) Error!bool {
+    pub fn jsonSerializeValue(self: *Vm, ctx: JsonCtx, value: Value) Error!bool {
         switch (value) {
             .undefined, .symbol => return false,
             .null => try ctx.out.appendSlice(self.gpa, "null"),
@@ -2210,13 +1788,13 @@ pub const Vm = struct {
         return true;
     }
 
-    fn newlineIndent(self: *Vm, ctx: JsonCtx, to_len: usize) Error!void {
+    pub fn newlineIndent(self: *Vm, ctx: JsonCtx, to_len: usize) Error!void {
         if (ctx.gap.len == 0) return;
         try ctx.out.append(self.gpa, '\n');
         try ctx.out.appendSlice(self.gpa, ctx.indent.items[0..to_len]);
     }
 
-    fn jsonArray(self: *Vm, ctx: JsonCtx, o: *gc.Object) Error!void {
+    pub fn jsonArray(self: *Vm, ctx: JsonCtx, o: *gc.Object) Error!void {
         try ctx.out.append(self.gpa, '[');
         const prev = ctx.indent.items.len;
         try ctx.indent.appendSlice(self.gpa, ctx.gap);
@@ -2235,7 +1813,7 @@ pub const Vm = struct {
         try ctx.out.append(self.gpa, ']');
     }
 
-    fn jsonObject(self: *Vm, ctx: JsonCtx, holder: Value, o: *gc.Object) Error!void {
+    pub fn jsonObject(self: *Vm, ctx: JsonCtx, holder: Value, o: *gc.Object) Error!void {
         try ctx.out.append(self.gpa, '{');
         const prev = ctx.indent.items.len;
         try ctx.indent.appendSlice(self.gpa, ctx.gap);
@@ -2272,18 +1850,18 @@ pub const Vm = struct {
         try ctx.out.append(self.gpa, '}');
     }
 
-    fn jsonQuote(self: *Vm, out: *std.ArrayList(u8), units: []const u16) Error!void {
+    pub fn jsonQuote(self: *Vm, out: *std.ArrayList(u8), units: []const u16) Error!void {
         try out.append(self.gpa, '"');
         for (units) |u| try appendJsonChar(self.gpa, out, u);
         try out.append(self.gpa, '"');
     }
-    fn jsonQuoteBytes(self: *Vm, out: *std.ArrayList(u8), bytes: []const u8) Error!void {
+    pub fn jsonQuoteBytes(self: *Vm, out: *std.ArrayList(u8), bytes: []const u8) Error!void {
         try out.append(self.gpa, '"');
         for (bytes) |b| try appendJsonChar(self.gpa, out, b);
         try out.append(self.gpa, '"');
     }
 
-    fn jsonParse(self: *Vm, text: []const u8, reviver: Value) Error!Value {
+    pub fn jsonParse(self: *Vm, text: []const u8, reviver: Value) Error!Value {
         var p = JsonParser{ .vm = self, .s = text, .i = 0 };
         p.skipWs();
         const v = try p.parseValue();
@@ -2298,7 +1876,7 @@ pub const Vm = struct {
         return self.internalizeJSON(Value.fromObject(holder), "", reviver);
     }
 
-    fn internalizeJSON(self: *Vm, holder: Value, key: []const u8, reviver: Value) Error!Value {
+    pub fn internalizeJSON(self: *Vm, holder: Value, key: []const u8, reviver: Value) Error!Value {
         const val = try self.getProperty(holder, key);
         if (val.isObject()) {
             const o = val.asObject();
@@ -2333,4860 +1911,3 @@ pub const Vm = struct {
         return self.callValue(reviver, holder, &.{ ks, val });
     }
 };
-
-// ---- free helpers ----------------------------------------------------------
-
-fn sameTypeStrictEq(a: Value, b: Value) bool {
-    return switch (a) {
-        .undefined => b.isUndefined(),
-        .null => b.isNull(),
-        .boolean => |x| b.isBoolean() and x == b.asBool(),
-        .number => |x| b.isNumber() and x == b.asNumber(), // NaN != NaN, +0 == -0
-        .string => |x| b.isString() and std.mem.eql(u16, x.units, b.asString().units),
-        .bigint => |x| b.isBigInt() and x.value == b.asBigInt().value,
-        .symbol => |x| b.isSymbol() and x == b.asSymbol(),
-        .object => |x| b.isObject() and x == b.asObject(),
-        .hole => unreachable,
-    };
-}
-
-pub fn toBoolean(v: Value) bool {
-    return switch (v) {
-        .undefined, .null => false,
-        .boolean => |b| b,
-        .number => |n| n != 0 and !std.math.isNan(n),
-        .string => |s| s.units.len != 0,
-        .bigint => |b| b.value != 0,
-        .symbol, .object => true,
-        .hole => unreachable,
-    };
-}
-
-fn jsMod(a: f64, b: f64) f64 {
-    return @rem(a, b);
-}
-
-fn jsShl(a: i32, count: u32) i32 {
-    const x: u32 = @bitCast(a);
-    const sh: u5 = @intCast(count & 31);
-    return @bitCast(@as(u32, @truncate(@as(u64, x) << sh)));
-}
-fn jsShr(a: i32, count: u32) i32 {
-    const sh: u5 = @intCast(count & 31);
-    return a >> sh;
-}
-fn jsUshr(a: i32, count: u32) u32 {
-    const x: u32 = @bitCast(a);
-    const sh: u5 = @intCast(count & 31);
-    return x >> sh;
-}
-
-/// JS `Number::exponentiate` — differs from C `pow` on a few edge cases
-/// (`x**±0` is 1 even for NaN x; `(±1)**±Infinity` is NaN).
-fn jsPow(base: f64, exp: f64) f64 {
-    if (std.math.isNan(exp)) return std.math.nan(f64);
-    if (exp == 0) return 1;
-    if (std.math.isNan(base)) return std.math.nan(f64);
-    if (std.math.isInf(exp)) {
-        const ab = @abs(base);
-        if (ab == 1) return std.math.nan(f64);
-        if (exp > 0) return if (ab > 1) std.math.inf(f64) else 0;
-        return if (ab > 1) 0 else std.math.inf(f64);
-    }
-    return std.math.pow(f64, base, exp);
-}
-
-fn doubleToInt32(n: f64) i32 {
-    if (std.math.isNan(n) or std.math.isInf(n)) return 0;
-    const truncated = std.math.trunc(n);
-    const modulo = @mod(truncated, 4294967296.0);
-    const as_u32: u32 = @intFromFloat(if (modulo < 0) modulo + 4294967296.0 else modulo);
-    return @bitCast(as_u32);
-}
-
-fn stringToNumber(units: []const u16) f64 {
-    // Convert to ASCII, trim, parse. Non-ASCII or malformed -> NaN.
-    var buf: [64]u8 = undefined;
-    if (units.len == 0) return 0;
-    if (units.len >= buf.len) return std.math.nan(f64);
-    var n: usize = 0;
-    for (units) |u| {
-        if (u > 127) return std.math.nan(f64);
-        buf[n] = @intCast(u);
-        n += 1;
-    }
-    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
-    if (trimmed.len == 0) return 0;
-    if (std.mem.eql(u8, trimmed, "Infinity") or std.mem.eql(u8, trimmed, "+Infinity")) return std.math.inf(f64);
-    if (std.mem.eql(u8, trimmed, "-Infinity")) return -std.math.inf(f64);
-    const compiler = @import("compiler.zig");
-    return compiler.parseNumber(trimmed) catch std.math.nan(f64);
-}
-
-fn numberToString(n: f64, buf: []u8) []const u8 {
-    if (std.math.isNan(n)) return "NaN";
-    if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
-    if (n == 0) return "0";
-    // Integer fast path only when the value fits safely in i64.
-    if (n == std.math.trunc(n) and @abs(n) < 9.0e18) {
-        return std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(n))}) catch "0";
-    }
-    return std.fmt.bufPrint(buf, "{d}", .{n}) catch "0";
-}
-
-// ---- native built-in functions ---------------------------------------------
-
-fn castVm(ctx: *anyopaque) *Vm {
-    return @ptrCast(@alignCast(ctx));
-}
-fn argAt(args: []const Value, i: usize) Value {
-    return if (i < args.len) args[i] else Value.undefined_value;
-}
-
-fn nativeError(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const obj = if (this.isObject() and this.asObject() != vm.global_object)
-        this.asObject()
-    else
-        try vm.newObject(vm.error_proto);
-    try vm.protect(Value.fromObject(obj));
-    defer vm.unprotect();
-    const msg = argAt(args, 0);
-    if (!msg.isUndefined()) {
-        const s = try vm.toStringVal(msg);
-        try vm.defineData(obj, "message", s, true, false, true);
-    }
-    return Value.fromObject(obj);
-}
-
-fn nativeErrorToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (!this.isObject()) return vm.throwTypeError("Error.prototype.toString called on non-object");
-    const name_v = try vm.getProperty(this, "name");
-    const name = try vm.toStringVal(name_v);
-    try vm.protect(name);
-    defer vm.unprotect();
-    const msg_v = try vm.getProperty(this, "message");
-    const msg = try vm.toStringVal(msg_v);
-    try vm.protect(msg);
-    defer vm.unprotect();
-    if (msg.asString().units.len == 0) return name;
-    if (name.asString().units.len == 0) return msg;
-    // name + ": " + message
-    const sep = try vm.makeString(": ");
-    try vm.protect(sep);
-    defer vm.unprotect();
-    const first = try vm.concat(name.asString().units, sep.asString().units);
-    try vm.protect(first);
-    defer vm.unprotect();
-    return vm.concat(first.asString().units, msg.asString().units);
-}
-
-fn nativeObject(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    _ = this;
-    const v = argAt(args, 0);
-    if (v.isObject()) return v;
-    if (v.isNullish()) return Value.fromObject(try vm.newObject(vm.object_proto));
-    // ToObject for primitives (wrapper objects) is not implemented; return a
-    // fresh object so Object(x) at least yields an object.
-    return Value.fromObject(try vm.newObject(vm.object_proto));
-}
-
-fn nativeObjectToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    return switch (this) {
-        .undefined => vm.makeString("[object Undefined]"),
-        .null => vm.makeString("[object Null]"),
-        else => vm.makeString("[object Object]"),
-    };
-}
-
-fn nativeObjectValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = args;
-    return this;
-}
-
-fn nativeHasOwnProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const key = try vm.toPropertyKey(argAt(args, 0));
-    defer vm.gpa.free(key);
-    if (this.isString()) {
-        // String primitive: indices and `length` are own properties.
-        if (std.mem.eql(u8, key, "length")) return Value.fromBool(true);
-        if (arrayIndex(key)) |i| return Value.fromBool(i < this.asString().units.len);
-        return Value.fromBool(false);
-    }
-    if (!this.isObject()) return Value.fromBool(false);
-    const o = this.asObject();
-    if (o.is_array) {
-        if (std.mem.eql(u8, key, "length")) return Value.fromBool(true);
-        if (arrayIndex(key)) |i| {
-            if (Vm.arrayHasOwn(o, i)) return Value.fromBool(true);
-        }
-    }
-    // String wrapper: the boxed string's indices are own properties.
-    if (o.properties.get(prim_key)) |d| {
-        if (d.value.isString()) {
-            if (arrayIndex(key)) |i| return Value.fromBool(i < d.value.asString().units.len);
-        }
-    }
-    return Value.fromBool(o.properties.contains(key));
-}
-
-fn nativeIsPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    const v = argAt(args, 0);
-    if (!this.isObject() or !v.isObject()) return Value.fromBool(false);
-    const target = this.asObject();
-    var o: ?*gc.Object = v.asObject().prototype;
-    while (o) |cur| {
-        if (cur == target) return Value.fromBool(true);
-        o = cur.prototype;
-    }
-    return Value.fromBool(false);
-}
-
-fn nativeObjectGetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    _ = this;
-    const v = argAt(args, 0);
-    if (!v.isObject()) return vm.throwTypeError("Object.getPrototypeOf called on non-object");
-    return if (v.asObject().prototype) |p| Value.fromObject(p) else Value.null_value;
-}
-
-fn nativeObjectCreate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    _ = this;
-    const proto_arg = argAt(args, 0);
-    const proto: ?*gc.Object = if (proto_arg.isObject()) proto_arg.asObject() else if (proto_arg.isNull()) null else return vm.throwTypeError("Object prototype may only be an Object or null");
-    return Value.fromObject(try vm.newObject(proto));
-}
-
-/// Parse a JS property-descriptor object and define `key` on `obj` with it
-/// (shared by Object.defineProperty / Object.defineProperties).
-fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value) Error!void {
-    if (!desc_v.isObject()) return vm.throwTypeError("property descriptor must be an object");
-    var desc = gc.PropertyDescriptor{ .enumerable = false, .writable = false, .configurable = false };
-    const get_v = try vm.getProperty(desc_v, "get");
-    const set_v = try vm.getProperty(desc_v, "set");
-    if (get_v.isObject() or set_v.isObject()) {
-        desc.is_accessor = true;
-        desc.get = if (get_v.isObject()) get_v else null;
-        desc.set = if (set_v.isObject()) set_v else null;
-    } else {
-        desc.value = try vm.getProperty(desc_v, "value");
-        desc.writable = toBoolean(try vm.getProperty(desc_v, "writable"));
-    }
-    desc.enumerable = toBoolean(try vm.getProperty(desc_v, "enumerable"));
-    desc.configurable = toBoolean(try vm.getProperty(desc_v, "configurable"));
-
-    const gop = try obj.properties.getOrPut(vm.gpa, key);
-    if (!gop.found_existing) gop.key_ptr.* = try vm.gpa.dupe(u8, key);
-    gop.value_ptr.* = desc;
-}
-
-fn nativeObjectDefineProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    _ = this;
-    const obj_v = argAt(args, 0);
-    if (!obj_v.isObject()) return vm.throwTypeError("Object.defineProperty called on non-object");
-    const key = try vm.toPropertyKey(argAt(args, 1));
-    defer vm.gpa.free(key);
-    try applyDescriptor(vm, obj_v.asObject(), key, argAt(args, 2));
-    return obj_v;
-}
-
-fn nativeObjectDefineProperties(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    _ = this;
-    const obj_v = argAt(args, 0);
-    if (!obj_v.isObject()) return vm.throwTypeError("Object.defineProperties called on non-object");
-    const props_v = argAt(args, 1);
-    if (!props_v.isObject()) return vm.throwTypeError("properties argument must be an object");
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (keys.items) |k| vm.gpa.free(k);
-        keys.deinit(vm.gpa);
-    }
-    try ownEnumerableKeys(vm, props_v.asObject(), &keys);
-    for (keys.items) |k| {
-        try applyDescriptor(vm, obj_v.asObject(), k, try vm.getProperty(props_v, k));
-    }
-    return obj_v;
-}
-
-fn nativeObjectPreventExtensions(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    if (v.isObject()) v.asObject().extensible = false;
-    return v; // ES2015: non-objects pass through
-}
-
-fn nativeObjectIsExtensible(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    return Value.fromBool(v.isObject() and v.asObject().extensible);
-}
-
-fn nativeObjectSeal(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    if (v.isObject()) {
-        const o = v.asObject();
-        o.extensible = false;
-        var it = o.properties.iterator();
-        while (it.next()) |entry| entry.value_ptr.configurable = false;
-    }
-    return v;
-}
-
-fn nativeObjectIsSealed(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    if (!v.isObject()) return Value.fromBool(true);
-    const o = v.asObject();
-    if (o.extensible) return Value.fromBool(false);
-    var it = o.properties.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.configurable) return Value.fromBool(false);
-    }
-    return Value.fromBool(true);
-}
-
-fn nativeObjectFreeze(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    if (v.isObject()) {
-        const o = v.asObject();
-        o.extensible = false;
-        var it = o.properties.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.configurable = false;
-            if (!entry.value_ptr.is_accessor) entry.value_ptr.writable = false;
-        }
-    }
-    return v;
-}
-
-fn nativeObjectIsFrozen(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    if (!v.isObject()) return Value.fromBool(true);
-    const o = v.asObject();
-    if (o.extensible) return Value.fromBool(false);
-    var it = o.properties.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.configurable) return Value.fromBool(false);
-        if (!entry.value_ptr.is_accessor and entry.value_ptr.writable) return Value.fromBool(false);
-    }
-    return Value.fromBool(true);
-}
-
-fn nativeObjectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    _ = this;
-    const obj_v = argAt(args, 0);
-    const key = try vm.toPropertyKey(argAt(args, 1));
-    defer vm.gpa.free(key);
-    if (!obj_v.isObject()) {
-        // ES2015 ToObject semantics: null/undefined throw; a string primitive
-        // exposes index/length own properties; other primitives have none.
-        if (obj_v.isNullish()) return vm.throwTypeError("Object.getOwnPropertyDescriptor called on null or undefined");
-        if (obj_v.isString()) {
-            const su = obj_v.asString().units;
-            if (std.mem.eql(u8, key, "length")) {
-                return vm.makeDataDescriptor(Value.fromNumber(@floatFromInt(su.len)), false, false, false);
-            }
-            if (arrayIndex(key)) |i| {
-                if (i < su.len) return vm.makeDataDescriptor(try vm.makeStringFromUtf16(su[i .. i + 1]), false, true, false);
-            }
-        }
-        return Value.undefined_value;
-    }
-    // Array exotic own properties: indices and `length` don't live in the map.
-    const o = obj_v.asObject();
-    // String wrapper: indexed own properties read the boxed [[StringData]].
-    if (o.properties.get(prim_key)) |d| {
-        if (d.value.isString()) {
-            if (arrayIndex(key)) |i| {
-                const su = d.value.asString().units;
-                if (i < su.len) return vm.makeDataDescriptor(try vm.makeStringFromUtf16(su[i .. i + 1]), false, true, false);
-                return Value.undefined_value;
-            }
-        }
-    }
-    if (o.is_array) {
-        if (std.mem.eql(u8, key, "length")) {
-            return vm.makeDataDescriptor(Value.fromNumber(@floatFromInt(o.array_length)), true, false, false);
-        }
-        if (arrayIndex(key)) |i| {
-            if (Vm.arrayGetOwn(o, i)) |v| return vm.makeDataDescriptor(v, true, true, true);
-            return Value.undefined_value;
-        }
-    }
-    const desc = o.properties.get(key) orelse return Value.undefined_value;
-    const result = try vm.newObject(vm.object_proto);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    if (desc.is_accessor) {
-        try vm.defineData(result, "get", desc.get orelse Value.undefined_value, true, true, true);
-        try vm.defineData(result, "set", desc.set orelse Value.undefined_value, true, true, true);
-    } else {
-        try vm.defineData(result, "value", desc.value, true, true, true);
-        try vm.defineData(result, "writable", Value.fromBool(desc.writable), true, true, true);
-    }
-    try vm.defineData(result, "enumerable", Value.fromBool(desc.enumerable), true, true, true);
-    try vm.defineData(result, "configurable", Value.fromBool(desc.configurable), true, true, true);
-    return Value.fromObject(result);
-}
-
-fn nativeString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const s = if (args.len == 0) try vm.makeString("") else try vm.toStringVal(args[0]);
-    // As a constructor, `this` is a fresh object inheriting String.prototype:
-    // store [[StringData]] so wrapper coercions and methods reach the primitive.
-    if (this.isObject() and this.asObject().prototype == vm.string_proto) {
-        try vm.protect(s);
-        defer vm.unprotect();
-        try vm.defineData(this.asObject(), prim_key, s, false, false, false);
-        try vm.defineData(this.asObject(), "length", Value.fromNumber(@floatFromInt(s.asString().units.len)), false, false, false);
-    }
-    return s;
-}
-
-fn nativeNumber(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const n: f64 = if (args.len == 0) 0 else try vm.toNumber(args[0]);
-    if (this.isObject() and this.asObject().prototype == vm.number_proto) {
-        try vm.defineData(this.asObject(), prim_key, Value.fromNumber(n), false, false, false);
-    }
-    return Value.fromNumber(n);
-}
-
-fn nativeBoolean(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const b = toBoolean(argAt(args, 0));
-    if (this.isObject() and this.asObject().prototype == vm.boolean_proto) {
-        try vm.defineData(this.asObject(), prim_key, Value.fromBool(b), false, false, false);
-    }
-    return Value.fromBool(b);
-}
-
-fn thisBoolean(vm: *Vm, this: Value) Error!bool {
-    if (this.isBoolean()) return this.asBool();
-    if (this.isObject()) {
-        if (this.asObject().properties.get(prim_key)) |d| {
-            if (d.value.isBoolean()) return d.value.asBool();
-        }
-    }
-    return vm.throwTypeError("Boolean.prototype method called on non-boolean");
-}
-
-fn nativeBooleanToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    return vm.makeString(if (try thisBoolean(vm, this)) "true" else "false");
-}
-
-fn nativeBooleanValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return Value.fromBool(try thisBoolean(castVm(ctx), this));
-}
-
-fn mathUnary(ctx: *anyopaque, args: []const Value, comptime op: anytype) Error!Value {
-    const vm = castVm(ctx);
-    const x: f64 = try vm.toNumber(argAt(args, 0));
-    return Value.fromNumber(op(x));
-}
-fn nativeMathAbs(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    return mathUnary(ctx, args, struct {
-        fn f(x: f64) f64 {
-            return @abs(x);
-        }
-    }.f);
-}
-fn nativeMathFloor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    return mathUnary(ctx, args, std.math.floor);
-}
-fn nativeMathCeil(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    return mathUnary(ctx, args, std.math.ceil);
-}
-fn nativeMathRound(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    return mathUnary(ctx, args, struct {
-        fn f(x: f64) f64 {
-            if (std.math.isNan(x) or std.math.isInf(x) or x == 0) return x; // preserves -0
-            // floor(x) + (fractional >= 0.5 ? 1 : 0); avoids the x+0.5
-            // double-rounding pitfall. Ties round toward +Infinity.
-            const fl = std.math.floor(x);
-            const result = if (x - fl >= 0.5) fl + 1 else fl;
-            // Values in [-0.5, 0) round to -0, not +0.
-            if (result == 0 and x < 0) return -0.0;
-            return result;
-        }
-    }.f);
-}
-fn nativeMathTrunc(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    return mathUnary(ctx, args, std.math.trunc);
-}
-fn nativeMathSqrt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    return mathUnary(ctx, args, std.math.sqrt);
-}
-fn nativeMathSign(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    return mathUnary(ctx, args, struct {
-        fn f(x: f64) f64 {
-            if (std.math.isNan(x)) return x;
-            if (x > 0) return 1;
-            if (x < 0) return -1;
-            return x; // +/-0
-        }
-    }.f);
-}
-fn nativeMathPow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const base = try vm.toNumber(argAt(args, 0));
-    const exp = try vm.toNumber(argAt(args, 1));
-    return Value.fromNumber(jsPow(base, exp));
-}
-fn isNegZero(x: f64) bool {
-    return x == 0 and std.math.signbit(x);
-}
-fn nativeMathMax(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    var result: f64 = -std.math.inf(f64);
-    var saw_nan = false;
-    // Spec: coerce every argument (side effects) before deciding.
-    for (args) |a| {
-        const n = try vm.toNumber(a);
-        if (std.math.isNan(n)) {
-            saw_nan = true;
-        } else if (n > result or (n == 0 and result == 0 and isNegZero(result) and !isNegZero(n))) {
-            result = n; // +0 is greater than -0
-        }
-    }
-    return Value.fromNumber(if (saw_nan) std.math.nan(f64) else result);
-}
-fn nativeMathMin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    var result: f64 = std.math.inf(f64);
-    var saw_nan = false;
-    for (args) |a| {
-        const n = try vm.toNumber(a);
-        if (std.math.isNan(n)) {
-            saw_nan = true;
-        } else if (n < result or (n == 0 and result == 0 and !isNegZero(result) and isNegZero(n))) {
-            result = n; // -0 is less than +0
-        }
-    }
-    return Value.fromNumber(if (saw_nan) std.math.nan(f64) else result);
-}
-fn nativeIsNaN(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    return Value.fromBool(std.math.isNan(try vm.toNumber(argAt(args, 0))));
-}
-fn nativeIsFinite(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const n = try vm.toNumber(argAt(args, 0));
-    return Value.fromBool(!std.math.isNan(n) and !std.math.isInf(n));
-}
-
-/// Build a native for a unary Math function from a `fn(f64) f64`.
-fn mathUnaryFn(comptime op: anytype) gc.NativeFn {
-    return struct {
-        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-            _ = this;
-            return mathUnary(ctx, args, op);
-        }
-    }.call;
-}
-
-fn opSin(x: f64) f64 {
-    return @sin(x);
-}
-fn opCos(x: f64) f64 {
-    return @cos(x);
-}
-fn opTan(x: f64) f64 {
-    return std.math.tan(x);
-}
-fn opAsin(x: f64) f64 {
-    return std.math.asin(x);
-}
-fn opAcos(x: f64) f64 {
-    return std.math.acos(x);
-}
-fn opAtan(x: f64) f64 {
-    return std.math.atan(x);
-}
-fn opSinh(x: f64) f64 {
-    return std.math.sinh(x);
-}
-fn opCosh(x: f64) f64 {
-    return std.math.cosh(x);
-}
-fn opTanh(x: f64) f64 {
-    return std.math.tanh(x);
-}
-fn opAsinh(x: f64) f64 {
-    return std.math.asinh(x);
-}
-fn opAcosh(x: f64) f64 {
-    return std.math.acosh(x);
-}
-fn opAtanh(x: f64) f64 {
-    return std.math.atanh(x);
-}
-fn opExp(x: f64) f64 {
-    return @exp(x);
-}
-fn opExpm1(x: f64) f64 {
-    return std.math.expm1(x);
-}
-fn opLog(x: f64) f64 {
-    return @log(x);
-}
-fn opLog2(x: f64) f64 {
-    return @log2(x);
-}
-fn opLog10(x: f64) f64 {
-    return @log10(x);
-}
-fn opLog1p(x: f64) f64 {
-    return std.math.log1p(x);
-}
-fn opCbrt(x: f64) f64 {
-    return std.math.cbrt(x);
-}
-fn opFround(x: f64) f64 {
-    return @floatCast(@as(f32, @floatCast(x)));
-}
-
-fn nativeMathAtan2(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const y = try vm.toNumber(argAt(args, 0));
-    const x = try vm.toNumber(argAt(args, 1));
-    return Value.fromNumber(std.math.atan2(y, x));
-}
-fn nativeMathHypot(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    var sum: f64 = 0;
-    var any_inf = false;
-    for (args) |a| {
-        const n = try vm.toNumber(a);
-        if (std.math.isInf(n)) any_inf = true;
-        sum += n * n;
-    }
-    // ±Infinity in any argument yields +Infinity, even alongside NaN.
-    if (any_inf) return Value.fromNumber(std.math.inf(f64));
-    return Value.fromNumber(@sqrt(sum));
-}
-fn nativeMathClz32(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const n = try vm.toUint32(argAt(args, 0));
-    return Value.fromNumber(@floatFromInt(@as(u32, @clz(n))));
-}
-fn nativeMathImul(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const a = try vm.toInt32(argAt(args, 0));
-    const b = try vm.toInt32(argAt(args, 1));
-    return Value.fromNumber(@floatFromInt(a *% b));
-}
-
-var math_prng = std.Random.DefaultPrng.init(0x2545F4914F6CDD1D);
-fn nativeMathRandom(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    _ = args;
-    return Value.fromNumber(math_prng.random().float(f64));
-}
-
-// ---- Array built-ins -------------------------------------------------------
-
-fn isCallable(v: Value) bool {
-    return v.isObject() and v.asObject().callable != null;
-}
-
-/// IsConstructor: true iff `v` is a callable object that implements
-/// [[Construct]]. A proxy defers to its target/handler, so treat it as a
-/// constructor here and let `constructValue` validate.
-fn isConstructorValue(v: Value) bool {
-    if (!v.isObject()) return false;
-    const obj = v.asObject();
-    if (obj.proxy_target != null) return true;
-    if (obj.bound_target) |bt| return isConstructorValue(bt);
-    const clo = obj.callable orelse return false;
-    return clo.constructor;
-}
-
-fn thisArray(vm: *Vm, this: Value) Error!*gc.Object {
-    if (!this.isObject() or !this.asObject().is_array) {
-        return vm.throwTypeError("Array.prototype method called on a non-array");
-    }
-    return this.asObject();
-}
-
-fn nativeArray(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    if (args.len == 1 and args[0].isNumber()) {
-        const n = args[0].asNumber();
-        const len: u32 = if (n < 0 or n != std.math.floor(n) or n > 4294967295) return vm.throwRangeError("invalid array length") else @intFromFloat(n);
-        return Value.fromObject(try vm.newArray(len));
-    }
-    const arr = try vm.newArray(0);
-    try vm.protect(Value.fromObject(arr));
-    defer vm.unprotect();
-    for (args, 0..) |a, i| try vm.setArrayElement(arr, @intCast(i), a);
-    return Value.fromObject(arr);
-}
-
-fn nativeArrayIsArray(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    return Value.fromBool(v.isObject() and v.asObject().is_array);
-}
-
-/// Append `src`'s elements (0..length, preserving holes) to `dst`.
-fn appendArrayElements(vm: *Vm, dst: *gc.Object, src: *gc.Object) Error!void {
-    const base = dst.array_length;
-    const n = src.array_length;
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        try vm.checkBudget();
-        if (Vm.arrayGetOwn(src, i)) |v| try vm.setArrayElement(dst, @intCast(@as(u64, base) + i), v);
-    }
-    const total: u64 = @as(u64, base) + n; // account for trailing holes
-    if (total > dst.array_length) dst.array_length = @intCast(total);
-}
-
-fn nativeArrayPush(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
-    for (args) |a| try vm.arrayAppend(arr, a);
-    return Value.fromNumber(@floatFromInt(arr.array_length));
-}
-
-fn nativeArrayPop(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
-    if (arr.array_length == 0) return Value.undefined_value;
-    const last = arr.array_length - 1;
-    const v = Vm.arrayGetOwn(arr, last) orelse Value.undefined_value;
-    try vm.setArrayLength(arr, last);
-    return v;
-}
-
-/// ToIntegerOrInfinity: NaN -> 0, else truncate toward zero.
-fn toIntegerOrInfinity(vm: *Vm, v: Value) Error!f64 {
-    const n = try vm.toNumber(v);
-    if (std.math.isNan(n)) return 0;
-    return std.math.trunc(n);
-}
-
-/// ToLength(Get(base, "length")) — the generic array-like length.
-fn lengthOfArrayLike(vm: *Vm, base: Value) Error!u64 {
-    const n = try vm.toNumber(try vm.getProperty(base, "length"));
-    if (std.math.isNan(n) or n <= 0) return 0;
-    return @intFromFloat(@min(n, 9007199254740991.0)); // 2^53 - 1
-}
-
-/// Resolve a `fromIndex` argument against `len` (negative counts from the
-/// end). Returns null when the search can never succeed (fromIndex >= len).
-fn resolveFromIndex(vm: *Vm, args: []const Value, len: u64) Error!?u64 {
-    const flen: f64 = @floatFromInt(len);
-    var from: f64 = if (args.len >= 2) try toIntegerOrInfinity(vm, args[1]) else 0;
-    if (from >= flen) return null;
-    if (from < 0) from = @max(flen + from, 0);
-    return @intFromFloat(from);
-}
-
-fn nativeArrayIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-
-    // Fast path: a real array — scan only present indices.
-    if (this.isObject() and this.asObject().is_array) {
-        const arr = this.asObject();
-        if (arr.array_length == 0) return Value.fromNumber(-1);
-        const start = (try resolveFromIndex(vm, args, arr.array_length)) orelse return Value.fromNumber(-1);
-        var idxs: std.ArrayList(u32) = .empty;
-        defer idxs.deinit(vm.gpa);
-        try vm.arrayPresentIndices(arr, &idxs);
-        for (idxs.items) |i| {
-            if (i < start) continue;
-            if (sameTypeStrictEq(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromNumber(@floatFromInt(i));
-        }
-        return Value.fromNumber(-1);
-    }
-
-    // Generic array-like path (spec: ToLength + HasProperty + Get per index).
-    const len = try lengthOfArrayLike(vm, this);
-    if (len == 0) return Value.fromNumber(-1);
-    var k = (try resolveFromIndex(vm, args, len)) orelse return Value.fromNumber(-1);
-    while (k < len) : (k += 1) {
-        try vm.checkBudget();
-        var kb: [24]u8 = undefined;
-        const key = std.fmt.bufPrint(&kb, "{d}", .{k}) catch unreachable;
-        if (!hasPropertyGeneric(vm, this, key)) continue; // indexOf skips holes/absent indices
-        if (sameTypeStrictEq(try vm.getProperty(this, key), target)) return Value.fromNumber(@floatFromInt(k));
-    }
-    return Value.fromNumber(-1);
-}
-
-/// HasProperty for any base value: objects walk their chain; primitives check
-/// their exotic own keys and then their wrapper prototype's chain.
-fn hasPropertyGeneric(vm: *Vm, base: Value, key: []const u8) bool {
-    if (base.isObject()) return vm.hasProperty(base.asObject(), key);
-    if (base.isString()) {
-        if (arrayIndex(key)) |i| {
-            if (i < base.asString().units.len) return true;
-        }
-        if (std.mem.eql(u8, key, "length")) return true;
-        if (vm.string_proto) |p| return vm.hasProperty(p, key);
-        return false;
-    }
-    const proto: ?*gc.Object = if (base.isNumber()) vm.number_proto else if (base.isBoolean()) vm.boolean_proto else null;
-    if (proto) |p| return vm.hasProperty(p, key);
-    return false;
-}
-
-fn nativeArrayIncludes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-
-    if (this.isObject() and this.asObject().is_array) {
-        const arr = this.asObject();
-        if (arr.array_length == 0) return Value.fromBool(false);
-        const start = (try resolveFromIndex(vm, args, arr.array_length)) orelse return Value.fromBool(false);
-        var idxs: std.ArrayList(u32) = .empty;
-        defer idxs.deinit(vm.gpa);
-        try vm.arrayPresentIndices(arr, &idxs);
-        var present_after_start: usize = 0;
-        for (idxs.items) |i| {
-            if (i < start) continue;
-            present_after_start += 1;
-            if (sameValueZero(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromBool(true);
-        }
-        // Unlike indexOf, includes reads holes as `undefined`.
-        const searched: u64 = arr.array_length - start;
-        if (target.isUndefined() and present_after_start < searched) return Value.fromBool(true);
-        return Value.fromBool(false);
-    }
-
-    // Generic array-like path: absent indices read as `undefined`.
-    const len = try lengthOfArrayLike(vm, this);
-    if (len == 0) return Value.fromBool(false);
-    var k = (try resolveFromIndex(vm, args, len)) orelse return Value.fromBool(false);
-    while (k < len) : (k += 1) {
-        try vm.checkBudget();
-        var kb: [24]u8 = undefined;
-        const key = std.fmt.bufPrint(&kb, "{d}", .{k}) catch unreachable;
-        if (sameValueZero(try vm.getProperty(this, key), target)) return Value.fromBool(true);
-    }
-    return Value.fromBool(false);
-}
-
-fn nativeArrayJoin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sep_v = argAt(args, 0);
-    const sep = if (sep_v.isUndefined()) try vm.makeString(",") else try vm.toStringVal(sep_v);
-    try vm.protect(sep);
-    defer vm.unprotect();
-
-    const is_real_array = this.isObject() and this.asObject().is_array;
-    const len: u64 = if (is_real_array) this.asObject().array_length else try lengthOfArrayLike(vm, this);
-
-    var buf: std.ArrayList(u16) = .empty;
-    defer buf.deinit(vm.gpa);
-    var i: u64 = 0;
-    while (i < len) : (i += 1) {
-        try vm.checkBudget();
-        if (i > 0) try buf.appendSlice(vm.gpa, sep.asString().units);
-        // Holes/absent and null/undefined join as empty.
-        const el = if (is_real_array)
-            Vm.arrayGetOwn(this.asObject(), @intCast(i)) orelse continue
-        else blk: {
-            var kb: [24]u8 = undefined;
-            const key = std.fmt.bufPrint(&kb, "{d}", .{i}) catch unreachable;
-            break :blk try vm.getProperty(this, key);
-        };
-        if (el.isNullish()) continue;
-        const s = try vm.toStringVal(el);
-        try vm.protect(s);
-        defer vm.unprotect();
-        try buf.appendSlice(vm.gpa, s.asString().units);
-    }
-    return vm.makeStringFromUtf16(buf.items);
-}
-
-fn nativeArrayToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return nativeArrayJoin(ctx, this, args);
-}
-
-fn nativeArraySlice(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
-    const len: i64 = @intCast(arr.array_length);
-    const start = relativeIndex(try optNumber(vm, argAt(args, 0), 0), len);
-    const end = relativeIndex(try optNumber(vm, argAt(args, 1), @floatFromInt(len)), len);
-    const count: u32 = if (end > start) @intCast(end - start) else 0;
-    const result = try vm.newArray(count);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    var i = start;
-    var j: u32 = 0;
-    while (i < end) : (i += 1) {
-        try vm.checkBudget();
-        if (Vm.arrayGetOwn(arr, @intCast(i))) |v| try vm.setArrayElement(result, j, v); // holes preserved
-        j += 1;
-    }
-    return Value.fromObject(result);
-}
-
-fn nativeArrayConcat(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    try appendArrayElements(vm, result, arr);
-    for (args) |a| {
-        if (a.isObject() and a.asObject().is_array) {
-            try appendArrayElements(vm, result, a.asObject());
-        } else {
-            try vm.arrayAppend(result, a);
-        }
-    }
-    return Value.fromObject(result);
-}
-
-fn nativeArrayForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
-    const cb = argAt(args, 0);
-    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    var idxs: std.ArrayList(u32) = .empty;
-    defer idxs.deinit(vm.gpa);
-    try vm.arrayPresentIndices(arr, &idxs);
-    for (idxs.items) |i| {
-        const el = Vm.arrayGetOwn(arr, i) orelse continue; // skip holes / deleted-by-callback
-        _ = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
-    }
-    return Value.undefined_value;
-}
-
-fn nativeArrayMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
-    const cb = argAt(args, 0);
-    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    const result = try vm.newArray(arr.array_length); // same length; holes preserved
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    var idxs: std.ArrayList(u32) = .empty;
-    defer idxs.deinit(vm.gpa);
-    try vm.arrayPresentIndices(arr, &idxs);
-    for (idxs.items) |i| {
-        const el = Vm.arrayGetOwn(arr, i) orelse continue;
-        const r = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
-        try vm.setArrayElement(result, i, r);
-    }
-    return Value.fromObject(result);
-}
-
-fn nativeArrayFilter(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const arr = try thisArray(vm, this);
-    const cb = argAt(args, 0);
-    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    var idxs: std.ArrayList(u32) = .empty;
-    defer idxs.deinit(vm.gpa);
-    try vm.arrayPresentIndices(arr, &idxs);
-    for (idxs.items) |i| {
-        const el = Vm.arrayGetOwn(arr, i) orelse continue;
-        const keep = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
-        if (toBoolean(keep)) try vm.arrayAppend(result, el);
-    }
-    return Value.fromObject(result);
-}
-
-fn optNumber(vm: *Vm, v: Value, default: f64) Error!f64 {
-    if (v.isUndefined()) return default;
-    return vm.toNumber(v);
-}
-
-/// Clamp a relative index (negative counts from the end) to [0, len].
-fn relativeIndex(n: f64, len: i64) i64 {
-    if (std.math.isNan(n)) return 0;
-    var idx: i64 = if (n < -9.2e18) -len else if (n > 9.2e18) len else @intFromFloat(std.math.trunc(n));
-    if (idx < 0) idx += len;
-    if (idx < 0) idx = 0;
-    if (idx > len) idx = len;
-    return idx;
-}
-
-// ---- Object.keys / values / entries ----------------------------------------
-
-/// Collect `obj`'s own string keys in spec order: integer-like keys ascending
-/// first (array elements and numeric property names together), then the rest
-/// in insertion order. Internal (NUL-prefixed) keys are skipped. When
-/// `enumerable_only`, non-enumerable properties are omitted. Keys are duped.
-fn orderedOwnKeys(vm: *Vm, obj: *gc.Object, enumerable_only: bool, out: *std.ArrayList([]const u8)) Error!void {
-    var ints: std.ArrayList(u32) = .empty;
-    defer ints.deinit(vm.gpa);
-    if (obj.is_array) try vm.arrayPresentIndices(obj, &ints);
-    var it = obj.properties.iterator();
-    while (it.next()) |entry| {
-        const k = entry.key_ptr.*;
-        if (k.len > 0 and k[0] == 0) continue; // internal slots + symbol keys
-        if (enumerable_only and !entry.value_ptr.enumerable) continue;
-        if (arrayIndex(k)) |i| try ints.append(vm.gpa, i);
-    }
-    std.mem.sort(u32, ints.items, {}, std.sort.asc(u32));
-    for (ints.items) |i| {
-        var buf: [16]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
-        try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
-    }
-    it = obj.properties.iterator();
-    while (it.next()) |entry| {
-        const k = entry.key_ptr.*;
-        if (k.len > 0 and k[0] == 0) continue;
-        if (enumerable_only and !entry.value_ptr.enumerable) continue;
-        if (arrayIndex(k) != null) continue; // already emitted, sorted
-        try out.append(vm.gpa, try vm.gpa.dupe(u8, k));
-    }
-}
-
-/// Own enumerable string keys in spec order (Object.keys/values/entries).
-fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
-    return orderedOwnKeys(vm, obj, true, out);
-}
-
-/// ES2015 ToObject coercion for Object.keys and friends: nullish throws, a
-/// string exposes its indices as own keys, other primitives have none.
-/// Returns null when `v` is a real object (caller proceeds normally).
-fn primitiveOwnKeysResult(vm: *Vm, v: Value, include_length: bool) Error!?Value {
-    if (v.isObject()) return null;
-    if (v.isNullish()) return vm.throwTypeError("cannot convert null or undefined to object");
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    if (v.isString()) {
-        const n = v.asString().units.len;
-        var i: usize = 0;
-        var buf: [16]u8 = undefined;
-        while (i < n) : (i += 1) {
-            const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
-            try vm.arrayAppend(result, try vm.makeString(s));
-        }
-        if (include_length) try vm.arrayAppend(result, try vm.makeString("length"));
-    }
-    return Value.fromObject(result);
-}
-
-fn nativeObjectKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const v = argAt(args, 0);
-    if (try primitiveOwnKeysResult(vm, v, false)) |r| return r;
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (keys.items) |k| vm.gpa.free(k);
-        keys.deinit(vm.gpa);
-    }
-    try ownEnumerableKeys(vm, v.asObject(), &keys);
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    for (keys.items) |k| {
-        const s = try vm.makeString(k);
-        try vm.arrayAppend(result,s);
-    }
-    return Value.fromObject(result);
-}
-
-fn nativeObjectValues(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const v = argAt(args, 0);
-    if (v.isNullish()) return vm.throwTypeError("cannot convert null or undefined to object");
-    if (!v.isObject()) return Value.fromObject(try vm.newArray(0));
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (keys.items) |k| vm.gpa.free(k);
-        keys.deinit(vm.gpa);
-    }
-    try ownEnumerableKeys(vm, v.asObject(), &keys);
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    for (keys.items) |k| {
-        const val = try vm.getProperty(v, k);
-        try vm.arrayAppend(result,val);
-    }
-    return Value.fromObject(result);
-}
-
-/// All own string-keyed property names (enumerable and not), skipping symbol
-/// and internal-slot keys. Array indices and `length` are included for arrays.
-fn ownPropertyNames(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
-    try orderedOwnKeys(vm, obj, false, out);
-    if (obj.is_array) try out.append(vm.gpa, try vm.gpa.dupe(u8, "length"));
-}
-
-fn nativeObjectGetOwnPropertyNames(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const v = argAt(args, 0);
-    if (try primitiveOwnKeysResult(vm, v, true)) |r| return r;
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (keys.items) |k| vm.gpa.free(k);
-        keys.deinit(vm.gpa);
-    }
-    try ownPropertyNames(vm, v.asObject(), &keys);
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    for (keys.items) |k| {
-        const s = try vm.makeString(k);
-        try vm.arrayAppend(result,s);
-    }
-    return Value.fromObject(result);
-}
-
-fn nativePropertyIsEnumerable(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!this.isObject()) return Value.fromBool(false);
-    const key = try vm.toPropertyKey(argAt(args, 0));
-    defer vm.gpa.free(key);
-    const o = this.asObject();
-    if (o.properties.get(key)) |desc| return Value.fromBool(desc.enumerable);
-    // A present array index is an enumerable own property.
-    if (o.is_array) {
-        if (std.fmt.parseInt(u32, key, 10)) |idx| {
-            if (Vm.arrayHasOwn(o, idx)) return Value.fromBool(true);
-        } else |_| {}
-    }
-    return Value.fromBool(false);
-}
-
-fn nativeObjectEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const v = argAt(args, 0);
-    if (v.isNullish()) return vm.throwTypeError("cannot convert null or undefined to object");
-    if (!v.isObject()) return Value.fromObject(try vm.newArray(0));
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (keys.items) |k| vm.gpa.free(k);
-        keys.deinit(vm.gpa);
-    }
-    try ownEnumerableKeys(vm, v.asObject(), &keys);
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    for (keys.items) |k| {
-        const pair = try vm.newArray(0);
-        try vm.protect(Value.fromObject(pair));
-        defer vm.unprotect();
-        try vm.arrayAppend(pair, try vm.makeString(k));
-        try vm.arrayAppend(pair, try vm.getProperty(v, k));
-        try vm.arrayAppend(result, Value.fromObject(pair));
-    }
-    return Value.fromObject(result);
-}
-
-// ---- String built-ins ------------------------------------------------------
-
-fn coerceToString(vm: *Vm, v: Value) Error!Value {
-    if (v.isString()) return v;
-    return vm.toStringVal(v);
-}
-
-fn indexOfUtf16(haystack: []const u16, needle: []const u16, from: usize) ?usize {
-    if (needle.len == 0) return @min(from, haystack.len);
-    if (needle.len > haystack.len) return null;
-    var i = from;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.mem.eql(u16, haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
-
-fn nativeStringToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    if (this.isString()) return this;
-    // A String wrapper returns its boxed [[StringData]]. Anything else throws
-    // (per spec) — which also breaks the toString -> ToPrimitive recursion.
-    if (this.isObject()) {
-        if (this.asObject().properties.get(prim_key)) |d| {
-            if (d.value.isString()) return d.value;
-        }
-    }
-    return castVm(ctx).throwTypeError("String.prototype.toString requires a String");
-}
-
-fn nativeStringLastIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const needle_s = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(needle_s);
-    defer vm.unprotect();
-    const needle = needle_s.asString().units;
-
-    // fromIndex clamps the latest allowed *start* position (NaN -> +inf).
-    var limit: usize = units.len;
-    if (args.len >= 2 and !args[1].isUndefined()) {
-        const n = try vm.toNumber(args[1]);
-        if (!std.math.isNan(n)) {
-            if (n < 0) {
-                limit = 0;
-            } else if (n < @as(f64, @floatFromInt(units.len))) {
-                limit = @intFromFloat(n);
-            }
-        }
-    }
-    if (needle.len > units.len) return Value.fromNumber(-1);
-    var start = @min(limit, units.len - needle.len);
-    while (true) {
-        if (std.mem.eql(u16, units[start .. start + needle.len], needle)) return Value.fromNumber(@floatFromInt(start));
-        if (start == 0) return Value.fromNumber(-1);
-        start -= 1;
-    }
-}
-
-fn nativeStringLocaleCompare(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const other = try coerceToString(vm, argAt(args, 0));
-    return Value.fromNumber(@floatFromInt(compareUtf16(sv.asString().units, other.asString().units)));
-}
-
-fn nativeFunctionToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.toString requires a function");
-    const name_v = try vm.getProperty(this, "name");
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.gpa);
-    try buf.appendSlice(vm.gpa, "function ");
-    if (name_v.isString()) {
-        const n8 = try utf16ToUtf8Alloc(vm.gpa, name_v.asString().units);
-        defer vm.gpa.free(n8);
-        try buf.appendSlice(vm.gpa, n8);
-    }
-    try buf.appendSlice(vm.gpa, "() { [native code] }");
-    return vm.makeString(buf.items);
-}
-
-fn nativeObjectToLocaleString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const m = try vm.getProperty(this, "toString");
-    if (!isCallable(m)) return vm.throwTypeError("toString is not callable");
-    return vm.callValue(m, this, &.{});
-}
-
-// ---- global numeric parsing + URI coding ------------------------------------
-
-fn nativeParseInt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(sv);
-    defer vm.unprotect();
-    var s = sv.asString().units;
-    while (s.len > 0 and isJsSpace(s[0])) s = s[1..];
-    var sign: f64 = 1;
-    if (s.len > 0 and (s[0] == '+' or s[0] == '-')) {
-        if (s[0] == '-') sign = -1;
-        s = s[1..];
-    }
-    var radix: u32 = if (args.len >= 2) (try vm.toUint32(args[1])) & 0xffff_ffff else 0;
-    if (radix != 0 and (radix < 2 or radix > 36)) return Value.fromNumber(std.math.nan(f64));
-    if ((radix == 0 or radix == 16) and s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
-        s = s[2..];
-        radix = 16;
-    }
-    if (radix == 0) radix = 10;
-    var value: f64 = 0;
-    var any = false;
-    for (s) |c| {
-        const d = hexLikeDigit(c) orelse break;
-        if (d >= radix) break;
-        value = value * @as(f64, @floatFromInt(radix)) + @as(f64, @floatFromInt(d));
-        any = true;
-    }
-    if (!any) return Value.fromNumber(std.math.nan(f64));
-    return Value.fromNumber(sign * value);
-}
-
-fn hexLikeDigit(c: u16) ?u32 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'z' => c - 'a' + 10,
-        'A'...'Z' => c - 'A' + 10,
-        else => null,
-    };
-}
-
-fn nativeParseFloat(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(sv);
-    defer vm.unprotect();
-    var s = sv.asString().units;
-    while (s.len > 0 and isJsSpace(s[0])) s = s[1..];
-
-    // Consume the longest prefix that forms a StrDecimalLiteral.
-    var i: usize = 0;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.gpa);
-    if (i < s.len and (s[i] == '+' or s[i] == '-')) {
-        try buf.append(vm.gpa, @intCast(s[i]));
-        i += 1;
-    }
-    if (i + 8 <= s.len and std.mem.eql(u16, s[i .. i + 8], &[_]u16{ 'I', 'n', 'f', 'i', 'n', 'i', 't', 'y' })) {
-        const neg = buf.items.len > 0 and buf.items[0] == '-';
-        return Value.fromNumber(if (neg) -std.math.inf(f64) else std.math.inf(f64));
-    }
-    var digits: usize = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        try buf.append(vm.gpa, @intCast(s[i]));
-        digits += 1;
-    }
-    if (i < s.len and s[i] == '.') {
-        try buf.append(vm.gpa, '.');
-        i += 1;
-        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-            try buf.append(vm.gpa, @intCast(s[i]));
-            digits += 1;
-        }
-    }
-    if (digits == 0) return Value.fromNumber(std.math.nan(f64));
-    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
-        const mark = buf.items.len;
-        var j = i + 1;
-        var ebuf: std.ArrayList(u8) = .empty;
-        defer ebuf.deinit(vm.gpa);
-        try ebuf.append(vm.gpa, 'e');
-        if (j < s.len and (s[j] == '+' or s[j] == '-')) {
-            try ebuf.append(vm.gpa, @intCast(s[j]));
-            j += 1;
-        }
-        var edigits: usize = 0;
-        while (j < s.len and s[j] >= '0' and s[j] <= '9') : (j += 1) {
-            try ebuf.append(vm.gpa, @intCast(s[j]));
-            edigits += 1;
-        }
-        if (edigits > 0) {
-            try buf.appendSlice(vm.gpa, ebuf.items);
-        } else {
-            buf.shrinkRetainingCapacity(mark);
-        }
-    }
-    const parsed = std.fmt.parseFloat(f64, buf.items) catch return Value.fromNumber(std.math.nan(f64));
-    return Value.fromNumber(parsed);
-}
-
-fn uriUnreserved(c: u8, comptime component: bool) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '!', '~', '*', '\'', '(', ')' => true,
-        // encodeURI additionally leaves the reserved set unescaped.
-        ';', '/', '?', ':', '@', '&', '=', '+', '$', ',', '#' => !component,
-        else => false,
-    };
-}
-
-fn uriEncode(ctx: *anyopaque, this: Value, args: []const Value, comptime component: bool) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const utf8 = try utf16ToUtf8Alloc(vm.gpa, sv.asString().units);
-    defer vm.gpa.free(utf8);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(vm.gpa);
-    const hex = "0123456789ABCDEF";
-    for (utf8) |b| {
-        if (uriUnreserved(b, component)) {
-            try out.append(vm.gpa, b);
-        } else {
-            try out.append(vm.gpa, '%');
-            try out.append(vm.gpa, hex[b >> 4]);
-            try out.append(vm.gpa, hex[b & 15]);
-        }
-    }
-    return vm.makeString(out.items);
-}
-
-fn nativeEncodeURIComponent(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return uriEncode(ctx, this, args, true);
-}
-fn nativeEncodeURI(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return uriEncode(ctx, this, args, false);
-}
-
-fn nativeDecodeURIComponent(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const utf8 = try utf16ToUtf8Alloc(vm.gpa, sv.asString().units);
-    defer vm.gpa.free(utf8);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(vm.gpa);
-    var i: usize = 0;
-    while (i < utf8.len) {
-        if (utf8[i] == '%') {
-            if (i + 2 >= utf8.len) return vm.throwTypeError("URI malformed");
-            const hi = hexLikeDigit(utf8[i + 1]) orelse return vm.throwTypeError("URI malformed");
-            const lo = hexLikeDigit(utf8[i + 2]) orelse return vm.throwTypeError("URI malformed");
-            if (hi > 15 or lo > 15) return vm.throwTypeError("URI malformed");
-            try out.append(vm.gpa, @intCast(hi * 16 + lo));
-            i += 3;
-        } else {
-            try out.append(vm.gpa, utf8[i]);
-            i += 1;
-        }
-    }
-    return vm.makeString(out.items);
-}
-
-fn nativeNumberToExponential(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const x = try thisNumber(vm, this);
-    var buf: [64]u8 = undefined;
-    if (std.math.isNan(x) or std.math.isInf(x)) return vm.makeString(numberToString(x, &buf));
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(vm.gpa);
-    if (argAt(args, 0).isUndefined()) {
-        try out.print(vm.gpa, "{e}", .{x});
-    } else {
-        const d = try vm.toNumber(args[0]);
-        if (std.math.isNan(d) or d < 0 or d > 100) return vm.throwRangeError("toExponential() argument must be between 0 and 100");
-        const digits: usize = @intFromFloat(d);
-        try out.print(vm.gpa, "{e:.[1]}", .{ x, digits });
-    }
-    // Zig prints "1.5e2"; JS wants "1.5e+2".
-    if (std.mem.indexOfScalar(u8, out.items, 'e')) |epos| {
-        if (epos + 1 < out.items.len and out.items[epos + 1] != '-') {
-            try out.insert(vm.gpa, epos + 1, '+');
-        }
-    }
-    return vm.makeString(out.items);
-}
-
-fn nativeNumberToPrecision(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const x = try thisNumber(vm, this);
-    var buf: [64]u8 = undefined;
-    if (argAt(args, 0).isUndefined()) return vm.makeString(numberToString(x, &buf));
-    const p_f = try vm.toNumber(args[0]);
-    if (std.math.isNan(p_f) or p_f < 1 or p_f > 100) return vm.throwRangeError("toPrecision() argument must be between 1 and 100");
-    const p: i32 = @intFromFloat(p_f);
-    if (std.math.isNan(x) or std.math.isInf(x)) return vm.makeString(numberToString(x, &buf));
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(vm.gpa);
-    if (x == 0) {
-        try out.append(vm.gpa, '0');
-        if (p > 1) {
-            try out.append(vm.gpa, '.');
-            var i: i32 = 1;
-            while (i < p) : (i += 1) try out.append(vm.gpa, '0');
-        }
-        return vm.makeString(out.items);
-    }
-    const e10: i32 = @intFromFloat(@floor(std.math.log10(@abs(x))));
-    if (e10 < -6 or e10 >= p) {
-        // Exponential with p-1 fractional digits.
-        try out.print(vm.gpa, "{e:.[1]}", .{ x, @as(usize, @intCast(p - 1)) });
-        if (std.mem.indexOfScalar(u8, out.items, 'e')) |epos| {
-            if (epos + 1 < out.items.len and out.items[epos + 1] != '-') try out.insert(vm.gpa, epos + 1, '+');
-        }
-    } else {
-        const frac: usize = @intCast(@max(p - 1 - e10, 0));
-        try out.print(vm.gpa, "{d:.[1]}", .{ x, frac });
-    }
-    return vm.makeString(out.items);
-}
-
-fn nativeStringCharAt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const n = try vm.toNumber(argAt(args, 0));
-    if (std.math.isNan(n) or n < 0 or n >= @as(f64, @floatFromInt(units.len))) return vm.makeString("");
-    const i: usize = @intFromFloat(n);
-    return vm.makeStringFromUtf16(units[i .. i + 1]);
-}
-
-fn nativeStringCharCodeAt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const n = try vm.toNumber(argAt(args, 0));
-    if (std.math.isNan(n) or n < 0 or n >= @as(f64, @floatFromInt(units.len))) return Value.fromNumber(std.math.nan(f64));
-    return Value.fromNumber(@floatFromInt(units[@intFromFloat(n)]));
-}
-
-fn nativeStringIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const search = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(search);
-    defer vm.unprotect();
-    const idx = indexOfUtf16(sv.asString().units, search.asString().units, 0);
-    return Value.fromNumber(if (idx) |i| @floatFromInt(i) else -1);
-}
-
-fn nativeStringIncludes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const search = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(search);
-    defer vm.unprotect();
-    return Value.fromBool(indexOfUtf16(sv.asString().units, search.asString().units, 0) != null);
-}
-
-fn nativeStringStartsWith(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const search = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(search);
-    defer vm.unprotect();
-    return Value.fromBool(std.mem.startsWith(u16, sv.asString().units, search.asString().units));
-}
-
-fn nativeStringEndsWith(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const search = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(search);
-    defer vm.unprotect();
-    return Value.fromBool(std.mem.endsWith(u16, sv.asString().units, search.asString().units));
-}
-
-fn nativeStringSlice(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const len: i64 = @intCast(units.len);
-    const start = relativeIndex(try optNumber(vm, argAt(args, 0), 0), len);
-    const end = relativeIndex(try optNumber(vm, argAt(args, 1), @floatFromInt(len)), len);
-    if (start >= end) return vm.makeString("");
-    return vm.makeStringFromUtf16(units[@intCast(start)..@intCast(end)]);
-}
-
-fn nativeStringSubstring(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const len: i64 = @intCast(units.len);
-    var a = clampIndex(try optNumber(vm, argAt(args, 0), 0), len);
-    var b = clampIndex(try optNumber(vm, argAt(args, 1), @floatFromInt(len)), len);
-    if (a > b) {
-        const t = a;
-        a = b;
-        b = t;
-    }
-    return vm.makeStringFromUtf16(units[@intCast(a)..@intCast(b)]);
-}
-
-fn nativeStringToUpperCase(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return stringMapCase(castVm(ctx), this, true);
-}
-fn nativeStringToLowerCase(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return stringMapCase(castVm(ctx), this, false);
-}
-fn stringMapCase(vm: *Vm, this: Value, upper: bool) Error!Value {
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const out = try vm.gpa.alloc(u16, units.len);
-    defer vm.gpa.free(out);
-    for (units, 0..) |u, i| {
-        // ASCII case mapping (full Unicode case folding is deferred).
-        out[i] = if (upper and u >= 'a' and u <= 'z') u - 32 else if (!upper and u >= 'A' and u <= 'Z') u + 32 else u;
-    }
-    return vm.makeStringFromUtf16(out);
-}
-
-fn nativeStringTrim(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    var start: usize = 0;
-    var end: usize = units.len;
-    while (start < end and isJsSpace(units[start])) start += 1;
-    while (end > start and isJsSpace(units[end - 1])) end -= 1;
-    return vm.makeStringFromUtf16(units[start..end]);
-}
-
-fn nativeStringRepeat(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const n = try vm.toNumber(argAt(args, 0));
-    if (n < 0 or std.math.isNan(n) or n > 4294967295) return vm.throwRangeError("invalid count value");
-    const count: usize = @intFromFloat(n);
-    const units = sv.asString().units;
-    var buf: std.ArrayList(u16) = .empty;
-    defer buf.deinit(vm.gpa);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        try vm.checkBudget();
-        try buf.appendSlice(vm.gpa, units);
-    }
-    return vm.makeStringFromUtf16(buf.items);
-}
-
-fn nativeStringConcat(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    var buf: std.ArrayList(u16) = .empty;
-    defer buf.deinit(vm.gpa);
-    try buf.appendSlice(vm.gpa, sv.asString().units);
-    for (args) |a| {
-        const s = try coerceToString(vm, a);
-        try buf.appendSlice(vm.gpa, s.asString().units);
-    }
-    return vm.makeStringFromUtf16(buf.items);
-}
-
-fn nativeStringSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-
-    const sep_v = argAt(args, 0);
-    const limit_v = argAt(args, 1);
-    const lim: u32 = if (limit_v.isUndefined()) std.math.maxInt(u32) else try vm.toUint32(limit_v);
-    if (lim == 0) return Value.fromObject(result);
-
-    if (sep_v.isUndefined()) {
-        try vm.arrayAppend(result, sv);
-        return Value.fromObject(result);
-    }
-
-    // RegExp separator: split between matches; captures are spliced in.
-    if (sep_v.isObject() and sep_v.asObject().regex != null) {
-        const re = sep_v.asObject().regex.?;
-        if (units.len == 0) {
-            // Empty subject: [] if the pattern matches empty, else [S].
-            if (try regexFind(vm, re, units, 0)) |m| {
-                m.deinit(vm.gpa);
-            } else {
-                try vm.arrayAppend(result, sv);
-            }
-            return Value.fromObject(result);
-        }
-        var p: usize = 0; // start of the current unmatched piece
-        var pos: usize = 0;
-        while (pos < units.len) {
-            const m = (try regexFind(vm, re, units, pos)) orelse break;
-            defer m.deinit(vm.gpa);
-            const w = m.groups[0].?;
-            if (w.start >= units.len) break; // separator may not match at the very end
-            if (w.end == p) {
-                pos = w.start + 1; // empty/degenerate match: advance, no split
-                continue;
-            }
-            try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..w.start]));
-            if (result.array_length >= lim) return Value.fromObject(result);
-            for (m.groups[1..]) |g| {
-                const v = if (g) |sp| try vm.makeStringFromUtf16(units[sp.start..sp.end]) else Value.undefined_value;
-                try vm.arrayAppend(result, v);
-                if (result.array_length >= lim) return Value.fromObject(result);
-            }
-            p = w.end;
-            pos = if (w.end == w.start) w.start + 1 else w.end;
-        }
-        try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..]));
-        return Value.fromObject(result);
-    }
-
-    const sep = try coerceToString(vm, sep_v);
-    try vm.protect(sep);
-    defer vm.unprotect();
-    const sep_units = sep.asString().units;
-
-    if (sep_units.len == 0) {
-        // Split into individual code units (bounded by limit).
-        for (units) |u| {
-            if (result.array_length >= lim) break;
-            const piece = try vm.makeStringFromUtf16(&[_]u16{u});
-            try vm.arrayAppend(result, piece);
-        }
-        return Value.fromObject(result);
-    }
-
-    var start: usize = 0;
-    while (indexOfUtf16(units, sep_units, start)) |idx| {
-        const piece = try vm.makeStringFromUtf16(units[start..idx]);
-        try vm.arrayAppend(result, piece);
-        if (result.array_length >= lim) return Value.fromObject(result);
-        start = idx + sep_units.len;
-    }
-    const last = try vm.makeStringFromUtf16(units[start..]);
-    try vm.arrayAppend(result, last);
-    return Value.fromObject(result);
-}
-
-// ---- String methods that consume RegExp (phase-4 §5 integration) ------------
-
-/// Get the RegExp object for a String-method argument. Per spec, a non-RegExp
-/// argument is coerced via `new RegExp(ToString(arg))` (undefined -> empty
-/// pattern). Caller should protect the returned object across allocations.
-fn regexArgObject(vm: *Vm, v: Value) Error!*gc.Object {
-    if (v.isObject() and v.asObject().regex != null) return v.asObject();
-    var src_owned: ?[]u8 = null;
-    defer if (src_owned) |s| vm.gpa.free(s);
-    var source: []const u8 = "";
-    if (!v.isUndefined()) {
-        const s = try vm.toStringVal(v);
-        try vm.protect(s);
-        defer vm.unprotect();
-        src_owned = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
-        source = src_owned.?;
-    }
-    return vm.makeRegExp(source, "");
-}
-
-/// Run `re` against `units` from `start`, mapping engine errors to JS throws.
-fn regexFind(vm: *Vm, re: *const bilby.Regex, units: []const u16, start: usize) Error!?bilby.Match {
-    return re.find(vm.gpa, units, start) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return vm.throwRangeError("regular expression too complex"),
-    };
-}
-
-fn nativeStringSearch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const rx = try regexArgObject(vm, argAt(args, 0));
-    try vm.protect(Value.fromObject(rx));
-    defer vm.unprotect();
-    // search ignores (and does not mutate) lastIndex.
-    const m = (try regexFind(vm, rx.regex.?, sv.asString().units, 0)) orelse return Value.fromNumber(-1);
-    defer m.deinit(vm.gpa);
-    return Value.fromNumber(@floatFromInt(m.groups[0].?.start));
-}
-
-fn nativeStringMatch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const rx = try regexArgObject(vm, argAt(args, 0));
-    try vm.protect(Value.fromObject(rx));
-    defer vm.unprotect();
-    const re = rx.regex.?;
-
-    // Non-global: identical to rx.exec(S).
-    if (!re.flags.global) return nativeRegExpExec(ctx, Value.fromObject(rx), &.{sv});
-
-    // Global: an array of all matched substrings (no captures), or null.
-    try vm.setProperty(Value.fromObject(rx), "lastIndex", Value.fromNumber(0));
-    const units = sv.asString().units;
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    var pos: usize = 0;
-    var found = false;
-    while (pos <= units.len) {
-        const m = (try regexFind(vm, re, units, pos)) orelse break;
-        const w = m.groups[0].?;
-        m.deinit(vm.gpa);
-        found = true;
-        try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[w.start..w.end]));
-        pos = if (w.end == w.start) w.end + 1 else w.end;
-    }
-    if (!found) return Value.null_value;
-    return Value.fromObject(result);
-}
-
-/// GetSubstitution: expand `$$ $& $` $' $n $nn $<name>` in a replacement
-/// string. Unrecognized `$` sequences are literal.
-fn appendSubstitution(
-    vm: *Vm,
-    out: *std.ArrayList(u16),
-    rep: []const u16,
-    units: []const u16,
-    groups: []const ?bilby.Span,
-    names: *const std.StringHashMapUnmanaged(u32),
-) Error!void {
-    const whole = groups[0].?;
-    var i: usize = 0;
-    while (i < rep.len) {
-        const c = rep[i];
-        if (c != '$' or i + 1 >= rep.len) {
-            try out.append(vm.gpa, c);
-            i += 1;
-            continue;
-        }
-        switch (rep[i + 1]) {
-            '$' => {
-                try out.append(vm.gpa, '$');
-                i += 2;
-            },
-            '&' => {
-                try out.appendSlice(vm.gpa, units[whole.start..whole.end]);
-                i += 2;
-            },
-            '`' => {
-                try out.appendSlice(vm.gpa, units[0..whole.start]);
-                i += 2;
-            },
-            '\'' => {
-                try out.appendSlice(vm.gpa, units[whole.end..]);
-                i += 2;
-            },
-            '0'...'9' => {
-                var num: usize = rep[i + 1] - '0';
-                var consumed: usize = 2;
-                // Prefer the two-digit reference when it names a real group.
-                if (i + 2 < rep.len and rep[i + 2] >= '0' and rep[i + 2] <= '9') {
-                    const two = num * 10 + (rep[i + 2] - '0');
-                    if (two >= 1 and two < groups.len) {
-                        num = two;
-                        consumed = 3;
-                    }
-                }
-                if (num >= 1 and num < groups.len) {
-                    if (groups[num]) |sp| try out.appendSlice(vm.gpa, units[sp.start..sp.end]);
-                    i += consumed;
-                } else {
-                    try out.append(vm.gpa, '$');
-                    i += 1;
-                }
-            },
-            '<' => {
-                // $<name> — only meaningful when the pattern has named groups.
-                const close = std.mem.indexOfScalarPos(u16, rep, i + 2, '>') orelse {
-                    try out.append(vm.gpa, '$');
-                    i += 1;
-                    continue;
-                };
-                if (names.count() == 0) {
-                    try out.append(vm.gpa, '$');
-                    i += 1;
-                    continue;
-                }
-                var name8: std.ArrayList(u8) = .empty;
-                defer name8.deinit(vm.gpa);
-                for (rep[i + 2 .. close]) |u| try name8.append(vm.gpa, @intCast(u & 0xff));
-                if (names.get(name8.items)) |idx| {
-                    if (groups[idx]) |sp| try out.appendSlice(vm.gpa, units[sp.start..sp.end]);
-                }
-                i = close + 1;
-            },
-            else => {
-                try out.append(vm.gpa, '$');
-                i += 1;
-            },
-        }
-    }
-}
-
-/// Invoke a replacer callback with (matched, p1.., offset, string) and append
-/// the ToString of its result.
-fn appendReplacerCall(
-    vm: *Vm,
-    out: *std.ArrayList(u16),
-    cb: Value,
-    units: []const u16,
-    groups: []const ?bilby.Span,
-    subject: Value,
-) Error!void {
-    var argv: std.ArrayList(Value) = .empty;
-    defer argv.deinit(vm.gpa);
-    var protected: usize = 0;
-    defer {
-        var k: usize = 0;
-        while (k < protected) : (k += 1) vm.unprotect();
-    }
-    for (groups) |g| {
-        if (g) |sp| {
-            const s = try vm.makeStringFromUtf16(units[sp.start..sp.end]);
-            try vm.protect(s);
-            protected += 1;
-            try argv.append(vm.gpa, s);
-        } else {
-            try argv.append(vm.gpa, Value.undefined_value);
-        }
-    }
-    try argv.append(vm.gpa, Value.fromNumber(@floatFromInt(groups[0].?.start)));
-    try argv.append(vm.gpa, subject);
-    const r = try vm.callValue(cb, Value.undefined_value, argv.items);
-    try vm.protect(r);
-    defer vm.unprotect();
-    const rs = try vm.toStringVal(r);
-    try out.appendSlice(vm.gpa, rs.asString().units);
-}
-
-fn nativeStringReplace(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const units = sv.asString().units;
-    const pat = argAt(args, 0);
-    const rep = argAt(args, 1);
-    const rep_is_fn = isCallable(rep);
-
-    var out: std.ArrayList(u16) = .empty;
-    defer out.deinit(vm.gpa);
-
-    if (pat.isObject() and pat.asObject().regex != null) {
-        const rx = pat.asObject();
-        const re = rx.regex.?;
-        var last_end: usize = 0;
-        var pos: usize = 0;
-        while (pos <= units.len) {
-            const m = (try regexFind(vm, re, units, pos)) orelse break;
-            defer m.deinit(vm.gpa);
-            const w = m.groups[0].?;
-            try out.appendSlice(vm.gpa, units[last_end..w.start]);
-            if (rep_is_fn) {
-                try appendReplacerCall(vm, &out, rep, units, m.groups, sv);
-            } else {
-                const rs = try vm.toStringVal(rep);
-                try vm.protect(rs);
-                defer vm.unprotect();
-                try appendSubstitution(vm, &out, rs.asString().units, units, m.groups, &re.names);
-            }
-            last_end = w.end;
-            pos = if (w.end == w.start) w.end + 1 else w.end;
-            if (!re.flags.global) break;
-        }
-        try out.appendSlice(vm.gpa, units[last_end..]);
-        return vm.makeStringFromUtf16(out.items);
-    }
-
-    // String pattern: replace the first occurrence only.
-    const pat_s = try vm.toStringVal(pat);
-    try vm.protect(pat_s);
-    defer vm.unprotect();
-    const pat_units = pat_s.asString().units;
-    const idx = indexOfUtf16(units, pat_units, 0) orelse return sv;
-    const span = [_]?bilby.Span{.{ .start = idx, .end = idx + pat_units.len }};
-    try out.appendSlice(vm.gpa, units[0..idx]);
-    if (rep_is_fn) {
-        try appendReplacerCall(vm, &out, rep, units, &span, sv);
-    } else {
-        const rs = try vm.toStringVal(rep);
-        try vm.protect(rs);
-        defer vm.unprotect();
-        const no_names: std.StringHashMapUnmanaged(u32) = .empty;
-        try appendSubstitution(vm, &out, rs.asString().units, units, &span, &no_names);
-    }
-    try out.appendSlice(vm.gpa, units[idx + pat_units.len ..]);
-    return vm.makeStringFromUtf16(out.items);
-}
-
-fn nativeStringFromCharCode(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const out = try vm.gpa.alloc(u16, args.len);
-    defer vm.gpa.free(out);
-    for (args, 0..) |a, i| {
-        const n = try vm.toNumber(a);
-        out[i] = @truncate(@as(u32, @intFromFloat(@mod(n, 65536))));
-    }
-    return vm.makeStringFromUtf16(out);
-}
-
-// ---- Number built-ins ------------------------------------------------------
-
-fn thisNumber(vm: *Vm, this: Value) Error!f64 {
-    if (this.isNumber()) return this.asNumber();
-    // Number wrapper: unbox [[NumberData]].
-    if (this.isObject()) {
-        if (this.asObject().properties.get(prim_key)) |d| {
-            if (d.value.isNumber()) return d.value.asNumber();
-        }
-    }
-    return vm.throwTypeError("Number.prototype method called on non-number");
-}
-
-fn nativeNumberValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return Value.fromNumber(try thisNumber(castVm(ctx), this));
-}
-
-fn nativeNumberToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const x = try thisNumber(vm, this);
-    const radix_v = argAt(args, 0);
-    const radix: u8 = if (radix_v.isUndefined()) 10 else @intFromFloat(try vm.toNumber(radix_v));
-    if (radix == 10) {
-        var buf: [64]u8 = undefined;
-        return vm.makeString(numberToString(x, &buf));
-    }
-    if (radix < 2 or radix > 36) return vm.throwRangeError("toString() radix must be between 2 and 36");
-    var buf: [72]u8 = undefined;
-    // Fall back to decimal formatting for non-finite or out-of-i64-range values.
-    if (std.math.isNan(x) or std.math.isInf(x) or @abs(x) >= 9.0e18) {
-        return vm.makeString(numberToString(x, &buf));
-    }
-    // Integer radix conversion (fractional part not supported for non-decimal).
-    const i: i64 = @intFromFloat(std.math.trunc(x));
-    return vm.makeString(formatRadix(i, radix, &buf));
-}
-
-fn nativeNumberToFixed(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const x = try thisNumber(vm, this);
-    const d = try vm.toNumber(argAt(args, 0));
-    const digits: usize = if (std.math.isNan(d) or d < 0) 0 else if (d > 100) 100 else @intFromFloat(d);
-    if (std.math.isNan(x)) return vm.makeString("NaN");
-    var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{[v]d:.[p]}", .{ .v = x, .p = digits }) catch return vm.makeString("0");
-    return vm.makeString(s);
-}
-
-fn nativeNumberIsInteger(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    if (!v.isNumber()) return Value.fromBool(false);
-    const n = v.asNumber();
-    return Value.fromBool(!std.math.isNan(n) and !std.math.isInf(n) and n == std.math.trunc(n));
-}
-fn nativeNumberIsFinite(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    return Value.fromBool(v.isNumber() and !std.math.isNan(v.asNumber()) and !std.math.isInf(v.asNumber()));
-}
-fn nativeNumberIsNaN(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    const v = argAt(args, 0);
-    return Value.fromBool(v.isNumber() and std.math.isNan(v.asNumber()));
-}
-
-// ---- RegExp built-ins (bilby-backed) -----------------------------------------
-
-fn hasFlag(flags: []const u8, f: u8) bool {
-    return std.mem.indexOfScalar(u8, flags, f) != null;
-}
-
-fn nativeRegExp(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const pat_v = argAt(args, 0);
-    // If the first argument is already a RegExp, copy its source.
-    var src_owned: ?[]u8 = null;
-    defer if (src_owned) |s| vm.gpa.free(s);
-    var source: []const u8 = "";
-    if (pat_v.isObject() and pat_v.asObject().prototype == vm.regexp_proto) {
-        const s = try vm.getProperty(pat_v, "source");
-        if (s.isString()) {
-            src_owned = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
-            source = src_owned.?;
-        }
-    } else if (!pat_v.isUndefined()) {
-        const s = try vm.toStringVal(pat_v);
-        try vm.protect(s);
-        defer vm.unprotect();
-        src_owned = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
-        source = src_owned.?;
-    }
-    const flags_v = argAt(args, 1);
-    var flags_owned: ?[]u8 = null;
-    defer if (flags_owned) |f| vm.gpa.free(f);
-    var flags: []const u8 = "";
-    if (!flags_v.isUndefined()) {
-        const f = try vm.toStringVal(flags_v);
-        try vm.protect(f);
-        defer vm.unprotect();
-        flags_owned = try utf16ToUtf8Alloc(vm.gpa, f.asString().units);
-        flags = flags_owned.?;
-    }
-    return Value.fromObject(try vm.makeRegExp(source, flags));
-}
-
-/// Getter backing for the RegExp.prototype flag accessors. Non-RegExp `this`
-/// (including RegExp.prototype itself) yields undefined per spec-adjacent
-/// leniency rather than throwing.
-fn regexpFlagGetter(comptime field: []const u8) gc.NativeFn {
-    return struct {
-        fn get(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-            _ = ctx;
-            _ = args;
-            if (this.isObject()) {
-                if (this.asObject().regex) |re| return Value.fromBool(@field(re.flags, field));
-            }
-            return Value.undefined_value;
-        }
-    }.get;
-}
-
-fn nativeRegExpGetSource(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (this.isObject()) {
-        if (this.asObject().properties.get(regexp_source_key)) |d| return d.value;
-    }
-    return vm.makeString("(?:)"); // %RegExp.prototype%.source
-}
-
-fn nativeRegExpGetFlags(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (this.isObject()) {
-        if (this.asObject().properties.get(regexp_flags_key)) |d| return d.value;
-    }
-    return vm.makeString("");
-}
-
-/// Write `lastIndex` with strict [[Set]] semantics: a non-writable own
-/// `lastIndex` makes exec throw TypeError (spec: Set(..., true)).
-fn regexpSetLastIndex(vm: *Vm, this: Value, n: f64) Error!void {
-    if (this.isObject()) {
-        if (this.asObject().properties.getPtr("lastIndex")) |desc| {
-            if (!desc.is_accessor and !desc.writable) {
-                return vm.throwTypeError("cannot assign to read-only property 'lastIndex'");
-            }
-        }
-    }
-    try vm.setProperty(this, "lastIndex", Value.fromNumber(n));
-}
-
-/// RegExp.prototype.test — spec: equivalent to `exec(s) !== null`.
-fn nativeRegExpTest(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const r = try nativeRegExpExec(ctx, this, args);
-    return Value.fromBool(!r.isNull());
-}
-
-/// RegExp.prototype.exec — run the compiled bilby matcher against the subject,
-/// honouring `lastIndex` for global/sticky regexes. Returns the match array
-/// (with `index`/`input`/`groups`) or null.
-fn nativeRegExpExec(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!this.isObject() or this.asObject().regex == null)
-        return vm.throwTypeError("RegExp.prototype.exec called on a non-RegExp");
-    const re = this.asObject().regex.?;
-
-    const subject = try vm.toStringVal(argAt(args, 0));
-    try vm.protect(subject);
-    defer vm.unprotect();
-    const units = subject.asString().units;
-
-    // Spec: lastIndex is read (once) unconditionally, but only used — and
-    // later written — for global/sticky regexes.
-    const li = try vm.toNumber(try vm.getProperty(this, "lastIndex"));
-    const track_last = re.flags.global or re.flags.sticky;
-    var start: usize = 0;
-    if (track_last) {
-        if (li > @as(f64, @floatFromInt(units.len))) {
-            try regexpSetLastIndex(vm, this, 0);
-            return Value.null_value;
-        }
-        if (li >= 1) start = @intFromFloat(li);
-    }
-
-    const maybe = re.find(vm.gpa, units, start) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // Step budget exceeded (catastrophic backtracking).
-        else => return vm.throwRangeError("regular expression too complex"),
-    };
-    const m = maybe orelse {
-        if (track_last) try regexpSetLastIndex(vm, this, 0);
-        return Value.null_value;
-    };
-    defer m.deinit(vm.gpa);
-
-    const whole = m.groups[0].?;
-    if (track_last) try regexpSetLastIndex(vm, this, @floatFromInt(whole.end));
-
-    // Result array: [$0, $1, …] plus index / input / groups properties.
-    const arr = try vm.newArray(0);
-    try vm.protect(Value.fromObject(arr));
-    defer vm.unprotect();
-    for (m.groups) |g| {
-        const v = if (g) |span| try vm.makeStringFromUtf16(units[span.start..span.end]) else Value.undefined_value;
-        try vm.arrayAppend(arr, v);
-    }
-    try vm.defineData(arr, "index", Value.fromNumber(@floatFromInt(whole.start)), true, true, true);
-    try vm.defineData(arr, "input", subject, true, true, true);
-
-    // `groups`: an object of named captures, or undefined when there are none.
-    if (re.names.count() > 0) {
-        const groups_obj = try vm.newObject(vm.object_proto);
-        try vm.protect(Value.fromObject(groups_obj));
-        defer vm.unprotect();
-        var it = re.names.iterator();
-        while (it.next()) |entry| {
-            const g = m.groups[entry.value_ptr.*];
-            const v = if (g) |span| try vm.makeStringFromUtf16(units[span.start..span.end]) else Value.undefined_value;
-            try vm.defineData(groups_obj, entry.key_ptr.*, v, true, true, true);
-        }
-        try vm.defineData(arr, "groups", Value.fromObject(groups_obj), true, true, true);
-    } else {
-        try vm.defineData(arr, "groups", Value.undefined_value, true, true, true);
-    }
-
-    return Value.fromObject(arr);
-}
-
-fn nativeRegExpToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (!this.isObject()) return vm.throwTypeError("RegExp.prototype.toString called on non-object");
-    const src_v = try vm.getProperty(this, "source");
-    const flags_v = try vm.getProperty(this, "flags");
-    const src = try vm.toStringVal(src_v);
-    try vm.protect(src);
-    defer vm.unprotect();
-    const flags = try vm.toStringVal(flags_v);
-    try vm.protect(flags);
-    defer vm.unprotect();
-    // "/" + source + "/" + flags
-    var buf: std.ArrayList(u16) = .empty;
-    defer buf.deinit(vm.gpa);
-    try buf.append(vm.gpa, '/');
-    try buf.appendSlice(vm.gpa, src.asString().units);
-    try buf.append(vm.gpa, '/');
-    try buf.appendSlice(vm.gpa, flags.asString().units);
-    return vm.makeStringFromUtf16(buf.items);
-}
-
-// ---- JSON helpers ----------------------------------------------------------
-
-fn appendJsonChar(gpa: std.mem.Allocator, out: *std.ArrayList(u8), u: u16) Error!void {
-    switch (u) {
-        '"' => try out.appendSlice(gpa, "\\\""),
-        '\\' => try out.appendSlice(gpa, "\\\\"),
-        '\n' => try out.appendSlice(gpa, "\\n"),
-        '\t' => try out.appendSlice(gpa, "\\t"),
-        '\r' => try out.appendSlice(gpa, "\\r"),
-        8 => try out.appendSlice(gpa, "\\b"),
-        12 => try out.appendSlice(gpa, "\\f"),
-        else => {
-            if (u < 0x20) {
-                const hex = "0123456789abcdef";
-                try out.appendSlice(gpa, "\\u");
-                try out.append(gpa, hex[(u >> 12) & 0xf]);
-                try out.append(gpa, hex[(u >> 8) & 0xf]);
-                try out.append(gpa, hex[(u >> 4) & 0xf]);
-                try out.append(gpa, hex[u & 0xf]);
-            } else if (u < 0x80) {
-                try out.append(gpa, @intCast(u));
-            } else {
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(u, &buf) catch {
-                    try out.append(gpa, '?');
-                    return;
-                };
-                try out.appendSlice(gpa, buf[0..n]);
-            }
-        },
-    }
-}
-
-const JsonParser = struct {
-    vm: *Vm,
-    s: []const u8,
-    i: usize,
-
-    fn skipWs(self: *JsonParser) void {
-        while (self.i < self.s.len) {
-            switch (self.s[self.i]) {
-                ' ', '\t', '\n', '\r' => self.i += 1,
-                else => break,
-            }
-        }
-    }
-    fn peek(self: *JsonParser) u8 {
-        return if (self.i < self.s.len) self.s[self.i] else 0;
-    }
-
-    fn parseValue(self: *JsonParser) Error!Value {
-        self.skipWs();
-        switch (self.peek()) {
-            '{' => return self.parseObject(),
-            '[' => return self.parseArray(),
-            '"' => return self.parseString(),
-            't' => {
-                try self.expectWord("true");
-                return Value.fromBool(true);
-            },
-            'f' => {
-                try self.expectWord("false");
-                return Value.fromBool(false);
-            },
-            'n' => {
-                try self.expectWord("null");
-                return Value.null_value;
-            },
-            '-', '0'...'9' => return self.parseNumber(),
-            else => return self.vm.throwSyntaxError("Unexpected token in JSON"),
-        }
-    }
-
-    fn expectWord(self: *JsonParser, word: []const u8) Error!void {
-        if (self.i + word.len > self.s.len or !std.mem.eql(u8, self.s[self.i .. self.i + word.len], word)) {
-            return self.vm.throwSyntaxError("Unexpected token in JSON");
-        }
-        self.i += word.len;
-    }
-
-    fn parseNumber(self: *JsonParser) Error!Value {
-        const start = self.i;
-        if (self.peek() == '-') self.i += 1;
-        while (self.i < self.s.len and self.s[self.i] >= '0' and self.s[self.i] <= '9') self.i += 1;
-        if (self.peek() == '.') {
-            self.i += 1;
-            while (self.i < self.s.len and self.s[self.i] >= '0' and self.s[self.i] <= '9') self.i += 1;
-        }
-        if (self.peek() == 'e' or self.peek() == 'E') {
-            self.i += 1;
-            if (self.peek() == '+' or self.peek() == '-') self.i += 1;
-            while (self.i < self.s.len and self.s[self.i] >= '0' and self.s[self.i] <= '9') self.i += 1;
-        }
-        const n = std.fmt.parseFloat(f64, self.s[start..self.i]) catch return self.vm.throwSyntaxError("Invalid number in JSON");
-        return Value.fromNumber(n);
-    }
-
-    /// Parse a JSON string; returns UTF-8 bytes in `buf` (caller-owned scratch).
-    fn parseStringInto(self: *JsonParser, buf: *std.ArrayList(u8)) Error!void {
-        if (self.peek() != '"') return self.vm.throwSyntaxError("Expected string in JSON");
-        self.i += 1;
-        while (self.i < self.s.len) {
-            const c = self.s[self.i];
-            self.i += 1;
-            if (c == '"') return;
-            if (c == '\\') {
-                const e = self.peek();
-                self.i += 1;
-                switch (e) {
-                    '"' => try buf.append(self.vm.gpa, '"'),
-                    '\\' => try buf.append(self.vm.gpa, '\\'),
-                    '/' => try buf.append(self.vm.gpa, '/'),
-                    'b' => try buf.append(self.vm.gpa, 8),
-                    'f' => try buf.append(self.vm.gpa, 12),
-                    'n' => try buf.append(self.vm.gpa, '\n'),
-                    'r' => try buf.append(self.vm.gpa, '\r'),
-                    't' => try buf.append(self.vm.gpa, '\t'),
-                    'u' => {
-                        if (self.i + 4 > self.s.len) return self.vm.throwSyntaxError("Invalid \\u escape in JSON");
-                        const cp = std.fmt.parseInt(u21, self.s[self.i .. self.i + 4], 16) catch return self.vm.throwSyntaxError("Invalid \\u escape in JSON");
-                        self.i += 4;
-                        var ub: [4]u8 = undefined;
-                        const n = std.unicode.utf8Encode(cp, &ub) catch {
-                            try buf.append(self.vm.gpa, '?');
-                            continue;
-                        };
-                        try buf.appendSlice(self.vm.gpa, ub[0..n]);
-                    },
-                    else => return self.vm.throwSyntaxError("Invalid escape in JSON"),
-                }
-            } else {
-                try buf.append(self.vm.gpa, c);
-            }
-        }
-        return self.vm.throwSyntaxError("Unterminated string in JSON");
-    }
-
-    fn parseString(self: *JsonParser) Error!Value {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.vm.gpa);
-        try self.parseStringInto(&buf);
-        return self.vm.makeString(buf.items);
-    }
-
-    fn parseArray(self: *JsonParser) Error!Value {
-        self.i += 1; // '['
-        const arr = try self.vm.newArray(0);
-        try self.vm.protect(Value.fromObject(arr));
-        defer self.vm.unprotect();
-        self.skipWs();
-        if (self.peek() == ']') {
-            self.i += 1;
-            return Value.fromObject(arr);
-        }
-        while (true) {
-            const v = try self.parseValue();
-            try self.vm.arrayAppend(arr, v);
-            self.skipWs();
-            const c = self.peek();
-            if (c == ',') {
-                self.i += 1;
-                continue;
-            }
-            if (c == ']') {
-                self.i += 1;
-                break;
-            }
-            return self.vm.throwSyntaxError("Expected ',' or ']' in JSON array");
-        }
-        return Value.fromObject(arr);
-    }
-
-    fn parseObject(self: *JsonParser) Error!Value {
-        self.i += 1; // '{'
-        const obj = try self.vm.newObject(self.vm.object_proto);
-        try self.vm.protect(Value.fromObject(obj));
-        defer self.vm.unprotect();
-        self.skipWs();
-        if (self.peek() == '}') {
-            self.i += 1;
-            return Value.fromObject(obj);
-        }
-        while (true) {
-            self.skipWs();
-            var key_buf: std.ArrayList(u8) = .empty;
-            defer key_buf.deinit(self.vm.gpa);
-            try self.parseStringInto(&key_buf);
-            self.skipWs();
-            if (self.peek() != ':') return self.vm.throwSyntaxError("Expected ':' in JSON object");
-            self.i += 1;
-            const v = try self.parseValue();
-            try self.vm.setProperty(Value.fromObject(obj), key_buf.items, v);
-            self.skipWs();
-            const c = self.peek();
-            if (c == ',') {
-                self.i += 1;
-                continue;
-            }
-            if (c == '}') {
-                self.i += 1;
-                break;
-            }
-            return self.vm.throwSyntaxError("Expected ',' or '}' in JSON object");
-        }
-        return Value.fromObject(obj);
-    }
-};
-
-fn nativeJSONStringify(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-
-    // The `space` argument -> indentation gap (max 10).
-    const ten_spaces = "          ";
-    var gap_buf: [64]u8 = undefined;
-    var gap: []const u8 = "";
-    const space = argAt(args, 2);
-    if (space.isNumber()) {
-        const n: usize = if (space.asNumber() < 0) 0 else if (space.asNumber() > 10) 10 else @intFromFloat(space.asNumber());
-        gap = ten_spaces[0..n];
-    } else if (space.isString()) {
-        const units = space.asString().units;
-        var len: usize = 0;
-        for (units[0..@min(units.len, 10)]) |u| {
-            if (len < gap_buf.len) {
-                gap_buf[len] = if (u < 0x80) @intCast(u) else ' ';
-                len += 1;
-            }
-        }
-        gap = gap_buf[0..len];
-    }
-
-    // The `replacer` argument -> a function, or an allow-list of keys.
-    var replacer: Value = Value.undefined_value;
-    var keys_owned: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (keys_owned.items) |k| vm.gpa.free(k);
-        keys_owned.deinit(vm.gpa);
-    }
-    var keys_filter: ?[]const []const u8 = null;
-    const replacer_arg = argAt(args, 1);
-    if (isCallable(replacer_arg)) {
-        replacer = replacer_arg;
-    } else if (replacer_arg.isObject() and replacer_arg.asObject().is_array) {
-        const ra = replacer_arg.asObject();
-        var ri: u32 = 0;
-        while (ri < ra.array_length) : (ri += 1) {
-            const el = Vm.arrayGetOwn(ra, ri) orelse continue;
-            if (el.isString()) {
-                const kb = try utf16ToUtf8Alloc(vm.gpa, el.asString().units);
-                try keys_owned.append(vm.gpa, kb);
-            } else if (el.isNumber()) {
-                var nb: [24]u8 = undefined;
-                const ks = numberToString(el.asNumber(), &nb);
-                try keys_owned.append(vm.gpa, try vm.gpa.dupe(u8, ks));
-            }
-        }
-        keys_filter = keys_owned.items;
-    }
-
-    // Wrap the value in a holder for SerializeJSONProperty.
-    const holder = try vm.newObject(vm.object_proto);
-    try vm.protect(Value.fromObject(holder));
-    defer vm.unprotect();
-    try vm.defineData(holder, "", argAt(args, 0), true, true, true);
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(vm.gpa);
-    var stack: std.ArrayList(*gc.Object) = .empty;
-    defer stack.deinit(vm.gpa);
-    var indent: std.ArrayList(u8) = .empty;
-    defer indent.deinit(vm.gpa);
-    const c = Vm.JsonCtx{ .out = &out, .stack = &stack, .indent = &indent, .gap = gap, .replacer = replacer, .keys_filter = keys_filter };
-
-    if (!try vm.jsonSerializeProperty(c, Value.fromObject(holder), "")) return Value.undefined_value;
-    return vm.makeString(out.items);
-}
-
-fn nativeJSONParse(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const text_v = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(text_v);
-    defer vm.unprotect();
-    const utf8 = try utf16ToUtf8Alloc(vm.gpa, text_v.asString().units);
-    defer vm.gpa.free(utf8);
-    return vm.jsonParse(utf8, argAt(args, 1));
-}
-
-// ---- Map / Set built-ins ---------------------------------------------------
-
-fn sameValueZero(a: Value, b: Value) bool {
-    if (a.isNumber() and b.isNumber()) {
-        const x = a.asNumber();
-        const y = b.asNumber();
-        if (std.math.isNan(x) and std.math.isNan(y)) return true;
-        return x == y; // +0 and -0 are equal under SameValueZero
-    }
-    return sameTypeStrictEq(a, b);
-}
-
-fn thisCollection(vm: *Vm, this: Value, kind: gc.Collection) Error!*gc.Object {
-    if (!this.isObject() or this.asObject().collection != kind) {
-        return vm.throwTypeError("method called on an incompatible receiver");
-    }
-    return this.asObject();
-}
-
-/// Index of `key` in a Map's interleaved entries (the key slot), or null.
-fn mapFind(map: *gc.Object, key: Value) ?usize {
-    var i: usize = 0;
-    while (i < map.elements.items.len) : (i += 2) {
-        if (sameValueZero(map.elements.items[i], key)) return i;
-    }
-    return null;
-}
-fn setFind(set: *gc.Object, value: Value) ?usize {
-    for (set.elements.items, 0..) |v, i| {
-        if (sameValueZero(v, value)) return i;
-    }
-    return null;
-}
-
-fn nativeMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const map = try vm.newMap();
-    try vm.protect(Value.fromObject(map));
-    defer vm.unprotect();
-    // Optional iterable of [key, value] pairs (arrays only, for now).
-    const init_v = argAt(args, 0);
-    if (init_v.isObject() and init_v.asObject().is_array) {
-        for (init_v.asObject().elements.items) |entry| {
-            if (entry.isObject() and entry.asObject().is_array) {
-                const e = entry.asObject().elements.items;
-                const k = if (e.len > 0) e[0] else Value.undefined_value;
-                const val = if (e.len > 1) e[1] else Value.undefined_value;
-                if (mapFind(map, k)) |idx| {
-                    map.elements.items[idx + 1] = val;
-                } else {
-                    try map.elements.append(vm.gpa, k);
-                    try map.elements.append(vm.gpa, val);
-                }
-            }
-        }
-    }
-    return Value.fromObject(map);
-}
-fn nativeMapGet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const map = try thisCollection(vm, this, .map);
-    if (mapFind(map, argAt(args, 0))) |i| return map.elements.items[i + 1];
-    return Value.undefined_value;
-}
-fn nativeMapSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const map = try thisCollection(vm, this, .map);
-    const key = argAt(args, 0);
-    const val = argAt(args, 1);
-    if (mapFind(map, key)) |i| {
-        map.elements.items[i + 1] = val;
-    } else {
-        try map.elements.append(vm.gpa, key);
-        try map.elements.append(vm.gpa, val);
-    }
-    return this;
-}
-fn nativeMapHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const map = try thisCollection(vm, this, .map);
-    return Value.fromBool(mapFind(map, argAt(args, 0)) != null);
-}
-fn nativeMapDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const map = try thisCollection(vm, this, .map);
-    if (mapFind(map, argAt(args, 0))) |i| {
-        _ = map.elements.orderedRemove(i); // key
-        _ = map.elements.orderedRemove(i); // value (shifted into i)
-        return Value.fromBool(true);
-    }
-    return Value.fromBool(false);
-}
-fn nativeMapSize(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const map = try thisCollection(vm, this, .map);
-    return Value.fromNumber(@floatFromInt(map.elements.items.len / 2));
-}
-fn nativeMapForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const map = try thisCollection(vm, this, .map);
-    const cb = argAt(args, 0);
-    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    var i: usize = 0;
-    while (i + 1 < map.elements.items.len) : (i += 2) {
-        const k = map.elements.items[i];
-        const v = map.elements.items[i + 1];
-        _ = try vm.callValue(cb, Value.undefined_value, &.{ v, k, this });
-    }
-    return Value.undefined_value;
-}
-
-fn nativeSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const set = try vm.newSet();
-    try vm.protect(Value.fromObject(set));
-    defer vm.unprotect();
-    const init_v = argAt(args, 0);
-    if (init_v.isObject() and init_v.asObject().is_array) {
-        for (init_v.asObject().elements.items) |v| {
-            if (setFind(set, v) == null) try set.elements.append(vm.gpa, v);
-        }
-    }
-    return Value.fromObject(set);
-}
-fn nativeSetAdd(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const set = try thisCollection(vm, this, .set);
-    const v = argAt(args, 0);
-    if (setFind(set, v) == null) try set.elements.append(vm.gpa, v);
-    return this;
-}
-fn nativeSetHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const set = try thisCollection(vm, this, .set);
-    return Value.fromBool(setFind(set, argAt(args, 0)) != null);
-}
-fn nativeSetDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const set = try thisCollection(vm, this, .set);
-    if (setFind(set, argAt(args, 0))) |i| {
-        _ = set.elements.orderedRemove(i);
-        return Value.fromBool(true);
-    }
-    return Value.fromBool(false);
-}
-fn nativeSetSize(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const set = try thisCollection(vm, this, .set);
-    return Value.fromNumber(@floatFromInt(set.elements.items.len));
-}
-fn nativeSetForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const set = try thisCollection(vm, this, .set);
-    const cb = argAt(args, 0);
-    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    var i: usize = 0;
-    while (i < set.elements.items.len) : (i += 1) {
-        const v = set.elements.items[i];
-        _ = try vm.callValue(cb, Value.undefined_value, &.{ v, v, this });
-    }
-    return Value.undefined_value;
-}
-
-fn nativeCollectionClear(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = args;
-    if (this.isObject()) this.asObject().elements.clearRetainingCapacity();
-    return Value.undefined_value;
-}
-
-// ---- iterator built-ins ----------------------------------------------------
-
-fn nativeIterSelf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = args;
-    return this;
-}
-
-fn nativeGeneratorNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return castVm(ctx).generatorResume(this, argAt(args, 0), 0);
-}
-fn nativeGeneratorReturn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return castVm(ctx).generatorResume(this, argAt(args, 0), 1);
-}
-fn nativeGeneratorThrow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return castVm(ctx).generatorResume(this, argAt(args, 0), 2);
-}
-fn nativeIterableValues(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return castVm(ctx).makeIterator(this, 0);
-}
-fn nativeIterableKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return castVm(ctx).makeIterator(this, 1);
-}
-fn nativeIterableEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return castVm(ctx).makeIterator(this, 2);
-}
-
-fn nativeIteratorNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (!this.isObject()) return vm.throwTypeError("not an iterator");
-    const t = try vm.getProperty(this, "\x00itT");
-    if (t.isUndefined()) return vm.makeIterResult(Value.undefined_value, true);
-    const idx: usize = @intFromFloat((try vm.getProperty(this, "\x00itI")).asNumber());
-    const kind: u8 = @intFromFloat((try vm.getProperty(this, "\x00itK")).asNumber());
-
-    var value: Value = Value.undefined_value;
-    var exhausted = false;
-    const index_val = Value.fromNumber(@floatFromInt(idx));
-    if (t.isString()) {
-        const units = t.asString().units;
-        if (idx >= units.len) exhausted = true else value = try vm.makeStringFromUtf16(units[idx .. idx + 1]);
-    } else if (t.isObject()) {
-        const o = t.asObject();
-        if (o.is_array) {
-            // Array iterator visits 0..length; holes yield `undefined`.
-            if (idx >= @as(usize, o.array_length)) exhausted = true else {
-                value = try vm.iterEntryValue(kind, index_val, Vm.arrayGetOwn(o, @intCast(idx)) orelse Value.undefined_value);
-            }
-        } else if (o.ta) |ta| {
-            if (idx >= ta.length) exhausted = true else value = try vm.iterEntryValue(kind, index_val, readTypedElement(ta, @intCast(idx)));
-        } else if (o.collection == .set) {
-            if (idx >= o.elements.items.len) exhausted = true else {
-                const v = o.elements.items[idx];
-                value = if (kind == 2) try vm.iterPair(v, v) else v;
-            }
-        } else if (o.collection == .map) {
-            const count = o.elements.items.len / 2;
-            if (idx >= count) exhausted = true else {
-                const k = o.elements.items[idx * 2];
-                const v = o.elements.items[idx * 2 + 1];
-                value = switch (kind) {
-                    1 => k,
-                    2 => try vm.iterPair(k, v),
-                    else => v,
-                };
-            }
-        } else exhausted = true;
-    } else exhausted = true;
-
-    if (exhausted) {
-        try vm.setProperty(this, "\x00itT", Value.undefined_value);
-        return vm.makeIterResult(Value.undefined_value, true);
-    }
-    try vm.setProperty(this, "\x00itI", Value.fromNumber(@floatFromInt(idx + 1)));
-    return vm.makeIterResult(value, false);
-}
-
-// ---- Date built-ins --------------------------------------------------------
-//
-// The time value (ms since the Unix epoch) is stored in a non-enumerable
-// internal property under a key that can't be written from source (leading
-// NUL). Local time is treated as UTC (no timezone support yet).
-
-const date_key = "\x00DateValue";
-
-fn dateTimeOf(vm: *Vm, this: Value) Error!f64 {
-    if (!this.isObject()) return vm.throwTypeError("this is not a Date");
-    const v = try vm.getProperty(this, date_key);
-    return if (v.isNumber()) v.asNumber() else std.math.nan(f64);
-}
-fn setDateTime(vm: *Vm, obj: *gc.Object, ms: f64) Error!void {
-    try vm.defineData(obj, date_key, Value.fromNumber(ms), true, false, false);
-}
-
-fn timeClip(t: f64) f64 {
-    if (std.math.isNan(t) or std.math.isInf(t) or @abs(t) > 8.64e15) return std.math.nan(f64);
-    return std.math.trunc(t);
-}
-
-const CivilDate = struct { y: i64, m: i64, d: i64 };
-fn civilFromDays(z_in: i64) CivilDate {
-    const z = z_in + 719468;
-    const era = @divTrunc(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
-    const mp = @divTrunc(5 * doy + 2, 153);
-    const d = doy - @divTrunc(153 * mp + 2, 5) + 1;
-    const m = if (mp < 10) mp + 3 else mp - 9;
-    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
-}
-fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
-    const y = if (m <= 2) y_in - 1 else y_in;
-    const era = @divTrunc(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400;
-    const mp = if (m > 2) m - 3 else m + 9;
-    const doy = @divTrunc(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
-}
-
-const DateParts = struct { year: i64, month: i64, day: i64, hours: i64, minutes: i64, seconds: i64, millis: i64, weekday: i64 };
-fn msToParts(ms_f: f64) DateParts {
-    const t: i64 = @intFromFloat(std.math.floor(ms_f));
-    const day = @divFloor(t, 86400000);
-    var rem = @mod(t, 86400000);
-    const hours = @divFloor(rem, 3600000);
-    rem = @mod(rem, 3600000);
-    const minutes = @divFloor(rem, 60000);
-    rem = @mod(rem, 60000);
-    const seconds = @divFloor(rem, 1000);
-    const millis = @mod(rem, 1000);
-    const weekday = @mod(@mod(day + 4, 7) + 7, 7); // day 0 (epoch) is Thursday
-    const c = civilFromDays(day);
-    return .{ .year = c.y, .month = c.m - 1, .day = c.d, .hours = hours, .minutes = minutes, .seconds = seconds, .millis = millis, .weekday = weekday };
-}
-
-/// Assemble a time value from components (month is 0-based; overflow allowed).
-fn makeDateTime(year_in: f64, month: f64, day: f64, h: f64, mi: f64, s: f64, ms: f64) f64 {
-    for ([_]f64{ year_in, month, day, h, mi, s, ms }) |c| {
-        if (std.math.isNan(c) or std.math.isInf(c)) return std.math.nan(f64);
-    }
-    var year: i64 = @intFromFloat(std.math.trunc(year_in));
-    var mon: i64 = @intFromFloat(std.math.trunc(month));
-    year += @divFloor(mon, 12);
-    mon = @mod(mon, 12);
-    const days = daysFromCivil(year, mon + 1, 1) + @as(i64, @intFromFloat(std.math.trunc(day))) - 1;
-    const total = days * 86400000 +
-        @as(i64, @intFromFloat(std.math.trunc(h))) * 3600000 +
-        @as(i64, @intFromFloat(std.math.trunc(mi))) * 60000 +
-        @as(i64, @intFromFloat(std.math.trunc(s))) * 1000 +
-        @as(i64, @intFromFloat(std.math.trunc(ms)));
-    return @floatFromInt(total);
-}
-
-/// Current wall-clock time in ms since the Unix epoch.
-fn nowMs() f64 {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
-    const ts = std.Io.Clock.now(.real, io);
-    const ms: i64 = @intCast(@divTrunc(ts.nanoseconds, 1_000_000));
-    return @floatFromInt(ms);
-}
-
-fn nativeDateNow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
-    _ = this;
-    _ = args;
-    return Value.fromNumber(nowMs());
-}
-
-fn componentsToMs(vm: *Vm, args: []const Value) Error!f64 {
-    var y = try vm.toNumber(argAt(args, 0));
-    if (y >= 0 and y <= 99 and y == std.math.trunc(y)) y += 1900;
-    const mo = try vm.toNumber(argAt(args, 1));
-    const d = if (args.len > 2) try vm.toNumber(args[2]) else 1;
-    const h = if (args.len > 3) try vm.toNumber(args[3]) else 0;
-    const mi = if (args.len > 4) try vm.toNumber(args[4]) else 0;
-    const s = if (args.len > 5) try vm.toNumber(args[5]) else 0;
-    const ms = if (args.len > 6) try vm.toNumber(args[6]) else 0;
-    return makeDateTime(y, mo, d, h, mi, s, ms);
-}
-
-fn nativeDate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    // Called without `new`: return a string for the current time.
-    if (!this.isObject() or this.asObject().prototype != vm.date_proto) {
-        var buf: [40]u8 = undefined;
-        return vm.makeString(formatIso(&buf, nowMs()));
-    }
-    const obj = this.asObject();
-    var ms: f64 = undefined;
-    if (args.len == 0) {
-        ms = nowMs();
-    } else if (args.len == 1) {
-        const a = args[0];
-        if (a.isObject() and a.asObject().prototype == vm.date_proto) {
-            ms = try dateTimeOf(vm, a);
-        } else if (a.isString()) {
-            const utf8 = try utf16ToUtf8Alloc(vm.gpa, a.asString().units);
-            defer vm.gpa.free(utf8);
-            ms = parseIsoDate(utf8);
-        } else {
-            ms = timeClip(try vm.toNumber(a));
-        }
-    } else {
-        ms = timeClip(try componentsToMs(vm, args));
-    }
-    try setDateTime(vm, obj, timeClip(ms));
-    return this;
-}
-
-fn nativeDateUTC(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    return Value.fromNumber(timeClip(try componentsToMs(vm, args)));
-}
-fn nativeDateParse(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const s = try coerceToString(vm, argAt(args, 0));
-    try vm.protect(s);
-    defer vm.unprotect();
-    const utf8 = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
-    defer vm.gpa.free(utf8);
-    return Value.fromNumber(parseIsoDate(utf8));
-}
-
-fn nativeDateGetTime(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return Value.fromNumber(try dateTimeOf(castVm(ctx), this));
-}
-fn nativeDateSetTime(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!this.isObject()) return vm.throwTypeError("this is not a Date");
-    const ms = timeClip(try vm.toNumber(argAt(args, 0)));
-    try setDateTime(vm, this.asObject(), ms);
-    return Value.fromNumber(ms);
-}
-
-fn dateField(vm: *Vm, this: Value, comptime field: []const u8) Error!Value {
-    const t = try dateTimeOf(vm, this);
-    if (std.math.isNan(t)) return Value.fromNumber(std.math.nan(f64));
-    const p = msToParts(t);
-    return Value.fromNumber(@floatFromInt(@field(p, field)));
-}
-fn nativeDateGetFullYear(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "year");
-}
-fn nativeDateGetMonth(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "month");
-}
-fn nativeDateGetDate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "day");
-}
-fn nativeDateGetDay(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "weekday");
-}
-fn nativeDateGetHours(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "hours");
-}
-fn nativeDateGetMinutes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "minutes");
-}
-fn nativeDateGetSeconds(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "seconds");
-}
-fn nativeDateGetMs(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    return dateField(castVm(ctx), this, "millis");
-}
-
-const weekday_names = [7][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-const month_names = [12][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-
-/// One component-setter for the whole set*/setUTC* family (local == UTC here).
-/// `first` indexes [year, month, day, hours, minutes, seconds, ms]; `count`
-/// arguments starting there are replaced (missing ones keep current values).
-fn dateSet(vm: *Vm, this: Value, args: []const Value, first: usize, count: usize) Error!Value {
-    const t = try dateTimeOf(vm, this);
-    var comps: [7]f64 = undefined;
-    if (std.math.isNan(t)) {
-        if (first == 0) {
-            // setFullYear on an invalid date starts from +0 per spec.
-            comps = .{ 1970, 0, 1, 0, 0, 0, 0 };
-        } else {
-            @memset(&comps, std.math.nan(f64));
-        }
-    } else {
-        const p = msToParts(t);
-        comps = .{
-            @floatFromInt(p.year),    @floatFromInt(p.month),   @floatFromInt(p.day),
-            @floatFromInt(p.hours),   @floatFromInt(p.minutes), @floatFromInt(p.seconds),
-            @floatFromInt(p.millis),
-        };
-    }
-    var i: usize = 0;
-    while (i < count and i < args.len) : (i += 1) {
-        comps[first + i] = try vm.toNumber(args[i]);
-    }
-    const nt = timeClip(makeDateTime(comps[0], comps[1], comps[2], comps[3], comps[4], comps[5], comps[6]));
-    if (!this.isObject()) return vm.throwTypeError("this is not a Date");
-    try setDateTime(vm, this.asObject(), nt);
-    return Value.fromNumber(nt);
-}
-
-fn nativeDateSetFullYear(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return dateSet(castVm(ctx), this, args, 0, 3);
-}
-fn nativeDateSetMonth(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return dateSet(castVm(ctx), this, args, 1, 2);
-}
-fn nativeDateSetDate(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return dateSet(castVm(ctx), this, args, 2, 1);
-}
-fn nativeDateSetHours(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return dateSet(castVm(ctx), this, args, 3, 4);
-}
-fn nativeDateSetMinutes(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return dateSet(castVm(ctx), this, args, 4, 3);
-}
-fn nativeDateSetSeconds(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return dateSet(castVm(ctx), this, args, 5, 2);
-}
-fn nativeDateSetMilliseconds(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    return dateSet(castVm(ctx), this, args, 6, 1);
-}
-
-fn nativeDateGetTimezoneOffset(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const t = try dateTimeOf(castVm(ctx), this);
-    if (std.math.isNan(t)) return Value.fromNumber(std.math.nan(f64));
-    return Value.fromNumber(0); // local time == UTC in this engine
-}
-
-fn nativeDateToDateString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const t = try dateTimeOf(vm, this);
-    if (std.math.isNan(t)) return vm.makeString("Invalid Date");
-    const p = msToParts(t);
-    var buf: [48]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{s} {s} {d:0>2} {d}", .{
-        weekday_names[@intCast(p.weekday)], month_names[@intCast(p.month)], @as(u64, @intCast(p.day)), p.year,
-    }) catch unreachable;
-    return vm.makeString(s);
-}
-
-fn nativeDateToTimeString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const t = try dateTimeOf(vm, this);
-    if (std.math.isNan(t)) return vm.makeString("Invalid Date");
-    const p = msToParts(t);
-    var buf: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d:0>2}:{d:0>2}:{d:0>2} GMT+0000 (Coordinated Universal Time)", .{
-        @as(u64, @intCast(p.hours)), @as(u64, @intCast(p.minutes)), @as(u64, @intCast(p.seconds)),
-    }) catch unreachable;
-    return vm.makeString(s);
-}
-
-fn nativeDateToUTCString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const t = try dateTimeOf(vm, this);
-    if (std.math.isNan(t)) return vm.makeString("Invalid Date");
-    const p = msToParts(t);
-    var buf: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        weekday_names[@intCast(p.weekday)], @as(u64, @intCast(p.day)),     month_names[@intCast(p.month)],
-        p.year,                             @as(u64, @intCast(p.hours)),   @as(u64, @intCast(p.minutes)),
-        @as(u64, @intCast(p.seconds)),
-    }) catch unreachable;
-    return vm.makeString(s);
-}
-
-/// Write `val` right-aligned, zero-padded to `width` digits into `dst`.
-fn writePadded(dst: []u8, val: i64, width: usize) usize {
-    var v: u64 = @intCast(if (val < 0) 0 else val);
-    var j = width;
-    while (j > 0) {
-        j -= 1;
-        dst[j] = '0' + @as(u8, @intCast(v % 10));
-        v /= 10;
-    }
-    return width;
-}
-fn formatIso(buf: []u8, ms: f64) []const u8 {
-    if (std.math.isNan(ms)) return "Invalid Date";
-    const p = msToParts(ms);
-    var i: usize = 0;
-    i += writePadded(buf[i..], p.year, 4);
-    buf[i] = '-';
-    i += 1;
-    i += writePadded(buf[i..], p.month + 1, 2);
-    buf[i] = '-';
-    i += 1;
-    i += writePadded(buf[i..], p.day, 2);
-    buf[i] = 'T';
-    i += 1;
-    i += writePadded(buf[i..], p.hours, 2);
-    buf[i] = ':';
-    i += 1;
-    i += writePadded(buf[i..], p.minutes, 2);
-    buf[i] = ':';
-    i += 1;
-    i += writePadded(buf[i..], p.seconds, 2);
-    buf[i] = '.';
-    i += 1;
-    i += writePadded(buf[i..], p.millis, 3);
-    buf[i] = 'Z';
-    i += 1;
-    return buf[0..i];
-}
-fn nativeDateToISOString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    const t = try dateTimeOf(vm, this);
-    if (std.math.isNan(t)) return vm.throwRangeError("Invalid time value");
-    var buf: [40]u8 = undefined;
-    return vm.makeString(formatIso(&buf, t));
-}
-
-/// Minimal ISO 8601 parser: `YYYY-MM-DD` and `YYYY-MM-DDTHH:mm:ss(.sss)?Z?`.
-fn parseIsoDate(s: []const u8) f64 {
-    const nan = std.math.nan(f64);
-    if (s.len < 10) return nan;
-    const year = std.fmt.parseInt(i64, s[0..4], 10) catch return nan;
-    if (s[4] != '-' or s[7] != '-') return nan;
-    const month = std.fmt.parseInt(i64, s[5..7], 10) catch return nan;
-    const day = std.fmt.parseInt(i64, s[8..10], 10) catch return nan;
-    var h: f64 = 0;
-    var mi: f64 = 0;
-    var sec: f64 = 0;
-    var ms: f64 = 0;
-    if (s.len >= 19 and (s[10] == 'T' or s[10] == ' ')) {
-        h = @floatFromInt(std.fmt.parseInt(i64, s[11..13], 10) catch return nan);
-        mi = @floatFromInt(std.fmt.parseInt(i64, s[14..16], 10) catch return nan);
-        sec = @floatFromInt(std.fmt.parseInt(i64, s[17..19], 10) catch return nan);
-        if (s.len >= 23 and s[19] == '.') {
-            ms = @floatFromInt(std.fmt.parseInt(i64, s[20..23], 10) catch return nan);
-        }
-    }
-    return timeClip(makeDateTime(@floatFromInt(year), @floatFromInt(month - 1), @floatFromInt(day), h, mi, sec, ms));
-}
-
-// ---- TypedArray / ArrayBuffer built-ins ------------------------------------
-
-fn readTypedElement(ta: gc.TypedArrayView, i: u32) Value {
-    const bytes = ta.buffer.buffer_data.?;
-    const off = ta.offset + i * gc.bytesPerElement(ta.kind);
-    const n: f64 = switch (ta.kind) {
-        .i8 => @floatFromInt(@as(i8, @bitCast(bytes[off]))),
-        .u8, .u8c => @floatFromInt(bytes[off]),
-        .i16 => @floatFromInt(std.mem.readInt(i16, bytes[off..][0..2], .little)),
-        .u16 => @floatFromInt(std.mem.readInt(u16, bytes[off..][0..2], .little)),
-        .i32 => @floatFromInt(std.mem.readInt(i32, bytes[off..][0..4], .little)),
-        .u32 => @floatFromInt(std.mem.readInt(u32, bytes[off..][0..4], .little)),
-        .f32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[off..][0..4], .little)))),
-        .f64 => @bitCast(std.mem.readInt(u64, bytes[off..][0..8], .little)),
-    };
-    return Value.fromNumber(n);
-}
-
-fn clampToU8(n: f64) u8 {
-    if (std.math.isNan(n) or n <= 0) return 0;
-    if (n >= 255) return 255;
-    return @intFromFloat(std.math.round(n));
-}
-
-fn writeTypedElement(ta: gc.TypedArrayView, i: u32, n: f64) void {
-    const bytes = ta.buffer.buffer_data.?;
-    const off = ta.offset + i * gc.bytesPerElement(ta.kind);
-    const bits: u32 = @bitCast(doubleToInt32(n)); // ToInt32/ToUint32 bit pattern
-    switch (ta.kind) {
-        .i8, .u8 => bytes[off] = @truncate(bits),
-        .u8c => bytes[off] = clampToU8(n),
-        .i16, .u16 => std.mem.writeInt(u16, bytes[off..][0..2], @truncate(bits), .little),
-        .i32, .u32 => std.mem.writeInt(u32, bytes[off..][0..4], bits, .little),
-        .f32 => std.mem.writeInt(u32, bytes[off..][0..4], @bitCast(@as(f32, @floatCast(n))), .little),
-        .f64 => std.mem.writeInt(u64, bytes[off..][0..8], @bitCast(n), .little),
-    }
-}
-
-fn nativeArrayBuffer(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!this.isObject()) return vm.throwTypeError("Constructor ArrayBuffer requires 'new'");
-    const len_f = try vm.toNumber(argAt(args, 0));
-    if (std.math.isNan(len_f) or len_f < 0 or len_f > 0x7fffffff) return vm.throwRangeError("Invalid array buffer length");
-    const len: u32 = @intFromFloat(len_f);
-    const data = try vm.gpa.alloc(u8, len);
-    @memset(data, 0);
-    this.asObject().buffer_data = data;
-    return this;
-}
-
-fn typedArrayConstructor(comptime kind: gc.TAKind) gc.NativeFn {
-    return struct {
-        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-            const vm = castVm(ctx);
-            if (!this.isObject()) return vm.throwTypeError("Constructor requires 'new'");
-            const obj = this.asObject();
-            const bpe = gc.bytesPerElement(kind);
-            const arg = argAt(args, 0);
-
-            if (arg.isObject() and arg.asObject().buffer_data != null and arg.asObject().ta == null) {
-                // View over an existing ArrayBuffer.
-                const buffer = arg.asObject();
-                const off_f = if (args.len > 1) try vm.toNumber(args[1]) else 0;
-                const offset: u32 = @intFromFloat(@max(0, off_f));
-                const avail = buffer.buffer_data.?.len - @min(offset, buffer.buffer_data.?.len);
-                const length: u32 = if (args.len > 2 and !args[2].isUndefined())
-                    @intFromFloat(@max(0, try vm.toNumber(args[2])))
-                else
-                    @intCast(avail / bpe);
-                if (offset + length * bpe > buffer.buffer_data.?.len) return vm.throwRangeError("Invalid typed array length");
-                obj.ta = .{ .buffer = buffer, .offset = offset, .length = length, .kind = kind };
-            } else if (arg.isObject() and (arg.asObject().is_array or arg.asObject().ta != null)) {
-                // Copy from an array or another typed array.
-                const src = arg.asObject();
-                const length: u32 = if (src.is_array) @intCast(src.elements.items.len) else src.ta.?.length;
-                const buffer = try vm.newArrayBuffer(length * bpe);
-                obj.ta = .{ .buffer = buffer, .offset = 0, .length = length, .kind = kind };
-                var i: u32 = 0;
-                while (i < length) : (i += 1) {
-                    const el = if (src.is_array) src.elements.items[i] else readTypedElement(src.ta.?, i);
-                    writeTypedElement(obj.ta.?, i, try vm.toNumber(el));
-                }
-            } else {
-                // Length (or empty).
-                const len_f = if (arg.isUndefined()) 0 else try vm.toNumber(arg);
-                if (std.math.isNan(len_f) or len_f < 0 or len_f > 0x3fffffff) return vm.throwRangeError("Invalid typed array length");
-                const length: u32 = @intFromFloat(len_f);
-                const buffer = try vm.newArrayBuffer(length * bpe);
-                obj.ta = .{ .buffer = buffer, .offset = 0, .length = length, .kind = kind };
-            }
-            return this;
-        }
-    }.call;
-}
-
-fn thisTypedArray(vm: *Vm, this: Value) Error!gc.TypedArrayView {
-    if (!this.isObject() or this.asObject().ta == null) return vm.throwTypeError("not a TypedArray");
-    return this.asObject().ta.?;
-}
-
-fn nativeTAFill(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const ta = try thisTypedArray(vm, this);
-    const n = try vm.toNumber(argAt(args, 0));
-    const len: i64 = @intCast(ta.length);
-    const start = relativeIndex(try optNumber(vm, argAt(args, 1), 0), len);
-    const end = relativeIndex(try optNumber(vm, argAt(args, 2), @floatFromInt(len)), len);
-    var i = start;
-    while (i < end) : (i += 1) writeTypedElement(ta, @intCast(i), n);
-    return this;
-}
-
-fn nativeTASet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const ta = try thisTypedArray(vm, this);
-    const src = argAt(args, 0);
-    const offset: u32 = @intFromFloat(@max(0, try optNumber(vm, argAt(args, 1), 0)));
-    if (src.isObject() and src.asObject().is_array) {
-        const a = src.asObject();
-        const n = a.array_length;
-        if (@as(u64, offset) + n > ta.length) return vm.throwRangeError("offset is out of bounds");
-        var i: u32 = 0;
-        while (i < n) : (i += 1) {
-            try vm.checkBudget();
-            writeTypedElement(ta, offset + i, try vm.toNumber(Vm.arrayGetOwn(a, i) orelse Value.undefined_value));
-        }
-    } else if (src.isObject() and src.asObject().ta != null) {
-        const s = src.asObject().ta.?;
-        if (offset + s.length > ta.length) return vm.throwRangeError("offset is out of bounds");
-        var i: u32 = 0;
-        while (i < s.length) : (i += 1) writeTypedElement(ta, offset + i, readTypedElement(s, i).asNumber());
-    } else {
-        return vm.throwTypeError("argument is not array-like");
-    }
-    return Value.undefined_value;
-}
-
-fn nativeTASubarray(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const ta = try thisTypedArray(vm, this);
-    const len: i64 = @intCast(ta.length);
-    const start = relativeIndex(try optNumber(vm, argAt(args, 0), 0), len);
-    const end = relativeIndex(try optNumber(vm, argAt(args, 1), @floatFromInt(len)), len);
-    const new_len: u32 = if (end > start) @intCast(end - start) else 0;
-    const bpe = gc.bytesPerElement(ta.kind);
-    // Shares the same backing buffer (a view, not a copy).
-    const view = try vm.newTypedArray(this.asObject().prototype, ta.buffer, ta.offset + @as(u32, @intCast(start)) * bpe, new_len, ta.kind);
-    return Value.fromObject(view);
-}
-
-fn nativeTAJoin(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const ta = try thisTypedArray(vm, this);
-    const sep = if (argAt(args, 0).isUndefined()) try vm.makeString(",") else try vm.toStringVal(argAt(args, 0));
-    try vm.protect(sep);
-    defer vm.unprotect();
-    var buf: std.ArrayList(u16) = .empty;
-    defer buf.deinit(vm.gpa);
-    var i: u32 = 0;
-    while (i < ta.length) : (i += 1) {
-        if (i > 0) try buf.appendSlice(vm.gpa, sep.asString().units);
-        const s = try vm.toStringVal(readTypedElement(ta, i));
-        try buf.appendSlice(vm.gpa, s.asString().units);
-    }
-    return vm.makeStringFromUtf16(buf.items);
-}
-
-fn nativeTAForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const ta = try thisTypedArray(vm, this);
-    const cb = argAt(args, 0);
-    if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    var i: u32 = 0;
-    while (i < ta.length) : (i += 1) {
-        _ = try vm.callValue(cb, Value.undefined_value, &.{ readTypedElement(ta, i), Value.fromNumber(@floatFromInt(i)), this });
-    }
-    return Value.undefined_value;
-}
-
-fn nativeTAIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const ta = try thisTypedArray(vm, this);
-    const target = try vm.toNumber(argAt(args, 0));
-    var i: u32 = 0;
-    while (i < ta.length) : (i += 1) {
-        if (readTypedElement(ta, i).asNumber() == target) return Value.fromNumber(@floatFromInt(i));
-    }
-    return Value.fromNumber(-1);
-}
-
-// ---- DataView --------------------------------------------------------------
-
-fn nativeDataView(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!this.isObject()) return vm.throwTypeError("Constructor DataView requires 'new'");
-    const buf_v = argAt(args, 0);
-    if (!buf_v.isObject() or buf_v.asObject().buffer_data == null or buf_v.asObject().ta != null) {
-        return vm.throwTypeError("First argument to DataView constructor must be an ArrayBuffer");
-    }
-    const buffer = buf_v.asObject();
-    const total = buffer.buffer_data.?.len;
-    const offset: u32 = @intFromFloat(@max(0, try optNumber(vm, argAt(args, 1), 0)));
-    if (offset > total) return vm.throwRangeError("Start offset is outside the bounds of the buffer");
-    const length: u32 = if (args.len > 2 and !args[2].isUndefined())
-        @intFromFloat(@max(0, try vm.toNumber(args[2])))
-    else
-        @intCast(total - offset);
-    if (offset + length > total) return vm.throwRangeError("Invalid DataView length");
-    const obj = this.asObject();
-    obj.ta = .{ .buffer = buffer, .offset = offset, .length = length, .kind = .u8 };
-    obj.is_dataview = true;
-    return this;
-}
-
-fn thisDataView(vm: *Vm, this: Value) Error!gc.TypedArrayView {
-    if (!this.isObject() or !this.asObject().is_dataview) return vm.throwTypeError("not a DataView");
-    return this.asObject().ta.?;
-}
-
-/// DataView.prototype.get<Type>(byteOffset, littleEndian?). `single_byte`
-/// types ignore the endianness argument; DataView defaults to big-endian.
-fn dataViewGet(comptime T: type, comptime is_float: bool, comptime single_byte: bool) gc.NativeFn {
-    return struct {
-        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-            const vm = castVm(ctx);
-            const dv = try thisDataView(vm, this);
-            const off: u32 = @intFromFloat(@max(0, try vm.toNumber(argAt(args, 0))));
-            const size = @sizeOf(T);
-            if (off + size > dv.length) return vm.throwRangeError("Offset is outside the bounds of the DataView");
-            const endian: std.builtin.Endian = if (single_byte or toBoolean(argAt(args, 1))) .little else .big;
-            const bytes = dv.buffer.buffer_data.?;
-            const p = bytes[dv.offset + off ..][0..size];
-            if (is_float) {
-                const Bits = if (T == f32) u32 else u64;
-                const raw = std.mem.readInt(Bits, p, endian);
-                return Value.fromNumber(@as(T, @bitCast(raw)));
-            }
-            return Value.fromNumber(@floatFromInt(std.mem.readInt(T, p, endian)));
-        }
-    }.call;
-}
-
-fn dataViewSet(comptime T: type, comptime is_float: bool, comptime single_byte: bool) gc.NativeFn {
-    return struct {
-        fn call(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-            const vm = castVm(ctx);
-            const dv = try thisDataView(vm, this);
-            const off: u32 = @intFromFloat(@max(0, try vm.toNumber(argAt(args, 0))));
-            const size = @sizeOf(T);
-            if (off + size > dv.length) return vm.throwRangeError("Offset is outside the bounds of the DataView");
-            const n = try vm.toNumber(argAt(args, 1));
-            const endian: std.builtin.Endian = if (single_byte or toBoolean(argAt(args, 2))) .little else .big;
-            const bytes = dv.buffer.buffer_data.?;
-            const p = bytes[dv.offset + off ..][0..size];
-            if (is_float) {
-                const Bits = if (T == f32) u32 else u64;
-                const casted: T = @floatCast(n);
-                std.mem.writeInt(Bits, p, @bitCast(casted), endian);
-            } else {
-                const bits: u32 = @bitCast(doubleToInt32(n));
-                const UT = std.meta.Int(.unsigned, @bitSizeOf(T));
-                std.mem.writeInt(UT, p, @truncate(bits), endian);
-            }
-            return Value.undefined_value;
-        }
-    }.call;
-}
-
-// ---- Symbol built-ins ------------------------------------------------------
-
-fn nativeSymbol(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    // Symbol is not a constructor.
-    if (this.isObject() and this.asObject().prototype == vm.symbol_proto) {
-        return vm.throwTypeError("Symbol is not a constructor");
-    }
-    const desc_v = argAt(args, 0);
-    if (desc_v.isUndefined()) return vm.makeSymbol(null);
-    const s = try vm.toStringVal(desc_v);
-    try vm.protect(s);
-    defer vm.unprotect();
-    const utf8 = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
-    defer vm.gpa.free(utf8);
-    return vm.makeSymbol(utf8);
-}
-
-fn nativeSymbolToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (!this.isSymbol()) return vm.throwTypeError("Symbol.prototype.toString called on non-symbol");
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.gpa);
-    try buf.appendSlice(vm.gpa, "Symbol(");
-    if (this.asSymbol().description) |d| {
-        const utf8 = try utf16ToUtf8Alloc(vm.gpa, d);
-        defer vm.gpa.free(utf8);
-        try buf.appendSlice(vm.gpa, utf8);
-    }
-    try buf.append(vm.gpa, ')');
-    return vm.makeString(buf.items);
-}
-
-fn nativeSymbolValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (!this.isSymbol()) return vm.throwTypeError("Symbol.prototype.valueOf called on non-symbol");
-    return this;
-}
-
-fn nativeSymbolDescription(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
-    const vm = castVm(ctx);
-    if (!this.isSymbol()) return vm.throwTypeError("Symbol.prototype.description called on non-symbol");
-    if (this.asSymbol().description) |d| return vm.makeStringFromUtf16(d);
-    return Value.undefined_value;
-}
-
-fn nativeSymbolFor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const s = try vm.toStringVal(argAt(args, 0));
-    try vm.protect(s);
-    defer vm.unprotect();
-    const key = try utf16ToUtf8Alloc(vm.gpa, s.asString().units);
-    defer vm.gpa.free(key);
-    for (vm.symbol_registry.items) |r| {
-        if (std.mem.eql(u8, r.key, key)) return Value.fromSymbol(r.sym);
-    }
-    const sym_val = try vm.makeSymbol(key);
-    try vm.symbol_registry.append(vm.gpa, .{ .key = try vm.gpa.dupe(u8, key), .sym = sym_val.asSymbol() });
-    return sym_val;
-}
-
-fn nativeSymbolKeyFor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const s = argAt(args, 0);
-    if (!s.isSymbol()) return vm.throwTypeError("Symbol.keyFor requires a symbol argument");
-    for (vm.symbol_registry.items) |r| {
-        if (r.sym == s.asSymbol()) return vm.makeString(r.key);
-    }
-    return Value.undefined_value;
-}
-
-// ---- Proxy + Reflect built-ins ---------------------------------------------
-
-fn nativeProxy(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!this.isObject()) return vm.throwTypeError("Constructor Proxy requires 'new'");
-    const target = argAt(args, 0);
-    const handler = argAt(args, 1);
-    if (!target.isObject() or !handler.isObject()) {
-        return vm.throwTypeError("Cannot create proxy with a non-object as target or handler");
-    }
-    const obj = this.asObject();
-    obj.proxy_target = target.asObject();
-    obj.proxy_handler = handler.asObject();
-    // Inherit callability so `typeof` and call/construct dispatch behave.
-    obj.callable = target.asObject().callable;
-    return this;
-}
-
-fn nativeReflectGet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    if (!target.isObject()) return vm.throwTypeError("Reflect.get called on non-object");
-    const key = try vm.toPropertyKey(argAt(args, 1));
-    defer vm.gpa.free(key);
-    return vm.getProperty(target, key);
-}
-fn nativeReflectSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    if (!target.isObject()) return vm.throwTypeError("Reflect.set called on non-object");
-    const key = try vm.toPropertyKey(argAt(args, 1));
-    defer vm.gpa.free(key);
-    try vm.setProperty(target, key, argAt(args, 2));
-    return Value.fromBool(true);
-}
-fn nativeReflectHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    if (!target.isObject()) return vm.throwTypeError("Reflect.has called on non-object");
-    return Value.fromBool(try vm.inOperator(argAt(args, 1), target));
-}
-fn nativeReflectDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    if (!target.isObject()) return vm.throwTypeError("Reflect.deleteProperty called on non-object");
-    const key = try vm.toPropertyKey(argAt(args, 1));
-    defer vm.gpa.free(key);
-    if (target.asObject().properties.fetchOrderedRemove(key)) |kv| vm.gpa.free(kv.key);
-    return Value.fromBool(true);
-}
-fn nativeReflectGetProto(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    if (!target.isObject()) return vm.throwTypeError("Reflect.getPrototypeOf called on non-object");
-    return if (target.asObject().prototype) |p| Value.fromObject(p) else Value.null_value;
-}
-fn nativeReflectOwnKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    if (!target.isObject()) return vm.throwTypeError("Reflect.ownKeys called on non-object");
-    const o = target.asObject();
-    const result = try vm.newArray(0);
-    try vm.protect(Value.fromObject(result));
-    defer vm.unprotect();
-    if (o.is_array) {
-        var idxs: std.ArrayList(u32) = .empty;
-        defer idxs.deinit(vm.gpa);
-        try vm.arrayPresentIndices(o, &idxs);
-        for (idxs.items) |i| {
-            var b: [16]u8 = undefined;
-            try vm.arrayAppend(result, try vm.makeString(std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable));
-        }
-    }
-    var it = o.properties.iterator();
-    while (it.next()) |entry| {
-        const k = entry.key_ptr.*;
-        if (k.len > 0 and k[0] == 0) continue; // skip internal/symbol keys
-        try vm.arrayAppend(result, try vm.makeString(k));
-    }
-    return Value.fromObject(result);
-}
-fn nativeReflectApply(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    const this_arg = argAt(args, 1);
-    const args_arr = argAt(args, 2);
-    const list = try vm.argListFromArray(args_arr);
-    defer vm.gpa.free(list);
-    return vm.callValue(target, this_arg, list);
-}
-fn nativeReflectConstruct(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const target = argAt(args, 0);
-    if (!isConstructorValue(target)) return vm.throwTypeError("Reflect.construct target is not a constructor");
-    // newTarget defaults to target; when supplied it must also be a constructor.
-    if (args.len >= 3 and !isConstructorValue(args[2])) {
-        return vm.throwTypeError("Reflect.construct newTarget is not a constructor");
-    }
-    const args_arr = argAt(args, 1);
-    const list = try vm.argListFromArray(args_arr);
-    defer vm.gpa.free(list);
-    return vm.constructValue(target, list);
-}
-
-// ---- Function.prototype ----------------------------------------------------
-
-fn nativeFunctionCall(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.call called on non-function");
-    const this_arg = argAt(args, 0);
-    const rest: []const Value = if (args.len > 1) args[1..] else &.{};
-    return vm.callValue(this, this_arg, rest);
-}
-
-fn nativeFunctionApply(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.apply called on non-function");
-    const this_arg = argAt(args, 0);
-    const args_arr = argAt(args, 1);
-    const list = try vm.argListFromArray(args_arr);
-    defer vm.gpa.free(list);
-    return vm.callValue(this, this_arg, list);
-}
-
-fn nativeFunctionBind(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    if (!isCallable(this)) return vm.throwTypeError("Function.prototype.bind called on non-function");
-    const bound = try vm.makeNative("bound", nativeBoundTrampoline, 0);
-    try vm.protect(Value.fromObject(bound));
-    defer vm.unprotect();
-    bound.bound_target = this;
-    bound.bound_this = argAt(args, 0);
-    if (args.len > 1) for (args[1..]) |a| try bound.elements.append(vm.gpa, a);
-    return Value.fromObject(bound);
-}
-
-/// A bound function's [[Call]]/[[Construct]] are intercepted in `callValue`/
-/// `constructValue`; this native is never actually dispatched.
-fn nativeBoundTrampoline(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    _ = args;
-    return castVm(ctx).throwTypeError("bound function dispatched without interception");
-}
-
-/// `eval(x)`: non-strings pass through; strings run in the global scope.
-fn nativeEval(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    const a = argAt(args, 0);
-    if (!a.isString()) return a;
-    const src8 = try utf16ToUtf8Alloc(vm.gpa, a.asString().units);
-    defer vm.gpa.free(src8);
-    return vm.evalSource(src8);
-}
-
-/// The dynamic `Function(p1, …, body)` constructor: assemble a function
-/// expression and evaluate it in the global scope.
-fn nativeFunctionCtor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    const vm = castVm(ctx);
-    var src: std.ArrayList(u8) = .empty;
-    defer src.deinit(vm.gpa);
-    try src.appendSlice(vm.gpa, "return (function anonymous(");
-    const nparams = if (args.len == 0) 0 else args.len - 1;
-    for (args[0..nparams], 0..) |p, i| {
-        if (i > 0) try src.appendSlice(vm.gpa, ", ");
-        const ps = try vm.toStringVal(p);
-        try vm.protect(ps);
-        defer vm.unprotect();
-        const p8 = try utf16ToUtf8Alloc(vm.gpa, ps.asString().units);
-        defer vm.gpa.free(p8);
-        try src.appendSlice(vm.gpa, p8);
-    }
-    try src.appendSlice(vm.gpa, "\n) {\n");
-    if (args.len > 0) {
-        const bs = try vm.toStringVal(args[args.len - 1]);
-        try vm.protect(bs);
-        defer vm.unprotect();
-        const b8 = try utf16ToUtf8Alloc(vm.gpa, bs.asString().units);
-        defer vm.gpa.free(b8);
-        try src.appendSlice(vm.gpa, b8);
-    }
-    try src.appendSlice(vm.gpa, "\n});");
-    return vm.evalSource(src.items);
-}
-
-fn clampIndex(n: f64, len: i64) i64 {
-    if (std.math.isNan(n) or n < 0) return 0;
-    if (n > @as(f64, @floatFromInt(len))) return len;
-    return @intFromFloat(std.math.trunc(n));
-}
-
-fn isJsSpace(u: u16) bool {
-    return u == ' ' or u == '\t' or u == '\n' or u == '\r' or u == 0x0b or u == 0x0c or u == 0xa0 or u == 0xfeff;
-}
-
-/// Format an integer in the given radix into `buf`, returning the slice.
-fn formatRadix(value: i64, radix: u8, buf: []u8) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    var n: u64 = if (value < 0) @intCast(-value) else @intCast(value);
-    var i: usize = buf.len;
-    while (n > 0) {
-        i -= 1;
-        buf[i] = digits[@intCast(n % radix)];
-        n /= radix;
-    }
-    if (value < 0) {
-        i -= 1;
-        buf[i] = '-';
-    }
-    return buf[i..];
-}
-
-fn utf16ToUtf8Alloc(gpa: std.mem.Allocator, units: []const u16) Error![]u8 {
-    return std.unicode.utf16LeToUtf8Alloc(gpa, units) catch |e| switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => try gpa.dupe(u8, ""),
-    };
-}
-
-/// Parse a canonical array-index string (no leading zeros, < 2^32-1), else null.
-fn arrayIndex(key: []const u8) ?u32 {
-    if (key.len == 0 or key.len > 10) return null;
-    if (key.len > 1 and key[0] == '0') return null;
-    var n: u64 = 0;
-    for (key) |c| {
-        if (c < '0' or c > '9') return null;
-        n = n * 10 + (c - '0');
-    }
-    if (n >= 4294967295) return null;
-    return @intCast(n);
-}
-
-fn compareUtf16(a: []const u16, b: []const u16) i32 {
-    const n = @min(a.len, b.len);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (a[i] != b[i]) return if (a[i] < b[i]) -1 else 1;
-    }
-    if (a.len == b.len) return 0;
-    return if (a.len < b.len) -1 else 1;
-}
-
-// ---- tests -----------------------------------------------------------------
-
-const testing = std.testing;
-
-/// Compile and run `source`; return the script's completion value.
-fn eval(vm: *Vm, source: []const u8) !Value {
-    const parser = @import("parser.zig");
-    const compiler = @import("compiler.zig");
-    var pr = try parser.parse(testing.allocator, source, .script);
-    switch (pr) {
-        .syntax_error => return error.ParseFailed,
-        .ok => |*a| {
-            defer a.deinit();
-            var cr = try compiler.compile(testing.allocator, a.root, source);
-            switch (cr) {
-                .compile_error => return error.CompileFailed,
-                .ok => |*program| {
-                    defer program.deinit();
-                    return vm.run(program);
-                },
-            }
-        },
-    }
-}
-
-fn evalNumber(source: []const u8) !f64 {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    const v = try eval(&vm, source);
-    try testing.expect(v.isNumber());
-    return v.asNumber();
-}
-
-test "arithmetic" {
-    try testing.expectEqual(@as(f64, 7), try evalNumber("return 1 + 2 * 3;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 10 % 3;"));
-    try testing.expectEqual(@as(f64, 8), try evalNumber("return 2 ** 3;"));
-    try testing.expectEqual(@as(f64, -5), try evalNumber("return -(2 + 3);"));
-    try testing.expectEqual(@as(f64, 6), try evalNumber("return (0xF & 0x6) | 0;"));
-}
-
-test "variables and assignment" {
-    try testing.expectEqual(@as(f64, 30), try evalNumber("var a = 10; var b = 20; return a + b;"));
-    try testing.expectEqual(@as(f64, 15), try evalNumber("var a = 10; a += 5; return a;"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("var a = 1; var b = a++; return a + b;"));
-    try testing.expectEqual(@as(f64, 4), try evalNumber("var a = 1; var b = ++a; return a + b;"));
-}
-
-test "control flow" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("if (true) return 1; return 2;"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("if (false) return 1; else return 2;"));
-    try testing.expectEqual(@as(f64, 55), try evalNumber(
-        \\var sum = 0;
-        \\for (var i = 1; i <= 10; i++) sum += i;
-        \\return sum;
-    ));
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\var n = 3; var f = 1;
-        \\while (n > 0) { f *= n; n--; }
-        \\return f;
-    ));
-    try testing.expectEqual(@as(f64, 4), try evalNumber(
-        \\var i = 0;
-        \\for (;;) { i++; if (i === 4) break; }
-        \\return i;
-    ));
-}
-
-test "functions, recursion, closures" {
-    try testing.expectEqual(@as(f64, 120), try evalNumber(
-        \\function fact(n) { if (n <= 1) return 1; return n * fact(n - 1); }
-        \\return fact(5);
-    ));
-    try testing.expectEqual(@as(f64, 55), try evalNumber(
-        \\function fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }
-        \\return fib(10);
-    ));
-    try testing.expectEqual(@as(f64, 8), try evalNumber(
-        \\function adder(x) { return function(y) { return x + y; }; }
-        \\var add5 = adder(5);
-        \\return add5(3);
-    ));
-    try testing.expectEqual(@as(f64, 25), try evalNumber(
-        \\var square = (x) => x * x;
-        \\return square(5);
-    ));
-}
-
-test "logical and conditional" {
-    try testing.expectEqual(@as(f64, 2), try evalNumber("return 0 || 2;"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return 1 && 3;"));
-    try testing.expectEqual(@as(f64, 5), try evalNumber("return null ?? 5;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return true ? 1 : 2;"));
-}
-
-test "strings and equality" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-
-    const v = try eval(&vm, "return 'foo' + 'bar';");
-    try testing.expect(v.isString());
-    try testing.expectEqualSlices(u16, &[_]u16{ 'f', 'o', 'o', 'b', 'a', 'r' }, v.asString().units);
-
-    try testing.expect(toBoolean(try eval(&vm, "return 1 == '1';")));
-    try testing.expect(!toBoolean(try eval(&vm, "return 1 === '1';")));
-    try testing.expect(toBoolean(try eval(&vm, "return null == undefined;")));
-    try testing.expect(toBoolean(try eval(&vm, "return 'a' < 'b';")));
-}
-
-test "typeof" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    const v = try eval(&vm, "return typeof 42;");
-    try testing.expectEqualSlices(u16, &[_]u16{ 'n', 'u', 'm', 'b', 'e', 'r' }, v.asString().units);
-}
-
-test "try/catch catches a throw" {
-    try testing.expectEqual(@as(f64, 42), try evalNumber(
-        \\var result = 0;
-        \\try { throw 42; } catch (e) { result = e; }
-        \\return result;
-    ));
-}
-
-test "uncaught throw propagates" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    const r = eval(&vm, "throw 99;");
-    try testing.expectError(error.JsThrow, r);
-    try testing.expect(vm.pending_exception.?.isNumber());
-    try testing.expectEqual(@as(f64, 99), vm.pending_exception.?.asNumber());
-}
-
-test "calling a non-function throws" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    const r = eval(&vm, "var x = 5; return x();");
-    try testing.expectError(error.JsThrow, r);
-}
-
-test "runs under GC stress" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    vm.heap.stress = true;
-    const v = try eval(&vm,
-        \\function make(n) { return function() { return n; }; }
-        \\var f = make(7);
-        \\return f() + f();
-    );
-    try testing.expect(v.isNumber());
-    try testing.expectEqual(@as(f64, 14), v.asNumber());
-}
-
-test "object literals and member access" {
-    try testing.expectEqual(@as(f64, 3), try evalNumber("var o = { a: 1, b: 2 }; return o.a + o.b;"));
-    try testing.expectEqual(@as(f64, 5), try evalNumber("var o = {}; o.x = 5; return o.x;"));
-    try testing.expectEqual(@as(f64, 7), try evalNumber("var o = {}; o['k'] = 7; return o['k'];"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("var o = { a: { b: 3 } }; return o.a.b;"));
-    try testing.expectEqual(@as(f64, 0), try evalNumber("var o = {}; return o.missing === undefined ? 0 : 1;"));
-}
-
-test "methods and this" {
-    try testing.expectEqual(@as(f64, 10), try evalNumber(
-        \\var o = { x: 10, getX() { return this.x; } };
-        \\return o.getX();
-    ));
-    try testing.expectEqual(@as(f64, 30), try evalNumber(
-        \\var o = { a: 10, b: 20, sum: function() { return this.a + this.b; } };
-        \\return o.sum();
-    ));
-}
-
-test "new and constructors" {
-    try testing.expectEqual(@as(f64, 5), try evalNumber(
-        \\function Point(x) { this.x = x; }
-        \\var p = new Point(5);
-        \\return p.x;
-    ));
-    try testing.expectEqual(@as(f64, 7), try evalNumber(
-        \\function Box(v) { this.v = v; }
-        \\Box.prototype.get = function() { return this.v; };
-        \\var b = new Box(7);
-        \\return b.get();
-    ));
-    try testing.expectEqual(@as(f64, 3), try evalNumber(
-        \\function Counter() { this.n = 0; }
-        \\Counter.prototype.inc = function() { this.n = this.n + 1; return this; };
-        \\var c = new Counter();
-        \\c.inc().inc().inc();
-        \\return c.n;
-    ));
-}
-
-test "arrow functions capture lexical this" {
-    try testing.expectEqual(@as(f64, 42), try evalNumber(
-        \\var o = {
-        \\  x: 42,
-        \\  get: function () {
-        \\    var f = () => this.x;
-        \\    return f();
-        \\  }
-        \\};
-        \\return o.get();
-    ));
-    // The arrow's `this` survives extraction and .call() with another receiver.
-    try testing.expectEqual(@as(f64, 7), try evalNumber(
-        \\var o = { x: 7, mk: function () { return () => this.x; } };
-        \\var f = o.mk();
-        \\return f.call({ x: 99 });
-    ));
-}
-
-test "arrow functions and non-constructors are not new-able" {
-    // Arrow functions have no [[Construct]].
-    {
-        var vm = Vm.init(testing.allocator);
-        defer vm.deinit();
-        try testing.expectError(error.JsThrow, eval(&vm, "var f = () => {}; return new f();"));
-    }
-    // Ordinary function declarations still construct.
-    try testing.expectEqual(@as(f64, 9), try evalNumber(
-        \\function Sq(x) { this.v = x * x; }
-        \\return new Sq(3).v;
-    ));
-    // Native built-ins that aren't constructors reject `new`.
-    {
-        var vm = Vm.init(testing.allocator);
-        defer vm.deinit();
-        try testing.expectError(error.JsThrow, eval(&vm, "return new Math.abs(1);"));
-    }
-}
-
-test "object toString coercion in concatenation" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    const v = try eval(&vm,
-        \\var o = { toString: function() { return "hi"; } };
-        \\return o + "!";
-    );
-    try testing.expect(v.isString());
-    try testing.expectEqualSlices(u16, &[_]u16{ 'h', 'i', '!' }, v.asString().units);
-}
-
-test "globals, instanceof, in, typeof-undeclared" {
-    try testing.expectEqual(@as(f64, 42), try evalNumber("foo = 42; return foo;"));
-    try testing.expectEqual(@as(f64, 7), try evalNumber("globalThis.bar = 7; return bar;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\function C() {}
-        \\var c = new C();
-        \\return (c instanceof C) ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("var o = { a: 1 }; return ('a' in o) ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 0), try evalNumber("var o = { a: 1 }; return ('b' in o) ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (typeof notDeclared === 'undefined') ? 1 : 0;"));
-}
-
-test "reading an undeclared global throws ReferenceError" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    try testing.expectError(error.JsThrow, eval(&vm, "return missingGlobalVar;"));
-}
-
-test "error objects and instanceof" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var e = new TypeError("boom");
-        \\return (e.message === "boom" && e.name === "TypeError") ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var e = new RangeError("x");
-        \\return (e instanceof RangeError && e instanceof Error) ? 1 : 0;
-    ));
-    // Engine-thrown errors are real Error objects now.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\try { null.x; } catch (e) { return (e instanceof TypeError) ? 1 : 0; }
-        \\return 0;
-    ));
-}
-
-test "Error.prototype.toString" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    const v = try eval(&vm, "return new Error('nope').toString();");
-    try testing.expect(v.isString());
-    try testing.expectEqualSlices(u16, &[_]u16{ 'E', 'r', 'r', 'o', 'r', ':', ' ', 'n', 'o', 'p', 'e' }, v.asString().units);
-}
-
-test "String / Number / Boolean" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return String(42) === '42' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 3.5), try evalNumber("return Number('3.5');"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Boolean(0) === false ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return String(true) === 'true' ? 1 : 0;"));
-}
-
-test "Math" {
-    try testing.expectEqual(@as(f64, 5), try evalNumber("return Math.abs(-5);"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return Math.floor(3.9);"));
-    try testing.expectEqual(@as(f64, 4), try evalNumber("return Math.ceil(3.1);"));
-    try testing.expectEqual(@as(f64, 4), try evalNumber("return Math.sqrt(16);"));
-    try testing.expectEqual(@as(f64, 7), try evalNumber("return Math.max(1, 7, 3);"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Math.min(1, 7, 3);"));
-    try testing.expectEqual(@as(f64, 8), try evalNumber("return Math.pow(2, 3);"));
-}
-
-test "Object builtins" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var o = { a: 1 };
-        \\return o.hasOwnProperty('a') && !o.hasOwnProperty('b') ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var proto = { greet: 5 };
-        \\var o = Object.create(proto);
-        \\return (Object.getPrototypeOf(o) === proto && o.greet === 5) ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 42), try evalNumber(
-        \\var o = {};
-        \\Object.defineProperty(o, 'x', { value: 42, enumerable: false });
-        \\return o.x;
-    ));
-}
-
-test "array literals and indexing" {
-    try testing.expectEqual(@as(f64, 40), try evalNumber("var a = [10, 20, 30]; return a[0] + a[2];"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return [1, 2, 3].length;"));
-    try testing.expectEqual(@as(f64, 4), try evalNumber("var a = []; a[3] = 9; return a.length;"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("var a = [1, 2, 3, 4]; a.length = 2; return a.length;"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return new Array(3).length;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Array.isArray([]) && !Array.isArray({}) ? 1 : 0;"));
-}
-
-test "array mutation methods" {
-    try testing.expectEqual(@as(f64, 5), try evalNumber("var a = [1]; a.push(2); a.push(3); return a.pop() + a.length;"));
-    try testing.expectEqual(@as(f64, 4), try evalNumber("return [1, 2].concat([3, 4]).length;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("var a = [1, 2, 3]; return (a.indexOf(2) === 1 && a.includes(3)) ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return [1, 2, 3].join('-') === '1-2-3' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("var a = [1, 2, 3, 4].slice(1, 3); return (a.length === 2 && a[0] === 2) ? 1 : 0;"));
-}
-
-test "array higher-order methods" {
-    try testing.expectEqual(@as(f64, 12), try evalNumber(
-        \\var a = [1, 2, 3].map(function (x) { return x * 2; });
-        \\return a[0] + a[1] + a[2];
-    ));
-    try testing.expectEqual(@as(f64, 2), try evalNumber(
-        \\var a = [1, 2, 3, 4].filter(function (x) { return x % 2 === 0; });
-        \\return a.length;
-    ));
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\var sum = 0;
-        \\[1, 2, 3].forEach(function (x) { sum += x; });
-        \\return sum;
-    ));
-}
-
-test "Object.keys/values/entries" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var o = { a: 1, b: 2 };
-        \\var k = Object.keys(o);
-        \\return (k.length === 2 && k[0] === 'a' && k[1] === 'b') ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 3), try evalNumber(
-        \\var o = { a: 1, b: 2 };
-        \\var v = Object.values(o);
-        \\return v[0] + v[1];
-    ));
-}
-
-test "string primitive access and methods" {
-    try testing.expectEqual(@as(f64, 5), try evalNumber("return 'hello'.length;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'hello'[1] === 'e' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 104), try evalNumber("return 'hello'.charCodeAt(0);"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("return 'hello'.indexOf('ll');"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'hello'.includes('ell') ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'hello'.slice(1, 3) === 'el' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'Hello'.toUpperCase() === 'HELLO' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'Hello'.toLowerCase() === 'hello' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return '  hi  '.trim() === 'hi' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'ab'.repeat(3) === 'ababab' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return 'a,b,c'.split(',').length;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a'.concat('b', 'c') === 'abc' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return String.fromCharCode(104, 105) === 'hi' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return ('hi'.startsWith('h') && 'hi'.endsWith('i')) ? 1 : 0;"));
-}
-
-test "Map" {
-    try testing.expectEqual(@as(f64, 5), try evalNumber(
-        \\var m = new Map();
-        \\m.set("a", 1); m.set("b", 2);
-        \\return m.get("a") + m.get("b") + m.size;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var m = new Map();
-        \\m.set(1, "x");
-        \\var had = m.has(1);
-        \\m.delete(1);
-        \\return (had && !m.has(1) && m.size === 0) ? 1 : 0;
-    ));
-    // Object keys by identity; NaN key via SameValueZero.
-    try testing.expectEqual(@as(f64, 42), try evalNumber("var m = new Map(); var k = {}; m.set(k, 42); return m.get(k);"));
-    try testing.expectEqual(@as(f64, 5), try evalNumber("var m = new Map(); m.set(NaN, 5); return m.get(NaN);"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("var m = new Map([['a', 1], ['b', 2]]); return m.get('b');"));
-    // Overwrite keeps size; chaining returns the map.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("var m = new Map(); m.set(1, 'a'); m.set(1, 'b'); return m.size;"));
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\var m = new Map([['a', 1], ['b', 2], ['c', 3]]);
-        \\var sum = 0;
-        \\m.forEach(function (v) { sum += v; });
-        \\return sum;
-    ));
-}
-
-test "Set" {
-    try testing.expectEqual(@as(f64, 2), try evalNumber("var s = new Set(); s.add(1); s.add(2); s.add(1); return s.size;"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("var s = new Set([1, 2, 2, 3]); return s.size;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var s = new Set();
-        \\s.add("x");
-        \\var had = s.has("x");
-        \\s.delete("x");
-        \\return (had && !s.has("x") && s.size === 0) ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\var s = new Set([1, 2, 3]);
-        \\var sum = 0;
-        \\s.forEach(function (v) { sum += v; });
-        \\return sum;
-    ));
-}
-
-test "Map/Set under GC stress" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    vm.heap.stress = true;
-    const v = try eval(&vm,
-        \\var m = new Map();
-        \\for (var i = 0; i < 15; i++) { m.set("k" + i, i); }
-        \\var s = new Set();
-        \\for (var j = 0; j < 15; j++) { s.add(j % 5); }
-        \\return m.size + s.size;
-    );
-    try testing.expectEqual(@as(f64, 20), v.asNumber()); // 15 + 5
-}
-
-test "JSON.stringify" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify(42) === '42' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify('hi') === '\"hi\"' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify(true) === 'true' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify(null) === 'null' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify([1, 2, 3]) === '[1,2,3]' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify({ a: 1, b: 2 }) === '{\"a\":1,\"b\":2}' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify({ a: [1, 2], b: { c: 3 } }) === '{\"a\":[1,2],\"b\":{\"c\":3}}' ? 1 : 0;"));
-    // undefined / functions omitted from objects, null in arrays.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify({ a: 1, b: undefined }) === '{\"a\":1}' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.stringify([1, undefined, 3]) === '[1,null,3]' ? 1 : 0;"));
-}
-
-test "JSON.parse and round-trip" {
-    try testing.expectEqual(@as(f64, 42), try evalNumber("return JSON.parse('42');"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.parse('\"hi\"') === 'hi' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.parse('true') === true ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return JSON.parse('null') === null ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 5), try evalNumber(
-        \\var o = JSON.parse('{"a":1,"b":[2,3]}');
-        \\return o.a + o.b[0] + o.b[1] - 1;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var o = { x: 1, y: [2, 3], z: "hi" };
-        \\var r = JSON.parse(JSON.stringify(o));
-        \\return (r.x === 1 && r.y[1] === 3 && r.z === "hi") ? 1 : 0;
-    ));
-}
-
-test "JSON.stringify space and replacer" {
-    // Indentation with a numeric space.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\return JSON.stringify({ a: 1 }, null, 2) === '{\n  "a": 1\n}' ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\return JSON.stringify([1, 2], null, 1) === '[\n 1,\n 2\n]' ? 1 : 0;
-    ));
-    // Replacer function.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var r = JSON.stringify({ a: 1, b: 2 }, function (k, v) { return k === 'b' ? undefined : v; });
-        \\return r === '{"a":1}' ? 1 : 0;
-    ));
-    // Replacer allow-list.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\return JSON.stringify({ a: 1, b: 2, c: 3 }, ["a", "c"]) === '{"a":1,"c":3}' ? 1 : 0;
-    ));
-}
-
-test "JSON.parse reviver" {
-    try testing.expectEqual(@as(f64, 20), try evalNumber(
-        \\var o = JSON.parse('{"a":5,"b":5}', function (k, v) { return typeof v === 'number' ? v * 2 : v; });
-        \\return o.a + o.b;
-    ));
-    // Reviver returning undefined deletes the property.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var o = JSON.parse('{"a":1,"drop":2}', function (k, v) { return k === 'drop' ? undefined : v; });
-        \\return ('drop' in o) ? 0 : 1;
-    ));
-}
-
-test "JSON cyclic structure throws" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    try testing.expectError(error.JsThrow, eval(&vm, "var o = {}; o.self = o; return JSON.stringify(o);"));
-}
-
-test "RegExp construction" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var re = /abc/gi;
-        \\return (re.source === "abc" && re.flags === "gi" && re.global && re.ignoreCase && !re.multiline) ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (/x/ instanceof RegExp) ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var re = new RegExp("foo", "m");
-        \\return (re.source === "foo" && re.multiline && re.flags === "m") ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return /ab/g.toString() === '/ab/g' ? 1 : 0;"));
-}
-
-test "RegExp.prototype.test" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return /x/.test('axb') ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 0), try evalNumber("return /x/.test('ab') ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return /^\\d{3}-\\d{4}$/.test('555-1234') ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return /hello/i.test('HELLO world') ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return /(?<=\\$)\\d+/.test('$42') ? 1 : 0;")); // lookbehind
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return new RegExp('a+b').test('caaab') ? 1 : 0;"));
-}
-
-test "RegExp.prototype.exec: match array, index, captures" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var m = /(\d{4})-(\d{2})/.exec("born 2026-07!");
-        \\return (m[0] === "2026-07" && m[1] === "2026" && m[2] === "07" &&
-        \\        m.index === 5 && m.input === "born 2026-07!" && m.length === 3) ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return /z/.exec('abc') === null ? 1 : 0;"));
-    // Unmatched optional group is undefined.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var m = /a(b)?c/.exec("ac");
-        \\return (m[0] === "ac" && m[1] === undefined) ? 1 : 0;
-    ));
-    // Named groups.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var m = /(?<y>\d{4})-(?<mo>\d{2})/.exec("2026-07");
-        \\return (m.groups.y === "2026" && m.groups.mo === "07") ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return /(a)/.exec('a').groups === undefined ? 1 : 0;"));
-}
-
-test "RegExp global: lastIndex drives repeated exec" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var re = /\d+/g;
-        \\var a = re.exec("a1 b22 c333");
-        \\var b = re.exec("a1 b22 c333");
-        \\var c = re.exec("a1 b22 c333");
-        \\var d = re.exec("a1 b22 c333");
-        \\return (a[0] === "1" && b[0] === "22" && c[0] === "333" && d === null && re.lastIndex === 0) ? 1 : 0;
-    ));
-    // Sticky: anchored at lastIndex exactly.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var re = /b/y;
-        \\re.lastIndex = 1;
-        \\var hit = re.exec("abc");
-        \\re.lastIndex = 0;
-        \\var miss = re.exec("abc");
-        \\return (hit !== null && miss === null) ? 1 : 0;
-    ));
-}
-
-test "RegExp invalid pattern throws SyntaxError" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    const v = try eval(&vm,
-        \\try { new RegExp("(unclosed"); return "no-throw"; }
-        \\catch (e) { return (e instanceof SyntaxError) ? "syntax" : "other"; }
-    );
-    try testing.expect(v.isString());
-    const utf8 = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
-    defer testing.allocator.free(utf8);
-    try testing.expectEqualStrings("syntax", utf8);
-}
-
-test "String.prototype.search and match" {
-    try testing.expectEqual(@as(f64, 4), try evalNumber("return 'abc 123'.search(/\\d+/);"));
-    try testing.expectEqual(@as(f64, -1), try evalNumber("return 'abc'.search(/z/);"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("return 'ab3'.search('3');")); // string coerced to regex
-    // Non-global match = exec.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var m = "id-42".match(/(\d+)/);
-        \\return (m[0] === "42" && m[1] === "42" && m.index === 3) ? 1 : 0;
-    ));
-    // Global match = all matched substrings.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var m = "a1 b22 c333".match(/\d+/g);
-        \\return (m.length === 3 && m[0] === "1" && m[1] === "22" && m[2] === "333") ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'abc'.match(/z/g) === null ? 1 : 0;"));
-}
-
-test "String.prototype.replace" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a-b-c'.replace('-', '+') === 'a+b-c' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a-b-c'.replace(/-/g, '+') === 'a+b+c' ? 1 : 0;"));
-    // $& $1 $` $' substitutions.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'John Smith'.replace(/(\\w+) (\\w+)/, '$2 $1') === 'Smith John' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'abc'.replace(/b/, '[$&]') === 'a[b]c' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'x$y'.replace('$', '$$') === 'x$y' ? 1 : 0;"));
-    // Named-group substitution.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return '2026-07'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$<m>/$<y>') === '07/2026' ? 1 : 0;"));
-    // Function replacer.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var s = "a1b2".replace(/\d/g, function (m, off) { return "<" + m + "@" + off + ">"; });
-        \\return s === "a<1@1>b<2@3>" ? 1 : 0;
-    ));
-}
-
-test "String.prototype.split with regex and limit" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a1b22c'.split(/\\d+/).join(',') === 'a,b,c' ? 1 : 0;"));
-    // Captures are spliced into the result.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'a1b'.split(/(\\d)/).join(',') === 'a,1,b' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("return 'a-b-c'.split('-', 2).length;"));
-    try testing.expectEqual(@as(f64, 0), try evalNumber("return 'a-b'.split('-', 0).length;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return 'ab'.split(/a*/).join(',') === ',b' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return ''.split('x').join('|') === '' ? 1 : 0;"));
-}
-
-test "RegExp under GC stress" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    vm.heap.stress = true;
-    const v = try eval(&vm,
-        \\var total = 0;
-        \\for (var i = 0; i < 5; i++) {
-        \\  var m = /(\w+)-(\w+)/.exec("aa-bb");
-        \\  total += m[1].length + m[2].length;
-        \\}
-        \\return total;
-    );
-    try testing.expectEqual(@as(f64, 20), v.asNumber());
-}
-
-test "TypedArrays: construction and element access" {
-    try testing.expectEqual(@as(f64, 4), try evalNumber("return new Int32Array(4).length;"));
-    try testing.expectEqual(@as(f64, 30), try evalNumber("var a = new Int32Array(3); a[0] = 10; a[1] = 20; return a[0] + a[1];"));
-    try testing.expectEqual(@as(f64, 6), try evalNumber("var a = new Int32Array([1, 2, 3]); return a[0] + a[1] + a[2];"));
-    try testing.expectEqual(@as(f64, 4), try evalNumber("return Int32Array.BYTES_PER_ELEMENT;"));
-    try testing.expectEqual(@as(f64, 16), try evalNumber("return new Int32Array(4).byteLength;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (new Int32Array(1) instanceof Int32Array) ? 1 : 0;"));
-}
-
-test "TypedArrays: element type coercion" {
-    try testing.expectEqual(@as(f64, 44), try evalNumber("var a = new Uint8Array(1); a[0] = 300; return a[0];")); // 300 & 255
-    try testing.expectEqual(@as(f64, -56), try evalNumber("var a = new Int8Array(1); a[0] = 200; return a[0];")); // 200 as i8
-    try testing.expectEqual(@as(f64, 255), try evalNumber("var a = new Uint8ClampedArray(1); a[0] = 300; return a[0];")); // clamped
-    try testing.expectEqual(@as(f64, 0), try evalNumber("var a = new Uint8ClampedArray(1); a[0] = -5; return a[0];")); // clamped low
-    try testing.expectEqual(@as(f64, 3.5), try evalNumber("var a = new Float64Array(1); a[0] = 3.5; return a[0];"));
-}
-
-test "TypedArrays: ArrayBuffer views" {
-    try testing.expectEqual(@as(f64, 16), try evalNumber("return new ArrayBuffer(16).byteLength;"));
-    try testing.expectEqual(@as(f64, 14), try evalNumber(
-        \\var b = new ArrayBuffer(8);
-        \\var a = new Int32Array(b);
-        \\a[0] = 5; a[1] = 7;
-        \\return a.length + a[0] + a[1];
-    ));
-    // Two views share one buffer (little-endian low byte).
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var b = new ArrayBuffer(4);
-        \\var bytes = new Uint8Array(b);
-        \\var ints = new Int32Array(b);
-        \\ints[0] = 1;
-        \\return bytes[0];
-    ));
-}
-
-test "TypedArrays: methods" {
-    try testing.expectEqual(@as(f64, 28), try evalNumber("var a = new Int32Array(4); a.fill(7); return a[0] + a[1] + a[2] + a[3];"));
-    try testing.expectEqual(@as(f64, 6), try evalNumber("var a = new Int32Array(4); a.set([1, 2, 3], 1); return a[1] + a[2] + a[3];"));
-    try testing.expectEqual(@as(f64, 4), try evalNumber("var a = new Int32Array([1, 2, 3, 4]); var s = a.subarray(1, 3); return s.length + s[0];"));
-    // subarray shares the buffer.
-    try testing.expectEqual(@as(f64, 99), try evalNumber("var a = new Int32Array([1, 2, 3, 4]); var s = a.subarray(1); s[0] = 99; return a[1];"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return new Int32Array([1, 2, 3]).join('-') === '1-2-3' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return new Int32Array([5, 6, 7]).indexOf(6);"));
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\var sum = 0;
-        \\new Int32Array([1, 2, 3]).forEach(function (x) { sum += x; });
-        \\return sum;
-    ));
-}
-
-test "TypedArrays under GC stress" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    vm.heap.stress = true;
-    const v = try eval(&vm,
-        \\var total = 0;
-        \\for (var i = 0; i < 10; i++) {
-        \\  var a = new Float64Array(8);
-        \\  a.fill(i);
-        \\  total += a[3];
-        \\}
-        \\return total;
-    );
-    try testing.expectEqual(@as(f64, 45), v.asNumber()); // 0+1+...+9
-}
-
-test "Proxy" {
-    // get trap.
-    try testing.expectEqual(@as(f64, 100), try evalNumber(
-        \\var p = new Proxy({}, { get: function (t, k) { return 100; } });
-        \\return p.anything;
-    ));
-    // set trap intercepts.
-    try testing.expectEqual(@as(f64, 5), try evalNumber(
-        \\var log = 0;
-        \\var p = new Proxy({}, { set: function (t, k, v) { log = v; return true; } });
-        \\p.x = 5;
-        \\return log;
-    ));
-    // has trap for `in`.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var p = new Proxy({}, { has: function (t, k) { return k === 'yes'; } });
-        \\return (('yes' in p) && !('no' in p)) ? 1 : 0;
-    ));
-    // No trap -> forwards to target.
-    try testing.expectEqual(@as(f64, 42), try evalNumber("var p = new Proxy({ v: 42 }, {}); return p.v;"));
-    // apply trap.
-    try testing.expectEqual(@as(f64, 20), try evalNumber(
-        \\function base() { return 1; }
-        \\var p = new Proxy(base, { apply: function (t, thisArg, args) { return args[0] * 2; } });
-        \\return p(10);
-    ));
-}
-
-test "Reflect" {
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return Reflect.get({ a: 3 }, 'a');"));
-    try testing.expectEqual(@as(f64, 9), try evalNumber("var o = {}; Reflect.set(o, 'x', 9); return o.x;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Reflect.has({ a: 1 }, 'a') ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("return Reflect.ownKeys({ a: 1, b: 2 }).length;"));
-    try testing.expectEqual(@as(f64, 7), try evalNumber(
-        \\function add(a, b) { return a + b; }
-        \\return Reflect.apply(add, null, [3, 4]);
-    ));
-    try testing.expectEqual(@as(f64, 5), try evalNumber(
-        \\function Point(x) { this.x = x; }
-        \\return Reflect.construct(Point, [5]).x;
-    ));
-}
-
-test "Symbol" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return typeof Symbol() === 'symbol' ? 1 : 0;"));
-    // Each Symbol is unique.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (Symbol('x') === Symbol('x')) ? 0 : 1;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("var s = Symbol('desc'); return s === s ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Symbol('hi').toString() === 'Symbol(hi)' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Symbol('hi').description === 'hi' ? 1 : 0;"));
-    // Symbol.for registry.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (Symbol.for('k') === Symbol.for('k')) ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Symbol.keyFor(Symbol.for('key')) === 'key' ? 1 : 0;"));
-    // Well-known symbols exist.
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return typeof Symbol.iterator === 'symbol' ? 1 : 0;"));
-}
-
-test "Symbol-keyed properties" {
-    // Symbol keys work and are distinct from string keys.
-    try testing.expectEqual(@as(f64, 42), try evalNumber(
-        \\var s = Symbol('k');
-        \\var o = {};
-        \\o[s] = 42;
-        \\return o[s];
-    ));
-    // Symbol keys are excluded from Object.keys / for-in / JSON.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var o = { a: 1 };
-        \\o[Symbol('hidden')] = 99;
-        \\return (Object.keys(o).length === 1 && Object.keys(o)[0] === 'a') ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var o = { a: 1 };
-        \\o[Symbol.iterator] = 5;
-        \\return JSON.stringify(o) === '{"a":1}' ? 1 : 0;
-    ));
-    // Well-known symbols usable as keys, retrievable.
-    try testing.expectEqual(@as(f64, 7), try evalNumber(
-        \\var o = {};
-        \\o[Symbol.iterator] = 7;
-        \\return o[Symbol.iterator];
-    ));
-}
-
-test "DataView" {
-    // Big-endian (default) vs little-endian round-trip.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var dv = new DataView(new ArrayBuffer(8));
-        \\dv.setInt32(0, 305419896); // 0x12345678
-        \\return dv.getInt32(0) === 305419896 ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var dv = new DataView(new ArrayBuffer(8));
-        \\dv.setInt32(0, 1, true); // little-endian
-        \\return (dv.getUint8(0) === 1 && dv.getUint8(3) === 0) ? 1 : 0;
-    ));
-    // Endianness is observable byte-by-byte (big-endian default).
-    try testing.expectEqual(@as(f64, 18), try evalNumber(
-        \\var dv = new DataView(new ArrayBuffer(4));
-        \\dv.setInt32(0, 305419896); // 0x12345678, big-endian
-        \\return dv.getUint8(0); // 0x12 = 18
-    ));
-    // Float round-trip.
-    try testing.expectEqual(@as(f64, 3.5), try evalNumber(
-        \\var dv = new DataView(new ArrayBuffer(8));
-        \\dv.setFloat64(0, 3.5);
-        \\return dv.getFloat64(0);
-    ));
-    // Shares the underlying ArrayBuffer with a typed array.
-    try testing.expectEqual(@as(f64, 255), try evalNumber(
-        \\var buf = new ArrayBuffer(4);
-        \\var u8 = new Uint8Array(buf);
-        \\var dv = new DataView(buf);
-        \\dv.setUint8(0, 255);
-        \\return u8[0];
-    ));
-    try testing.expectEqual(@as(f64, 8), try evalNumber("return new DataView(new ArrayBuffer(8)).byteLength;"));
-}
-
-test "Date" {
-    // 2021-06-15T12:30:45.123Z = 1623760245123 ms.
-    try testing.expectEqual(@as(f64, 1623760245123), try evalNumber("return new Date(1623760245123).getTime();"));
-    try testing.expectEqual(@as(f64, 2021), try evalNumber("return new Date(1623760245123).getFullYear();"));
-    try testing.expectEqual(@as(f64, 5), try evalNumber("return new Date(1623760245123).getMonth();")); // June = 5
-    try testing.expectEqual(@as(f64, 15), try evalNumber("return new Date(1623760245123).getDate();"));
-    try testing.expectEqual(@as(f64, 12), try evalNumber("return new Date(1623760245123).getHours();"));
-    try testing.expectEqual(@as(f64, 45), try evalNumber("return new Date(1623760245123).getSeconds();"));
-    try testing.expectEqual(@as(f64, 2), try evalNumber("return new Date(1623760245123).getDay();")); // Tuesday
-    try testing.expectEqual(@as(f64, 0), try evalNumber("return new Date(1970, 0, 1, 0, 0, 0, 0).getTime();"));
-    try testing.expectEqual(@as(f64, 1623760245123), try evalNumber("return Date.UTC(2021, 5, 15, 12, 30, 45, 123);"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return new Date(1623760245123).toISOString() === '2021-06-15T12:30:45.123Z' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1623760245123), try evalNumber("return Date.parse('2021-06-15T12:30:45.123Z');"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (typeof Date.now() === 'number' && Date.now() > 0) ? 1 : 0;"));
-}
-
-test "spread in array literals and calls" {
-    try testing.expectEqual(@as(f64, 15), try evalNumber(
-        \\var a = [1, 2, 3];
-        \\var b = [0, ...a, 4, 5];
-        \\return b[0] + b[1] + b[2] + b[3] + b[4] + b[5]; // 0+1+2+3+4+5
-    ));
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\function add(a, b, c) { return a + b + c; }
-        \\var nums = [1, 2, 3];
-        \\return add(...nums);
-    ));
-    try testing.expectEqual(@as(f64, 10), try evalNumber(
-        \\function add4(a, b, c, d) { return a + b + c + d; }
-        \\return add4(1, ...[2, 3], 4); // mixed spread + normal args
-    ));
-    // Spread a string into an array (per code unit).
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return [...'abc'].length;"));
-    // Spread a Set.
-    try testing.expectEqual(@as(f64, 3), try evalNumber("return [...new Set([1, 2, 2, 3])].length;"));
-}
-
-test "switch statements" {
-    try testing.expectEqual(@as(f64, 20), try evalNumber(
-        \\function f(n) {
-        \\  switch (n) {
-        \\    case 1: return 10;
-        \\    case 2: return 20;
-        \\    default: return 0;
-        \\  }
-        \\}
-        \\return f(2);
-    ));
-    try testing.expectEqual(@as(f64, 99), try evalNumber(
-        \\function f(n) { switch (n) { case 1: return 1; default: return 99; } }
-        \\return f(7);
-    ));
-    // Fall-through until break.
-    try testing.expectEqual(@as(f64, 3), try evalNumber(
-        \\var x = 0;
-        \\switch (1) { case 1: x += 1; case 2: x += 2; break; case 3: x += 100; }
-        \\return x;
-    ));
-}
-
-test "generators" {
-    // Basic yielding, consumed by for-of.
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\function* g() { yield 1; yield 2; yield 3; }
-        \\var sum = 0;
-        \\for (var x of g()) sum += x;
-        \\return sum;
-    ));
-    // Manual next().
-    try testing.expectEqual(@as(f64, 30), try evalNumber(
-        \\function* g() { yield 10; yield 20; }
-        \\var it = g();
-        \\return it.next().value + it.next().value;
-    ));
-    // done flag.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\function* g() { yield 1; }
-        \\var it = g();
-        \\it.next();
-        \\return it.next().done ? 1 : 0;
-    ));
-    // Local state across yields (a loop inside the generator).
-    try testing.expectEqual(@as(f64, 10), try evalNumber(
-        \\function* range(n) { for (var i = 0; i < n; i++) yield i; }
-        \\var s = 0;
-        \\for (var x of range(5)) s += x;
-        \\return s;
-    ));
-    // Sent value: `x = yield v` receives next()'s argument.
-    try testing.expectEqual(@as(f64, 42), try evalNumber(
-        \\function* g() { var x = yield 1; return x; }
-        \\var it = g();
-        \\it.next();
-        \\return it.next(42).value;
-    ));
-    // return value becomes the final {value, done:true}.
-    try testing.expectEqual(@as(f64, 99), try evalNumber(
-        \\function* g() { yield 1; return 99; }
-        \\var it = g();
-        \\it.next();
-        \\return it.next().value;
-    ));
-    // yield* delegation.
-    try testing.expectEqual(@as(f64, 6), try evalNumber(
-        \\function* inner() { yield 1; yield 2; }
-        \\function* outer() { yield 0; yield* inner(); yield 3; }
-        \\var s = 0;
-        \\for (var x of outer()) s += x;
-        \\return s;
-    ));
-    // Generators are spreadable.
-    try testing.expectEqual(@as(f64, 3), try evalNumber(
-        \\function* g() { yield 1; yield 2; yield 3; }
-        \\return [...g()].length;
-    ));
-}
-
-test "generators under GC stress" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    vm.heap.stress = true;
-    const v = try eval(&vm,
-        \\function* fib() {
-        \\  var a = 0, b = 1;
-        \\  while (true) { yield a; var t = a + b; a = b; b = t; }
-        \\}
-        \\var it = fib();
-        \\var sum = 0;
-        \\for (var i = 0; i < 10; i++) sum += it.next().value;
-        \\return sum;
-    );
-    try testing.expectEqual(@as(f64, 88), v.asNumber()); // 0+1+1+2+3+5+8+13+21+34
-}
-
-test "iteration protocol" {
-    // for-of over Set / Map / Array iterators.
-    try testing.expectEqual(@as(f64, 6), try evalNumber("var s = 0; for (var x of new Set([1, 2, 3])) s += x; return s;"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber(
-        \\var s = 0;
-        \\for (var e of new Map([['a', 1], ['b', 2]])) s += e[1];
-        \\return s;
-    ));
-    try testing.expectEqual(@as(f64, 30), try evalNumber("var s = 0; for (var v of [10, 20].values()) s += v; return s;"));
-    try testing.expectEqual(@as(f64, 3), try evalNumber("var s = 0; for (var k of [0, 0, 0].keys()) s += 1; return s;"));
-    try testing.expectEqual(@as(f64, 5), try evalNumber("var it = [5].entries().next(); return it.value[0] + it.value[1];"));
-    // Manual iterator use.
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var it = [1, 2][Symbol.iterator]();
-        \\var r = it.next();
-        \\return (r.value === 1 && r.done === false) ? 1 : 0;
-    ));
-    // Custom iterable via a computed Symbol.iterator key.
-    try testing.expectEqual(@as(f64, 3), try evalNumber(
-        \\var obj = {};
-        \\obj[Symbol.iterator] = function () {
-        \\  var i = 0;
-        \\  return { next: function () { return i < 3 ? { value: i++, done: false } : { value: undefined, done: true }; } };
-        \\};
-        \\var s = 0;
-        \\for (var x of obj) s += x;
-        \\return s;
-    ));
-}
-
-test "for-of over arrays and strings" {
-    try testing.expectEqual(@as(f64, 6), try evalNumber("var s = 0; for (var x of [1, 2, 3]) s += x; return s;"));
-    try testing.expectEqual(@as(f64, 30), try evalNumber("var s = 0; for (const x of [10, 20]) s += x; return s;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber(
-        \\var out = "";
-        \\for (var c of "abc") { out = out + c; }
-        \\return out === "abc" ? 1 : 0;
-    ));
-    try testing.expectEqual(@as(f64, 3), try evalNumber(
-        \\var s = 0;
-        \\for (var x of [1, 2, 3, 4]) { if (x === 3) break; s += x; }
-        \\return s;
-    ));
-    try testing.expectEqual(@as(f64, 4), try evalNumber(
-        \\var s = 0;
-        \\for (var x of [1, 2, 3]) { if (x === 2) continue; s += x; }
-        \\return s;
-    ));
-}
-
-test "number methods" {
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (255).toString(16) === 'ff' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (3.14159).toFixed(2) === '3.14' ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return Number.isInteger(5) && !Number.isInteger(5.5) ? 1 : 0;"));
-    try testing.expectEqual(@as(f64, 1), try evalNumber("return (10).toString(2) === '1010' ? 1 : 0;"));
-}
-
-test "arrays under GC stress" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    vm.heap.stress = true;
-    const v = try eval(&vm,
-        \\var a = [];
-        \\for (var i = 0; i < 20; i++) { a.push(i); }
-        \\var b = a.map(function (x) { return x + 1; });
-        \\return b[19] + a.length;
-    );
-    try testing.expectEqual(@as(f64, 40), v.asNumber()); // 20 + 20
-}
-
-test "objects under GC stress" {
-    var vm = Vm.init(testing.allocator);
-    defer vm.deinit();
-    vm.heap.stress = true;
-    const v = try eval(&vm,
-        \\function Node(v) { this.v = v; this.next = null; }
-        \\var head = new Node(1);
-        \\head.next = new Node(2);
-        \\head.next.next = new Node(3);
-        \\return head.v + head.next.v + head.next.next.v;
-    );
-    try testing.expectEqual(@as(f64, 6), v.asNumber());
-}

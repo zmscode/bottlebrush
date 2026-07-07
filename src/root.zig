@@ -34,4 +34,5 @@ test {
     _ = @import("bytecode.zig");
     _ = @import("compiler.zig");
     _ = @import("interpreter.zig");
+    _ = @import("vm_tests.zig");
 }
