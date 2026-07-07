@@ -6,6 +6,7 @@ description: If abs(base) < 1 and exponent is −∞, the result is +∞.
 esid: sec-applying-the-exp-operator
 ---*/
 
+
 var exponent = -Infinity;
 var base = new Array();
 base[0] = 0.999999999999999;
@@ -17,7 +18,7 @@ base[5] = -0.999999999999999;
 var basenum = 6;
 
 for (var i = 0; i < basenum; i++) {
-	if (Math.pow(base[i], exponent) !== +Infinity) {
-		throw new Test262Error("#1: Math.pow(" + base[i] + ", " + exponent + ") !== +Infinity");
-	}
+  if (Math.pow(base[i], exponent) !== +Infinity) {
+    throw new Test262Error("#1: Math.pow(" + base[i] + ", " + exponent + ") !== +Infinity");
+  }
 }

@@ -23,8 +23,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.pow, "length", {
-	value: 2,
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: 2,
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

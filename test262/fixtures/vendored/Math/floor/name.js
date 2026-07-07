@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.floor, "name", {
-	value: "floor",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "floor",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

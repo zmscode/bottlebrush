@@ -9,12 +9,12 @@ const std = @import("std");
 const bb = @import("bottlebrush");
 
 const demo =
-    \\var nums = [1, 2, 3, 4, 5, 6];
-    \\var squaredEvens = nums
+    \\var nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+    \\var cubedEvens = nums
     \\  .filter(function (n) { return n % 2 === 0; })
-    \\  .map(function (n) { return n * n; });
+    \\  .map(function (n) { return n * n * n; });
     \\var total = 0;
-    \\squaredEvens.forEach(function (n) { total += n; });
+    \\cubedEvens.forEach(function (n) { total += n; });
     \\return total;
 ;
 

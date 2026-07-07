@@ -12,7 +12,7 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math, "pow", {
-	writable: true,
-	enumerable: false,
-	configurable: true,
+  writable: true,
+  enumerable: false,
+  configurable: true
 });

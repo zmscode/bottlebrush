@@ -21,8 +21,9 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.imul), false, "isConstructor(Math.imul) must return false");
+assert.sameValue(isConstructor(Math.imul), false, 'isConstructor(Math.imul) must return false');
 
 assert.throws(TypeError, () => {
-	new Math.imul();
+  new Math.imul();
 });
+

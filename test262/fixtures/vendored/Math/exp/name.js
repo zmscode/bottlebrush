@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.exp, "name", {
-	value: "exp",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "exp",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

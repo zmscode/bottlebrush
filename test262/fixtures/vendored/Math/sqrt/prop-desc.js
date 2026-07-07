@@ -13,7 +13,7 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math, "sqrt", {
-	writable: true,
-	enumerable: false,
-	configurable: true,
+  writable: true,
+  enumerable: false,
+  configurable: true
 });

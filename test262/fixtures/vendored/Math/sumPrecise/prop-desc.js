@@ -8,7 +8,7 @@ features: [Math.sumPrecise]
 ---*/
 
 verifyProperty(Math, "sumPrecise", {
-	writable: true,
-	enumerable: false,
-	configurable: true,
+  writable: true,
+  enumerable: false,
+  configurable: true
 });

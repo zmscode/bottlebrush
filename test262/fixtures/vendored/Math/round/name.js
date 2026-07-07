@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.round, "name", {
-	value: "round",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "round",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

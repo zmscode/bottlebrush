@@ -7,5 +7,5 @@ author: Ryan Lewis
 description: Math.clz32 should return 32 if passed 0.
 ---*/
 
-assert.sameValue(Math.clz32(0), 32, "Math.clz32(0)");
-assert.sameValue(Math.clz32(-0), 32, "Math.clz32(-0)");
+assert.sameValue(Math.clz32(0), 32, 'Math.clz32(0)');
+assert.sameValue(Math.clz32(-0), 32, 'Math.clz32(-0)');

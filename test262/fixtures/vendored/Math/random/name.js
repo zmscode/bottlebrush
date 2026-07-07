@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.random, "name", {
-	value: "random",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "random",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

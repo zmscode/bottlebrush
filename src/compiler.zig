@@ -47,6 +47,7 @@ const FnState = struct {
     parent: ?*FnState,
     name: []const u8,
     is_generator: bool = false,
+    is_arrow: bool = false,
     num_params: u32 = 0,
     arguments_slot: ?u32 = null,
     env_slot_count: u32 = 0,
@@ -209,7 +210,7 @@ pub const Compiler = struct {
         is_arrow: bool,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
-        var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator };
+        var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_arrow = is_arrow };
         const prev = self.fs;
         self.fs = &fs;
         defer self.fs = prev;
@@ -286,6 +287,7 @@ pub const Compiler = struct {
             .num_registers = fs.max_regs,
             .num_env_slots = fs.env_slot_count,
             .is_generator = fs.is_generator,
+            .is_arrow = fs.is_arrow,
             .arguments_slot = fs.arguments_slot,
             .code = try self.arena.dupe(Inst, fs.code.items),
             .constants = try self.dupeConstants(fs.constants.items),

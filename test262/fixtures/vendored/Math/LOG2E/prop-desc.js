@@ -11,8 +11,8 @@ info: |
 includes: [propertyHelper.js]
 ---*/
 
-verifyProperty(Math, "LOG2E", {
-	writable: false,
-	enumerable: false,
-	configurable: false,
+verifyProperty(Math, 'LOG2E', {
+  writable: false,
+  enumerable: false,
+  configurable: false,
 });

@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.log10, "name", {
-	value: "log10",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "log10",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

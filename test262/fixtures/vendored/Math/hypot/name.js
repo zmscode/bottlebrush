@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.hypot, "name", {
-	value: "hypot",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "hypot",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

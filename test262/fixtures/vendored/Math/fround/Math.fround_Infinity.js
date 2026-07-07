@@ -7,4 +7,4 @@ author: Ryan Lewis
 description: Math.fround should return Infinity if called with Infinity.
 ---*/
 
-assert.sameValue(Math.fround(Infinity), Infinity, "Math.fround(Infinity)");
+assert.sameValue(Math.fround(Infinity), Infinity, 'Math.fround(Infinity)');

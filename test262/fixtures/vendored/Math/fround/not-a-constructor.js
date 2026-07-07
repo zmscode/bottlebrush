@@ -21,8 +21,9 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.fround), false, "isConstructor(Math.fround) must return false");
+assert.sameValue(isConstructor(Math.fround), false, 'isConstructor(Math.fround) must return false');
 
 assert.throws(TypeError, () => {
-	new Math.fround();
+  new Math.fround();
 });
+

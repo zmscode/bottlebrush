@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.min, "length", {
-	value: 2,
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: 2,
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

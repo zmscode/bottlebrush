@@ -8,7 +8,7 @@ es6id: 20.2.2.29
 ---*/
 
 verifyProperty(Math, "sign", {
-	writable: true,
-	enumerable: false,
-	configurable: true,
+  writable: true,
+  enumerable: false,
+  configurable: true
 });

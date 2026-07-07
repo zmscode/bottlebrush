@@ -22,10 +22,16 @@ pub const Value = union(enum) {
     symbol: *gc.Symbol,
     bigint: *gc.BigInt,
     object: *gc.Object,
+    // An array "hole": the absence of an element in a holey array's backing
+    // store. Never observable to JS — array reads on a hole fall through to the
+    // prototype chain, and builtins skip holes. It exists only inside array
+    // element storage.
+    hole,
 
     // ---- Constructors ------------------------------------------------------
     pub const undefined_value: Value = .undefined;
     pub const null_value: Value = .null;
+    pub const hole_value: Value = .hole;
 
     pub fn fromBool(b: bool) Value {
         return .{ .boolean = b };
@@ -77,6 +83,10 @@ pub const Value = union(enum) {
     }
     pub fn isObject(self: Value) bool {
         return std.meta.activeTag(self) == .object;
+    }
+    /// True only for the internal array-hole sentinel.
+    pub fn isHole(self: Value) bool {
+        return std.meta.activeTag(self) == .hole;
     }
 
     // ---- Extractors (assert the caller checked the tag) --------------------

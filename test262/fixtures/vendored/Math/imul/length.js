@@ -22,8 +22,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.imul, "length", {
-	value: 2,
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: 2,
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

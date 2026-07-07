@@ -13,7 +13,7 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math, "tan", {
-	writable: true,
-	enumerable: false,
-	configurable: true,
+  writable: true,
+  enumerable: false,
+  configurable: true
 });

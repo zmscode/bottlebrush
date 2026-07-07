@@ -12,13 +12,17 @@ description: >
 ---*/
 
 // CHECK#1
-for (var i = 0; i < 100; i++) {
-	var val = Math.random();
+for (var i = 0; i < 100; i++)
+{
+  var val = Math.random();
 
-	assert.sameValue(typeof val, "number", "should not produce a non-numeric value: " + val);
-	assert.notSameValue(val, NaN, "should not produce NaN");
+  assert.sameValue(
+    typeof val, 'number', 'should not produce a non-numeric value: ' + val
+  );
+  assert.notSameValue(val, NaN, 'should not produce NaN');
 
-	if (val < 0 || val >= 1) {
-		throw new Test262Error("#1: Math.random() = " + val);
-	}
+  if (val < 0 || val >= 1)
+  {
+    throw new Test262Error("#1: Math.random() = " + val);
+  }
 }

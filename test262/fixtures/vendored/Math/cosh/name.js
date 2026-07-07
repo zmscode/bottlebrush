@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.cosh, "name", {
-	value: "cosh",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "cosh",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

@@ -21,8 +21,9 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.max), false, "isConstructor(Math.max) must return false");
+assert.sameValue(isConstructor(Math.max), false, 'isConstructor(Math.max) must return false');
 
 assert.throws(TypeError, () => {
-	new Math.max();
+  new Math.max();
 });
+

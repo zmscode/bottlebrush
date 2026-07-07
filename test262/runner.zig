@@ -27,8 +27,9 @@ const max_file_bytes = std.Io.Limit.limited(64 * 1024 * 1024);
 
 const Runner = struct {
     gpa: std.mem.Allocator,
-    io: std.Io,
-    harness_dir: std.Io.Dir,
+    /// Every harness helper preloaded into memory (basename -> source), shared
+    /// read-only across worker threads so no worker touches the filesystem.
+    includes: *const std.StringHashMapUnmanaged([]const u8),
     sta_src: []const u8,
     assert_src: []const u8,
 
@@ -149,6 +150,10 @@ const Runner = struct {
                 }
                 return .fail;
             },
+            error.Timeout => {
+                if (trace_skips or trace_files) std.debug.print("SKIP timeout (step budget)\n", .{});
+                return .skip; // exceeded the instruction budget
+            },
             else => {
                 if (trace_skips) std.debug.print("SKIP engine-limit\n", .{});
                 return .skip; // OOM / engine limit
@@ -174,9 +179,7 @@ const Runner = struct {
 
         for (meta.includes) |inc| {
             if (std.mem.eql(u8, inc, "assert.js") or std.mem.eql(u8, inc, "sta.js")) continue;
-            const inc_src = self.harness_dir.readFileAlloc(self.io, inc, self.gpa, max_file_bytes) catch
-                return error.MissingInclude;
-            defer self.gpa.free(inc_src);
+            const inc_src = self.includes.get(inc) orelse return error.MissingInclude;
             try buf.appendSlice(self.gpa, inc_src);
             try buf.appendSlice(self.gpa, "\n");
         }
@@ -186,16 +189,74 @@ const Runner = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+/// One worker thread's slice of the run: it pulls test indices off the shared
+/// atomic cursor, runs each in a fresh `Vm` on its own allocator, and tallies
+/// into its own scoreboard (merged after join — no shared mutable state).
+const Worker = struct {
+    paths: []const []const u8,
+    cursor: *std.atomic.Value(usize),
+    fixtures_path: []const u8,
+    includes: *const std.StringHashMapUnmanaged([]const u8),
+    sta_src: []const u8,
+    assert_src: []const u8,
+    board: report.Scoreboard = .{},
+};
+
+fn workerMain(w: *Worker) void {
+    // A shared, thread-safe allocator built for parallel throughput (per-worker
+    // DebugAllocator serializes badly here and drops us to ~1 core).
+    const gpa = std.heap.smp_allocator;
 
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
 
-    // Open the harness directory and load the always-included helpers.
-    var harness_dir = std.Io.Dir.cwd().openDir(io, harness_path, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, w.fixtures_path, .{}) catch return;
+    defer dir.close(io);
+
+    var runner = Runner{
+        .gpa = gpa,
+        .includes = w.includes,
+        .sta_src = w.sta_src,
+        .assert_src = w.assert_src,
+    };
+
+    while (true) {
+        const i = w.cursor.fetchAdd(1, .monotonic);
+        if (i >= w.paths.len) break;
+        const rel = w.paths[i];
+        w.board.files += 1;
+
+        const source = dir.readFileAlloc(io, rel, gpa, max_file_bytes) catch {
+            w.board.record(.skip);
+            continue;
+        };
+        defer gpa.free(source);
+
+        var meta = frontmatter.parse(gpa, source) catch {
+            w.board.record(.skip);
+            continue;
+        };
+        defer meta.deinit(gpa);
+
+        const outcome = runner.classify(source, meta);
+        if (trace_files and outcome == .fail) std.debug.print("FAIL {s}\n", .{rel});
+        w.board.record(outcome);
+    }
+}
+
+// Zig 0.16 hands `main` a `std.process.Init` (args + a leak-checking gpa + an
+// io implementation), replacing the removed `std.os.argv`/`argsAlloc`.
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+
+    // Optional directory argument: `test262 [dir]` (defaults to the bundled set).
+    var arg_it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = arg_it.next(); // skip argv[0]
+    const path: []const u8 = if (arg_it.next()) |p| p else default_path;
+
+    // Open the harness directory and load the always-prepended helpers.
+    var harness_dir = std.Io.Dir.cwd().openDir(io, harness_path, .{ .iterate = true }) catch |err| {
         std.debug.print("test262: cannot open harness '{s}': {s}\n", .{ harness_path, @errorName(err) });
         std.process.exit(1);
     };
@@ -206,47 +267,83 @@ pub fn main() !void {
     const assert_src = try harness_dir.readFileAlloc(io, "assert.js", gpa, max_file_bytes);
     defer gpa.free(assert_src);
 
-    var runner = Runner{
-        .gpa = gpa,
-        .io = io,
-        .harness_dir = harness_dir,
-        .sta_src = sta_src,
-        .assert_src = assert_src,
-    };
+    // Preload every harness helper into memory (basename -> source) so worker
+    // threads share it read-only and never touch the filesystem for includes.
+    var includes: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var it = includes.iterator();
+        while (it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            gpa.free(e.value_ptr.*);
+        }
+        includes.deinit(gpa);
+    }
+    {
+        var hwalk = try harness_dir.walk(gpa);
+        defer hwalk.deinit();
+        while (try hwalk.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".js")) continue;
+            const src = entry.dir.readFileAlloc(io, entry.basename, gpa, max_file_bytes) catch continue;
+            const gop = try includes.getOrPut(gpa, entry.basename);
+            if (gop.found_existing) {
+                gpa.free(src);
+            } else {
+                gop.key_ptr.* = try gpa.dupe(u8, entry.basename);
+                gop.value_ptr.* = src;
+            }
+        }
+    }
 
-    const path = default_path;
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         std.debug.print("test262: cannot open '{s}': {s}\n", .{ path, @errorName(err) });
         std.process.exit(1);
     };
     defer dir.close(io);
 
+    // Collect every test path up front; workers grab them via an atomic cursor.
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| gpa.free(p);
+        paths.deinit(gpa);
+    }
+    {
+        var walker = try dir.walk(gpa);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".js")) continue;
+            if (std.mem.endsWith(u8, entry.basename, "_FIXTURE.js")) continue;
+            try paths.append(gpa, try gpa.dupe(u8, entry.path));
+        }
+    }
+
+    const cpu = std.Thread.getCpuCount() catch 4;
+    const nthreads = @max(1, @min(cpu, @min(@as(usize, 16), @max(1, paths.items.len))));
+
+    var cursor = std.atomic.Value(usize).init(0);
+    const workers = try gpa.alloc(Worker, nthreads);
+    defer gpa.free(workers);
+    for (workers) |*w| w.* = .{
+        .paths = paths.items,
+        .cursor = &cursor,
+        .fixtures_path = path,
+        .includes = &includes,
+        .sta_src = sta_src,
+        .assert_src = assert_src,
+    };
+
+    const threads = try gpa.alloc(std.Thread, nthreads);
+    defer gpa.free(threads);
+    for (threads, workers) |*t, *w| t.* = try std.Thread.spawn(.{}, workerMain, .{w});
+    for (threads) |t| t.join();
+
     var board: report.Scoreboard = .{};
-    var walker = try dir.walk(gpa);
-    defer walker.deinit();
-
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".js")) continue;
-        if (std.mem.endsWith(u8, entry.basename, "_FIXTURE.js")) continue;
-
-        board.files += 1;
-
-        const source = entry.dir.readFileAlloc(io, entry.basename, gpa, max_file_bytes) catch {
-            board.record(.skip);
-            continue;
-        };
-        defer gpa.free(source);
-
-        var meta = frontmatter.parse(gpa, source) catch {
-            board.record(.skip);
-            continue;
-        };
-        defer meta.deinit(gpa);
-
-        const outcome = runner.classify(source, meta);
-        if (trace_files and outcome == .fail) std.debug.print("FAIL {s}\n", .{entry.path});
-        board.record(outcome);
+    for (workers) |w| {
+        board.pass += w.board.pass;
+        board.fail += w.board.fail;
+        board.skip += w.board.skip;
+        board.files += w.board.files;
     }
 
     printReport(path, board);

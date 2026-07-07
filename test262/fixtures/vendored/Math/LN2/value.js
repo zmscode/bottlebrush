@@ -10,5 +10,5 @@ info: |
     The precision of this approximation is host-defined.
 ---*/
 
-assert.sameValue(typeof Math.LN2, "number");
+assert.sameValue(typeof Math.LN2, 'number');
 assert.notSameValue(Math.LN2, NaN);

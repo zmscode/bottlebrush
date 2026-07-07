@@ -9,7 +9,7 @@ es6id: 20.2.2.20
 ---*/
 
 verifyProperty(Math, "log10", {
-	writable: true,
-	enumerable: false,
-	configurable: true,
+  writable: true,
+  enumerable: false,
+  configurable: true,
 });

@@ -9,4 +9,4 @@ description: Checking if Math.floor(x) is +Infinity, where x is +Infinity
 
 // CHECK#1
 var x = +Infinity;
-assert.sameValue(Math.floor(x), +Infinity, "Math.floor(+Infinity) must return +Infinity");
+assert.sameValue(Math.floor(x), +Infinity, 'Math.floor(+Infinity) must return +Infinity');

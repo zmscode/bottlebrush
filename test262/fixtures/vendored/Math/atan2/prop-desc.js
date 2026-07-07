@@ -12,7 +12,7 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math, "atan2", {
-	writable: true,
-	enumerable: false,
-	configurable: true,
+  writable: true,
+  enumerable: false,
+  configurable: true,
 });

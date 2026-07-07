@@ -13,9 +13,9 @@ info: |
 let valueOf_calls = 0;
 
 const n = {
-	valueOf: function () {
-		valueOf_calls++;
-	},
+  valueOf: function() {
+    valueOf_calls++;
+  }
 };
 Math.min(NaN, n);
 assert.sameValue(valueOf_calls, 1);

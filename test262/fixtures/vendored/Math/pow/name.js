@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.pow, "name", {
-	value: "pow",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "pow",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

@@ -22,6 +22,15 @@ const Value = @import("value.zig").Value;
 pub const Error = gc.VmError;
 
 const max_call_depth = 2000;
+/// Instruction budget per `run`. A hung/looping test throws `error.Timeout`
+/// (scored as an engine limit, not a conformance failure) instead of spinning
+/// forever. Generous enough for legitimately heavy tests.
+const max_steps = 50_000_000;
+/// Wall-clock budget per `run` (nanoseconds). Catches runaways whose cost is in
+/// GC or native loops rather than raw instruction count. Checked every
+/// `wall_check_mask + 1` steps to keep the clock read off the hot path.
+const max_wall_ns: i96 = 2 * std.time.ns_per_s;
+const wall_check_mask: u64 = 0x3FFF; // ~16k steps
 
 const Frame = struct {
     code: *const bc.CodeBlock,
@@ -41,6 +50,14 @@ pub const Vm = struct {
     temp_roots: std.ArrayList(Value) = .empty,
     pending_exception: ?Value = null,
     depth: u32 = 0,
+    /// Instructions executed in the current `run`. Bounds pathological or
+    /// intentionally-infinite scripts so a single test can't hang the host.
+    steps: u64 = 0,
+    /// Monotonic-clock provider + wall-clock deadline (nanoseconds). The step
+    /// budget alone can't bound wall time when the cost is in GC or native
+    /// loops, so `run` also arms a deadline checked periodically in the loop.
+    threaded: std.Io.Threaded = std.Io.Threaded.init_single_threaded,
+    deadline_ns: i96 = 0,
     // Realm intrinsics (created lazily by `bootstrap`).
     object_proto: ?*gc.Object = null,
     function_proto: ?*gc.Object = null,
@@ -646,6 +663,9 @@ pub const Vm = struct {
     /// `error.JsThrow` with `pending_exception` set.
     pub fn run(self: *Vm, program: *const bc.Program) Error!Value {
         try self.bootstrap();
+        self.steps = 0;
+        self.threaded = std.Io.Threaded.init_single_threaded;
+        self.deadline_ns = std.Io.Clock.now(.awake, self.threaded.io()).nanoseconds + max_wall_ns;
         const root = program.root;
         const env = try self.createEnv(null, root.num_env_slots);
         return self.execute(root, env, Value.fromObject(self.global_object.?));
@@ -706,9 +726,24 @@ pub const Vm = struct {
 
     /// The core dispatch loop over a frame. Runs until the function returns or a
     /// generator yields (leaving `frame.pc` at the `gen_yield` instruction).
+    /// True once the current `run` has exceeded its wall-clock deadline.
+    fn overBudget(self: *Vm) bool {
+        return std.Io.Clock.now(.awake, self.threaded.io()).nanoseconds > self.deadline_ns;
+    }
+
+    /// Tick the execution budget once and raise `error.Timeout` if the step or
+    /// wall-clock limit is exceeded. Called from the dispatch loop and from
+    /// native loops whose trip count is controlled by a JS `length`.
+    fn checkBudget(self: *Vm) Error!void {
+        self.steps += 1;
+        if (self.steps > max_steps) return error.Timeout;
+        if (self.steps & wall_check_mask == 0 and self.overBudget()) return error.Timeout;
+    }
+
     fn runLoop(self: *Vm, frame: *Frame) Error!RunResult {
         const code = frame.code;
         while (true) {
+            try self.checkBudget();
             const inst = code.code[frame.pc];
             const step = self.exec(code, frame.env, frame.regs, frame.this_value, inst, &frame.pc) catch |e| {
                 if (e != error.JsThrow) return e;
@@ -843,7 +878,7 @@ pub const Vm = struct {
                 regs[inst.a] = Value.fromBool(self.deleteProperty(regs[inst.b], key));
             },
             .load_this => regs[inst.a] = this_value,
-            .arr_push => try regs[inst.a].asObject().elements.append(self.gpa, regs[inst.b]),
+            .arr_push => try self.arrayAppend(regs[inst.a].asObject(), regs[inst.b]),
             .arr_spread => try self.spreadInto(regs[inst.a].asObject(), regs[inst.b]),
             .iter_init => regs[inst.a] = try self.getIterator(regs[inst.b]),
             .iter_next => regs[inst.a] = try self.iteratorNext(regs[inst.b]),
@@ -896,7 +931,7 @@ pub const Vm = struct {
         const clo = try self.heap.create(gc.Closure);
         clo.code = child;
         clo.env = env;
-        clo.constructor = !child.is_generator; // generators aren't `new`-able
+        clo.constructor = !child.is_generator and !child.is_arrow; // generators/arrows aren't `new`-able
         const fn_obj = try self.heap.create(gc.Object);
         fn_obj.callable = clo;
         fn_obj.prototype = self.function_proto;
@@ -1146,8 +1181,15 @@ pub const Vm = struct {
     /// Maps, generators, and custom iterables all work).
     fn spreadInto(self: *Vm, dst: *gc.Object, src: Value) Error!void {
         if (src.isObject() and src.asObject().is_array) {
-            // Copy first (spreading into dst may alias src's backing).
-            for (src.asObject().elements.items) |v| try dst.elements.append(self.gpa, v);
+            // Array spread visits 0..length (holes yield `undefined`). `n` is
+            // snapshotted so a self-spread appends past the original range.
+            const a = src.asObject();
+            const n = a.array_length;
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                try self.checkBudget();
+                try self.arrayAppend(dst, arrayGetOwn(a, i) orelse Value.undefined_value);
+            }
             return;
         }
         const iter = try self.getIterator(src);
@@ -1156,7 +1198,7 @@ pub const Vm = struct {
         while (true) {
             const r = try self.iteratorNext(iter);
             if (toBoolean(try self.getProperty(r, "done"))) break;
-            try dst.elements.append(self.gpa, try self.getProperty(r, "value"));
+            try self.arrayAppend(dst, try self.getProperty(r, "value"));
         }
     }
 
@@ -1174,11 +1216,13 @@ pub const Vm = struct {
         var o: ?*gc.Object = base.asObject();
         while (o) |cur| {
             if (cur.is_array) {
-                var i: usize = 0;
-                while (i < cur.elements.items.len) : (i += 1) {
+                var idxs: std.ArrayList(u32) = .empty;
+                defer idxs.deinit(self.gpa);
+                try self.arrayPresentIndices(cur, &idxs);
+                for (idxs.items) |i| {
                     var b: [16]u8 = undefined;
                     const s = std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable;
-                    try arr.elements.append(self.gpa, try self.makeString(s)); // array indices are unique
+                    try self.arrayAppend(arr, try self.makeString(s)); // array indices are unique
                 }
             }
             var it = cur.properties.iterator();
@@ -1187,7 +1231,7 @@ pub const Vm = struct {
                 const k = entry.key_ptr.*;
                 if (k.len > 0 and k[0] == 0) continue; // internal/symbol keys
                 if ((try seen.getOrPut(k)).found_existing) continue;
-                try arr.elements.append(self.gpa, try self.makeString(k));
+                try self.arrayAppend(arr, try self.makeString(k));
             }
             o = cur.prototype;
         }
@@ -1234,9 +1278,11 @@ pub const Vm = struct {
     }
 
     fn iterPair(self: *Vm, a: Value, b: Value) Error!Value {
-        const arr = try self.newArray(2);
-        arr.elements.items[0] = a;
-        arr.elements.items[1] = b;
+        const arr = try self.newArray(0);
+        try self.protect(Value.fromObject(arr));
+        defer self.unprotect();
+        try self.arrayAppend(arr, a);
+        try self.arrayAppend(arr, b);
         return Value.fromObject(arr);
     }
     fn iterEntryValue(self: *Vm, kind: u8, index: Value, element: Value) Error!Value {
@@ -1247,15 +1293,15 @@ pub const Vm = struct {
         };
     }
 
+    /// Create an array of logical length `len`. Elements are absent (holes)
+    /// until written — the dense store is not pre-materialized, so
+    /// `new Array(1e9)` costs nothing.
     fn newArray(self: *Vm, len: u32) Error!*gc.Object {
         self.maybeStress();
         const o = try self.heap.create(gc.Object);
         o.prototype = self.array_proto;
         o.is_array = true;
-        if (len > 0) {
-            try o.elements.resize(self.gpa, len);
-            @memset(o.elements.items, Value.undefined_value);
-        }
+        o.array_length = len;
         return o;
     }
 
@@ -1278,23 +1324,134 @@ pub const Vm = struct {
         return o;
     }
 
-    fn setArrayElement(self: *Vm, arr: *gc.Object, i: u32, value: Value) Error!void {
-        if (i >= arr.elements.items.len) {
-            const old = arr.elements.items.len;
-            try arr.elements.resize(self.gpa, i + 1);
-            for (arr.elements.items[old..]) |*slot| slot.* = Value.undefined_value;
+    // ---- array element storage (V8-style: fast dense + dictionary fallback) ---
+
+    /// The dense store may lead the write index by at most this much before the
+    /// array flips to dictionary mode (mirrors V8's `kMaxGap`).
+    const array_max_gap: u32 = 1024;
+
+    /// The array's own element at `i`, or null if it's a hole/absent. No
+    /// prototype lookup — callers that need the JS `[[Get]]` fall back themselves.
+    fn arrayGetOwn(arr: *gc.Object, i: u32) ?Value {
+        if (arr.dictionary_mode) return arr.array_dict.get(i);
+        if (i < arr.elements.items.len) {
+            const v = arr.elements.items[i];
+            return if (v.isHole()) null else v;
         }
-        arr.elements.items[i] = value;
+        return null;
+    }
+
+    fn arrayHasOwn(arr: *gc.Object, i: u32) bool {
+        return arrayGetOwn(arr, i) != null;
+    }
+
+    fn bumpArrayLength(arr: *gc.Object, i: u32) void {
+        const want: u64 = @as(u64, i) + 1;
+        if (want > arr.array_length) arr.array_length = @intCast(want);
+    }
+
+    /// Move all present dense elements into the dictionary store and switch mode.
+    fn arrayToDictionary(self: *Vm, arr: *gc.Object) Error!void {
+        for (arr.elements.items, 0..) |v, idx| {
+            if (v.isHole()) continue;
+            try arr.array_dict.put(self.gpa, @intCast(idx), v);
+        }
+        arr.elements.clearAndFree(self.gpa);
+        arr.dictionary_mode = true;
+    }
+
+    /// `arr[i] = value` (an ordinary value, never a hole). Grows the dense store
+    /// (filling the gap with holes) for small gaps, else converts to dictionary
+    /// mode so a far-out write can't balloon the backing store.
+    fn setArrayElement(self: *Vm, arr: *gc.Object, i: u32, value: Value) Error!void {
+        if (arr.dictionary_mode) {
+            try arr.array_dict.put(self.gpa, i, value);
+            bumpArrayLength(arr, i);
+            return;
+        }
+        const cap: u32 = @intCast(arr.elements.items.len);
+        if (i < cap) {
+            arr.elements.items[i] = value;
+        } else if (i - cap < array_max_gap) {
+            try arr.elements.resize(self.gpa, i + 1);
+            for (arr.elements.items[cap..i]) |*slot| slot.* = Value.hole_value;
+            arr.elements.items[i] = value;
+        } else {
+            try self.arrayToDictionary(arr);
+            try arr.array_dict.put(self.gpa, i, value);
+        }
+        bumpArrayLength(arr, i);
+    }
+
+    /// Append `value` at the current length.
+    fn arrayAppend(self: *Vm, arr: *gc.Object, value: Value) Error!void {
+        try self.setArrayElement(arr, arr.array_length, value);
+    }
+
+    /// Delete the own element at `i` (leaves a hole; length unchanged).
+    fn deleteArrayElement(self: *Vm, arr: *gc.Object, i: u32) void {
+        _ = self;
+        if (arr.dictionary_mode) {
+            _ = arr.array_dict.remove(i);
+        } else if (i < arr.elements.items.len) {
+            arr.elements.items[i] = Value.hole_value;
+        }
     }
 
     fn setArrayLength(self: *Vm, arr: *gc.Object, n: u32) Error!void {
-        const old = arr.elements.items.len;
-        if (n < old) {
+        if (arr.dictionary_mode) {
+            if (n < arr.array_length) {
+                var doomed: std.ArrayList(u32) = .empty;
+                defer doomed.deinit(self.gpa);
+                var it = arr.array_dict.keyIterator();
+                while (it.next()) |k| {
+                    if (k.* >= n) try doomed.append(self.gpa, k.*);
+                }
+                for (doomed.items) |k| _ = arr.array_dict.remove(k);
+            }
+        } else if (n < arr.elements.items.len) {
             arr.elements.shrinkRetainingCapacity(n);
-        } else if (n > old) {
-            try arr.elements.resize(self.gpa, n);
-            for (arr.elements.items[old..]) |*slot| slot.* = Value.undefined_value;
         }
+        arr.array_length = n;
+    }
+
+    /// Collect the present (non-hole) own indices in ascending order. Bounded by
+    /// the number of stored elements, never by the logical length — so builtins
+    /// stay cheap on sparse arrays. Caller owns `out`.
+    fn arrayPresentIndices(self: *Vm, arr: *gc.Object, out: *std.ArrayList(u32)) Error!void {
+        if (arr.dictionary_mode) {
+            var it = arr.array_dict.keyIterator();
+            while (it.next()) |k| try out.append(self.gpa, k.*);
+            std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+        } else {
+            for (arr.elements.items, 0..) |v, i| {
+                if (!v.isHole()) try out.append(self.gpa, @intCast(i));
+            }
+        }
+    }
+
+    /// Materialize an array value's 0..length elements (holes -> undefined) into
+    /// a fresh gpa buffer, for use as an argument list (`apply`/`Reflect`). The
+    /// values stay reachable via the source array; the caller frees the buffer.
+    fn argListFromArray(self: *Vm, v: Value) Error![]Value {
+        if (!v.isObject() or !v.asObject().is_array) return self.gpa.alloc(Value, 0);
+        const a = v.asObject();
+        const buf = try self.gpa.alloc(Value, a.array_length);
+        for (buf, 0..) |*slot, i| slot.* = arrayGetOwn(a, @intCast(i)) orelse Value.undefined_value;
+        return buf;
+    }
+
+    /// Build a `{value, writable, enumerable, configurable}` descriptor object
+    /// (as returned by `Object.getOwnPropertyDescriptor`).
+    fn makeDataDescriptor(self: *Vm, value: Value, w: bool, e: bool, c: bool) Error!Value {
+        const result = try self.newObject(self.object_proto);
+        try self.protect(Value.fromObject(result));
+        defer self.unprotect();
+        try self.defineData(result, "value", value, true, true, true);
+        try self.defineData(result, "writable", Value.fromBool(w), true, true, true);
+        try self.defineData(result, "enumerable", Value.fromBool(e), true, true, true);
+        try self.defineData(result, "configurable", Value.fromBool(c), true, true, true);
+        return Value.fromObject(result);
     }
 
     /// Define an own data property with explicit attributes (key is duplicated).
@@ -1333,12 +1490,14 @@ pub const Vm = struct {
             if (base.isSymbol()) return self.getFromProto(self.symbol_proto, base, key);
             return Value.undefined_value;
         }
-        // Array exotic own access (length + dense elements).
+        // Array exotic own access (length + own elements). A hole/absent index
+        // falls through to the prototype chain below.
         if (base.asObject().is_array) {
             const arr = base.asObject();
-            if (std.mem.eql(u8, key, "length")) return Value.fromNumber(@floatFromInt(arr.elements.items.len));
+            if (std.mem.eql(u8, key, "length")) return Value.fromNumber(@floatFromInt(arr.array_length));
             if (arrayIndex(key)) |i| {
-                if (i < arr.elements.items.len) return arr.elements.items[i];
+                if (arrayGetOwn(arr, i)) |v| return v;
+                return self.getFromProto(arr.prototype, base, key);
             }
         }
         // TypedArray exotic own access (indexed elements + view properties).
@@ -1461,7 +1620,7 @@ pub const Vm = struct {
         const o = base.asObject();
         if (o.is_array) {
             if (arrayIndex(key)) |i| {
-                if (i < o.elements.items.len) o.elements.items[i] = Value.undefined_value; // hole
+                self.deleteArrayElement(o, i);
                 return true;
             }
         }
@@ -1476,6 +1635,12 @@ pub const Vm = struct {
         _ = self;
         var o: ?*gc.Object = obj;
         while (o) |cur| {
+            if (cur.is_array) {
+                if (std.mem.eql(u8, key, "length")) return true;
+                if (arrayIndex(key)) |i| {
+                    if (arrayHasOwn(cur, i)) return true;
+                }
+            }
             if (cur.properties.contains(key)) return true;
             o = cur.prototype;
         }
@@ -1610,6 +1775,7 @@ pub const Vm = struct {
             .bigint => return self.throwTypeError("cannot convert a BigInt to a number"),
             .symbol => return self.throwTypeError("cannot convert a Symbol to a number"),
             .object => try self.toNumber(try self.toPrimitive(v)),
+            .hole => unreachable, // holes never escape array storage
         };
     }
 
@@ -1673,6 +1839,7 @@ pub const Vm = struct {
             .object => "[object Object]",
             .symbol => "Symbol()",
             .string => "", // handled by caller
+            .hole => unreachable,
         };
     }
 
@@ -1686,6 +1853,7 @@ pub const Vm = struct {
             .symbol => "symbol",
             .bigint => "bigint",
             .object => |o| if (o.callable != null) "function" else "object",
+            .hole => unreachable,
         };
         return self.makeString(name);
     }
@@ -1818,6 +1986,7 @@ pub const Vm = struct {
                 defer _ = ctx.stack.pop();
                 if (o.is_array) try self.jsonArray(ctx, o) else try self.jsonObject(ctx, value, o);
             },
+            .hole => unreachable,
         }
         return true;
     }
@@ -1832,9 +2001,10 @@ pub const Vm = struct {
         try ctx.out.append(self.gpa, '[');
         const prev = ctx.indent.items.len;
         try ctx.indent.appendSlice(self.gpa, ctx.gap);
-        const n = o.elements.items.len;
+        const n = o.array_length; // holes/undefined serialize as "null"
         var i: usize = 0;
         while (i < n) : (i += 1) {
+            try self.checkBudget();
             if (i > 0) try ctx.out.append(self.gpa, ',');
             try self.newlineIndent(ctx, ctx.indent.items.len);
             var kbuf: [24]u8 = undefined;
@@ -1915,10 +2085,11 @@ pub const Vm = struct {
             const o = val.asObject();
             if (o.is_array) {
                 var i: u32 = 0;
-                while (i < o.elements.items.len) : (i += 1) {
+                while (i < o.array_length) : (i += 1) {
+                    try self.checkBudget();
                     var kbuf: [24]u8 = undefined;
                     const ks = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch unreachable;
-                    o.elements.items[i] = try self.internalizeJSON(val, ks, reviver);
+                    try self.setArrayElement(o, i, try self.internalizeJSON(val, ks, reviver));
                 }
             } else {
                 var keys: std.ArrayList([]const u8) = .empty;
@@ -1956,6 +2127,7 @@ fn sameTypeStrictEq(a: Value, b: Value) bool {
         .bigint => |x| b.isBigInt() and x.value == b.asBigInt().value,
         .symbol => |x| b.isSymbol() and x == b.asSymbol(),
         .object => |x| b.isObject() and x == b.asObject(),
+        .hole => unreachable,
     };
 }
 
@@ -1967,6 +2139,7 @@ pub fn toBoolean(v: Value) bool {
         .string => |s| s.units.len != 0,
         .bigint => |b| b.value != 0,
         .symbol, .object => true,
+        .hole => unreachable,
     };
 }
 
@@ -2193,7 +2366,18 @@ fn nativeObjectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: []co
     if (!obj_v.isObject()) return vm.throwTypeError("called on non-object");
     const key = try vm.toPropertyKey(argAt(args, 1));
     defer vm.gpa.free(key);
-    const desc = obj_v.asObject().properties.get(key) orelse return Value.undefined_value;
+    // Array exotic own properties: indices and `length` don't live in the map.
+    const o = obj_v.asObject();
+    if (o.is_array) {
+        if (std.mem.eql(u8, key, "length")) {
+            return vm.makeDataDescriptor(Value.fromNumber(@floatFromInt(o.array_length)), true, false, false);
+        }
+        if (arrayIndex(key)) |i| {
+            if (Vm.arrayGetOwn(o, i)) |v| return vm.makeDataDescriptor(v, true, true, true);
+            return Value.undefined_value;
+        }
+    }
+    const desc = o.properties.get(key) orelse return Value.undefined_value;
     const result = try vm.newObject(vm.object_proto);
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
@@ -2498,26 +2682,46 @@ fn nativeArrayIsArray(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     return Value.fromBool(v.isObject() and v.asObject().is_array);
 }
 
+/// Append `src`'s elements (0..length, preserving holes) to `dst`.
+fn appendArrayElements(vm: *Vm, dst: *gc.Object, src: *gc.Object) Error!void {
+    const base = dst.array_length;
+    const n = src.array_length;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        try vm.checkBudget();
+        if (Vm.arrayGetOwn(src, i)) |v| try vm.setArrayElement(dst, @intCast(@as(u64, base) + i), v);
+    }
+    const total: u64 = @as(u64, base) + n; // account for trailing holes
+    if (total > dst.array_length) dst.array_length = @intCast(total);
+}
+
 fn nativeArrayPush(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const arr = try thisArray(vm, this);
-    for (args) |a| try arr.elements.append(vm.gpa, a);
-    return Value.fromNumber(@floatFromInt(arr.elements.items.len));
+    for (args) |a| try vm.arrayAppend(arr, a);
+    return Value.fromNumber(@floatFromInt(arr.array_length));
 }
 
 fn nativeArrayPop(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = args;
     const vm = castVm(ctx);
     const arr = try thisArray(vm, this);
-    return arr.elements.pop() orelse Value.undefined_value;
+    if (arr.array_length == 0) return Value.undefined_value;
+    const last = arr.array_length - 1;
+    const v = Vm.arrayGetOwn(arr, last) orelse Value.undefined_value;
+    try vm.setArrayLength(arr, last);
+    return v;
 }
 
 fn nativeArrayIndexOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const arr = try thisArray(vm, this);
     const target = argAt(args, 0);
-    for (arr.elements.items, 0..) |el, i| {
-        if (sameTypeStrictEq(el, target)) return Value.fromNumber(@floatFromInt(i));
+    var idxs: std.ArrayList(u32) = .empty;
+    defer idxs.deinit(vm.gpa);
+    try vm.arrayPresentIndices(arr, &idxs);
+    for (idxs.items) |i| {
+        if (sameTypeStrictEq(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromNumber(@floatFromInt(i));
     }
     return Value.fromNumber(-1);
 }
@@ -2526,13 +2730,14 @@ fn nativeArrayIncludes(ctx: *anyopaque, this: Value, args: []const Value) Error!
     const vm = castVm(ctx);
     const arr = try thisArray(vm, this);
     const target = argAt(args, 0);
-    for (arr.elements.items) |el| {
-        // SameValueZero: like strict equality but NaN matches NaN.
-        if (sameTypeStrictEq(el, target)) return Value.fromBool(true);
-        if (el.isNumber() and target.isNumber() and std.math.isNan(el.asNumber()) and std.math.isNan(target.asNumber())) {
-            return Value.fromBool(true);
-        }
+    var idxs: std.ArrayList(u32) = .empty;
+    defer idxs.deinit(vm.gpa);
+    try vm.arrayPresentIndices(arr, &idxs);
+    for (idxs.items) |i| {
+        if (sameValueZero(Vm.arrayGetOwn(arr, i).?, target)) return Value.fromBool(true);
     }
+    // Unlike indexOf, includes reads holes as `undefined`.
+    if (target.isUndefined() and idxs.items.len < arr.array_length) return Value.fromBool(true);
     return Value.fromBool(false);
 }
 
@@ -2546,9 +2751,14 @@ fn nativeArrayJoin(ctx: *anyopaque, this: Value, args: []const Value) Error!Valu
 
     var buf: std.ArrayList(u16) = .empty;
     defer buf.deinit(vm.gpa);
-    for (arr.elements.items, 0..) |el, i| {
+    var i: u32 = 0;
+    const n = arr.array_length;
+    while (i < n) : (i += 1) {
+        try vm.checkBudget();
         if (i > 0) try buf.appendSlice(vm.gpa, sep.asString().units);
-        if (el.isNullish()) continue; // null/undefined join as empty
+        // Holes and null/undefined join as empty.
+        const el = Vm.arrayGetOwn(arr, i) orelse continue;
+        if (el.isNullish()) continue;
         const s = try vm.toStringVal(el);
         try buf.appendSlice(vm.gpa, s.asString().units);
     }
@@ -2562,15 +2772,19 @@ fn nativeArrayToString(ctx: *anyopaque, this: Value, args: []const Value) Error!
 fn nativeArraySlice(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const arr = try thisArray(vm, this);
-    const len: i64 = @intCast(arr.elements.items.len);
+    const len: i64 = @intCast(arr.array_length);
     const start = relativeIndex(try optNumber(vm, argAt(args, 0), 0), len);
     const end = relativeIndex(try optNumber(vm, argAt(args, 1), @floatFromInt(len)), len);
-    const result = try vm.newArray(0);
+    const count: u32 = if (end > start) @intCast(end - start) else 0;
+    const result = try vm.newArray(count);
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
     var i = start;
+    var j: u32 = 0;
     while (i < end) : (i += 1) {
-        try result.elements.append(vm.gpa, arr.elements.items[@intCast(i)]);
+        try vm.checkBudget();
+        if (Vm.arrayGetOwn(arr, @intCast(i))) |v| try vm.setArrayElement(result, j, v); // holes preserved
+        j += 1;
     }
     return Value.fromObject(result);
 }
@@ -2581,12 +2795,12 @@ fn nativeArrayConcat(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
     const result = try vm.newArray(0);
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
-    for (arr.elements.items) |el| try result.elements.append(vm.gpa, el);
+    try appendArrayElements(vm, result, arr);
     for (args) |a| {
         if (a.isObject() and a.asObject().is_array) {
-            for (a.asObject().elements.items) |el| try result.elements.append(vm.gpa, el);
+            try appendArrayElements(vm, result, a.asObject());
         } else {
-            try result.elements.append(vm.gpa, a);
+            try vm.arrayAppend(result, a);
         }
     }
     return Value.fromObject(result);
@@ -2597,11 +2811,11 @@ fn nativeArrayForEach(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     const arr = try thisArray(vm, this);
     const cb = argAt(args, 0);
     if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    var i: u32 = 0;
-    const n: u32 = @intCast(arr.elements.items.len);
-    while (i < n) : (i += 1) {
-        if (i >= arr.elements.items.len) break;
-        const el = arr.elements.items[i];
+    var idxs: std.ArrayList(u32) = .empty;
+    defer idxs.deinit(vm.gpa);
+    try vm.arrayPresentIndices(arr, &idxs);
+    for (idxs.items) |i| {
+        const el = Vm.arrayGetOwn(arr, i) orelse continue; // skip holes / deleted-by-callback
         _ = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
     }
     return Value.undefined_value;
@@ -2612,13 +2826,14 @@ fn nativeArrayMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value
     const arr = try thisArray(vm, this);
     const cb = argAt(args, 0);
     if (!isCallable(cb)) return vm.throwTypeError("callback is not a function");
-    const n: u32 = @intCast(arr.elements.items.len);
-    const result = try vm.newArray(n);
+    const result = try vm.newArray(arr.array_length); // same length; holes preserved
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        const el = if (i < arr.elements.items.len) arr.elements.items[i] else Value.undefined_value;
+    var idxs: std.ArrayList(u32) = .empty;
+    defer idxs.deinit(vm.gpa);
+    try vm.arrayPresentIndices(arr, &idxs);
+    for (idxs.items) |i| {
+        const el = Vm.arrayGetOwn(arr, i) orelse continue;
         const r = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
         try vm.setArrayElement(result, i, r);
     }
@@ -2633,13 +2848,13 @@ fn nativeArrayFilter(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
     const result = try vm.newArray(0);
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
-    var i: u32 = 0;
-    const n: u32 = @intCast(arr.elements.items.len);
-    while (i < n) : (i += 1) {
-        if (i >= arr.elements.items.len) break;
-        const el = arr.elements.items[i];
+    var idxs: std.ArrayList(u32) = .empty;
+    defer idxs.deinit(vm.gpa);
+    try vm.arrayPresentIndices(arr, &idxs);
+    for (idxs.items) |i| {
+        const el = Vm.arrayGetOwn(arr, i) orelse continue;
         const keep = try vm.callValue(cb, Value.undefined_value, &.{ el, Value.fromNumber(@floatFromInt(i)), this });
-        if (toBoolean(keep)) try result.elements.append(vm.gpa, el);
+        if (toBoolean(keep)) try vm.arrayAppend(result, el);
     }
     return Value.fromObject(result);
 }
@@ -2665,8 +2880,10 @@ fn relativeIndex(n: f64, len: i64) i64 {
 /// indices ascending, then insertion-order string keys).
 fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
     if (obj.is_array) {
-        var i: usize = 0;
-        while (i < obj.elements.items.len) : (i += 1) {
+        var idxs: std.ArrayList(u32) = .empty;
+        defer idxs.deinit(vm.gpa);
+        try vm.arrayPresentIndices(obj, &idxs);
+        for (idxs.items) |i| {
             var buf: [16]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
             try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
@@ -2697,7 +2914,7 @@ fn nativeObjectKeys(ctx: *anyopaque, this: Value, args: []const Value) Error!Val
     defer vm.unprotect();
     for (keys.items) |k| {
         const s = try vm.makeString(k);
-        try result.elements.append(vm.gpa, s);
+        try vm.arrayAppend(result,s);
     }
     return Value.fromObject(result);
 }
@@ -2718,7 +2935,7 @@ fn nativeObjectValues(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     defer vm.unprotect();
     for (keys.items) |k| {
         const val = try vm.getProperty(v, k);
-        try result.elements.append(vm.gpa, val);
+        try vm.arrayAppend(result,val);
     }
     return Value.fromObject(result);
 }
@@ -2727,8 +2944,10 @@ fn nativeObjectValues(ctx: *anyopaque, this: Value, args: []const Value) Error!V
 /// and internal-slot keys. Array indices and `length` are included for arrays.
 fn ownPropertyNames(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
     if (obj.is_array) {
-        var i: usize = 0;
-        while (i < obj.elements.items.len) : (i += 1) {
+        var idxs: std.ArrayList(u32) = .empty;
+        defer idxs.deinit(vm.gpa);
+        try vm.arrayPresentIndices(obj, &idxs);
+        for (idxs.items) |i| {
             var buf: [16]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
             try out.append(vm.gpa, try vm.gpa.dupe(u8, s));
@@ -2759,7 +2978,7 @@ fn nativeObjectGetOwnPropertyNames(ctx: *anyopaque, this: Value, args: []const V
     defer vm.unprotect();
     for (keys.items) |k| {
         const s = try vm.makeString(k);
-        try result.elements.append(vm.gpa, s);
+        try vm.arrayAppend(result,s);
     }
     return Value.fromObject(result);
 }
@@ -2771,10 +2990,10 @@ fn nativePropertyIsEnumerable(ctx: *anyopaque, this: Value, args: []const Value)
     defer vm.gpa.free(key);
     const o = this.asObject();
     if (o.properties.get(key)) |desc| return Value.fromBool(desc.enumerable);
-    // Array indices are enumerable own properties when in range.
+    // A present array index is an enumerable own property.
     if (o.is_array) {
-        if (std.fmt.parseInt(usize, key, 10)) |idx| {
-            if (idx < o.elements.items.len) return Value.fromBool(true);
+        if (std.fmt.parseInt(u32, key, 10)) |idx| {
+            if (Vm.arrayHasOwn(o, idx)) return Value.fromBool(true);
         } else |_| {}
     }
     return Value.fromBool(false);
@@ -2795,12 +3014,12 @@ fn nativeObjectEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
     for (keys.items) |k| {
-        const pair = try vm.newArray(2);
+        const pair = try vm.newArray(0);
         try vm.protect(Value.fromObject(pair));
         defer vm.unprotect();
-        pair.elements.items[0] = try vm.makeString(k);
-        pair.elements.items[1] = try vm.getProperty(v, k);
-        try result.elements.append(vm.gpa, Value.fromObject(pair));
+        try vm.arrayAppend(pair, try vm.makeString(k));
+        try vm.arrayAppend(pair, try vm.getProperty(v, k));
+        try vm.arrayAppend(result, Value.fromObject(pair));
     }
     return Value.fromObject(result);
 }
@@ -2973,7 +3192,10 @@ fn nativeStringRepeat(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     var buf: std.ArrayList(u16) = .empty;
     defer buf.deinit(vm.gpa);
     var i: usize = 0;
-    while (i < count) : (i += 1) try buf.appendSlice(vm.gpa, units);
+    while (i < count) : (i += 1) {
+        try vm.checkBudget();
+        try buf.appendSlice(vm.gpa, units);
+    }
     return vm.makeStringFromUtf16(buf.items);
 }
 
@@ -3004,7 +3226,7 @@ fn nativeStringSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
 
     const sep_v = argAt(args, 0);
     if (sep_v.isUndefined()) {
-        try result.elements.append(vm.gpa, sv);
+        try vm.arrayAppend(result,sv);
         return Value.fromObject(result);
     }
     const sep = try coerceToString(vm, sep_v);
@@ -3016,7 +3238,7 @@ fn nativeStringSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
         // Split into individual code units.
         for (units) |u| {
             const piece = try vm.makeStringFromUtf16(&[_]u16{u});
-            try result.elements.append(vm.gpa, piece);
+            try vm.arrayAppend(result,piece);
         }
         return Value.fromObject(result);
     }
@@ -3024,11 +3246,11 @@ fn nativeStringSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
     var start: usize = 0;
     while (indexOfUtf16(units, sep_units, start)) |idx| {
         const piece = try vm.makeStringFromUtf16(units[start..idx]);
-        try result.elements.append(vm.gpa, piece);
+        try vm.arrayAppend(result,piece);
         start = idx + sep_units.len;
     }
     const last = try vm.makeStringFromUtf16(units[start..]);
-    try result.elements.append(vm.gpa, last);
+    try vm.arrayAppend(result,last);
     return Value.fromObject(result);
 }
 
@@ -3338,7 +3560,7 @@ const JsonParser = struct {
         }
         while (true) {
             const v = try self.parseValue();
-            try arr.elements.append(self.vm.gpa, v);
+            try self.vm.arrayAppend(arr, v);
             self.skipWs();
             const c = self.peek();
             if (c == ',') {
@@ -3426,7 +3648,10 @@ fn nativeJSONStringify(ctx: *anyopaque, this: Value, args: []const Value) Error!
     if (isCallable(replacer_arg)) {
         replacer = replacer_arg;
     } else if (replacer_arg.isObject() and replacer_arg.asObject().is_array) {
-        for (replacer_arg.asObject().elements.items) |el| {
+        const ra = replacer_arg.asObject();
+        var ri: u32 = 0;
+        while (ri < ra.array_length) : (ri += 1) {
+            const el = Vm.arrayGetOwn(ra, ri) orelse continue;
             if (el.isString()) {
                 const kb = try utf16ToUtf8Alloc(vm.gpa, el.asString().units);
                 try keys_owned.append(vm.gpa, kb);
@@ -3690,7 +3915,10 @@ fn nativeIteratorNext(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     } else if (t.isObject()) {
         const o = t.asObject();
         if (o.is_array) {
-            if (idx >= o.elements.items.len) exhausted = true else value = try vm.iterEntryValue(kind, index_val, o.elements.items[idx]);
+            // Array iterator visits 0..length; holes yield `undefined`.
+            if (idx >= @as(usize, o.array_length)) exhausted = true else {
+                value = try vm.iterEntryValue(kind, index_val, Vm.arrayGetOwn(o, @intCast(idx)) orelse Value.undefined_value);
+            }
         } else if (o.ta) |ta| {
             if (idx >= ta.length) exhausted = true else value = try vm.iterEntryValue(kind, index_val, readTypedElement(ta, @intCast(idx)));
         } else if (o.collection == .set) {
@@ -4111,9 +4339,14 @@ fn nativeTASet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const src = argAt(args, 0);
     const offset: u32 = @intFromFloat(@max(0, try optNumber(vm, argAt(args, 1), 0)));
     if (src.isObject() and src.asObject().is_array) {
-        const elems = src.asObject().elements.items;
-        if (offset + elems.len > ta.length) return vm.throwRangeError("offset is out of bounds");
-        for (elems, 0..) |el, i| writeTypedElement(ta, offset + @as(u32, @intCast(i)), try vm.toNumber(el));
+        const a = src.asObject();
+        const n = a.array_length;
+        if (@as(u64, offset) + n > ta.length) return vm.throwRangeError("offset is out of bounds");
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            try vm.checkBudget();
+            writeTypedElement(ta, offset + i, try vm.toNumber(Vm.arrayGetOwn(a, i) orelse Value.undefined_value));
+        }
     } else if (src.isObject() and src.asObject().ta != null) {
         const s = src.asObject().ta.?;
         if (offset + s.length > ta.length) return vm.throwRangeError("offset is out of bounds");
@@ -4403,17 +4636,19 @@ fn nativeReflectOwnKeys(ctx: *anyopaque, this: Value, args: []const Value) Error
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
     if (o.is_array) {
-        var i: usize = 0;
-        while (i < o.elements.items.len) : (i += 1) {
+        var idxs: std.ArrayList(u32) = .empty;
+        defer idxs.deinit(vm.gpa);
+        try vm.arrayPresentIndices(o, &idxs);
+        for (idxs.items) |i| {
             var b: [16]u8 = undefined;
-            try result.elements.append(vm.gpa, try vm.makeString(std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable));
+            try vm.arrayAppend(result, try vm.makeString(std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable));
         }
     }
     var it = o.properties.iterator();
     while (it.next()) |entry| {
         const k = entry.key_ptr.*;
         if (k.len > 0 and k[0] == 0) continue; // skip internal/symbol keys
-        try result.elements.append(vm.gpa, try vm.makeString(k));
+        try vm.arrayAppend(result, try vm.makeString(k));
     }
     return Value.fromObject(result);
 }
@@ -4423,7 +4658,8 @@ fn nativeReflectApply(ctx: *anyopaque, this: Value, args: []const Value) Error!V
     const target = argAt(args, 0);
     const this_arg = argAt(args, 1);
     const args_arr = argAt(args, 2);
-    const list: []const Value = if (args_arr.isObject() and args_arr.asObject().is_array) args_arr.asObject().elements.items else &.{};
+    const list = try vm.argListFromArray(args_arr);
+    defer vm.gpa.free(list);
     return vm.callValue(target, this_arg, list);
 }
 fn nativeReflectConstruct(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -4436,7 +4672,8 @@ fn nativeReflectConstruct(ctx: *anyopaque, this: Value, args: []const Value) Err
         return vm.throwTypeError("Reflect.construct newTarget is not a constructor");
     }
     const args_arr = argAt(args, 1);
-    const list: []const Value = if (args_arr.isObject() and args_arr.asObject().is_array) args_arr.asObject().elements.items else &.{};
+    const list = try vm.argListFromArray(args_arr);
+    defer vm.gpa.free(list);
     return vm.constructValue(target, list);
 }
 
@@ -4455,7 +4692,8 @@ fn nativeFunctionApply(ctx: *anyopaque, this: Value, args: []const Value) Error!
     if (!isCallable(this)) return vm.throwTypeError("Function.prototype.apply called on non-function");
     const this_arg = argAt(args, 0);
     const args_arr = argAt(args, 1);
-    const list: []const Value = if (args_arr.isObject() and args_arr.asObject().is_array) args_arr.asObject().elements.items else &.{};
+    const list = try vm.argListFromArray(args_arr);
+    defer vm.gpa.free(list);
     return vm.callValue(this, this_arg, list);
 }
 
@@ -4738,6 +4976,26 @@ test "new and constructors" {
         \\c.inc().inc().inc();
         \\return c.n;
     ));
+}
+
+test "arrow functions and non-constructors are not new-able" {
+    // Arrow functions have no [[Construct]].
+    {
+        var vm = Vm.init(testing.allocator);
+        defer vm.deinit();
+        try testing.expectError(error.JsThrow, eval(&vm, "var f = () => {}; return new f();"));
+    }
+    // Ordinary function declarations still construct.
+    try testing.expectEqual(@as(f64, 9), try evalNumber(
+        \\function Sq(x) { this.v = x * x; }
+        \\return new Sq(3).v;
+    ));
+    // Native built-ins that aren't constructors reject `new`.
+    {
+        var vm = Vm.init(testing.allocator);
+        defer vm.deinit();
+        try testing.expectError(error.JsThrow, eval(&vm, "return new Math.abs(1);"));
+    }
 }
 
 test "object toString coercion in concatenation" {

@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.trunc, "name", {
-	value: "trunc",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "trunc",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

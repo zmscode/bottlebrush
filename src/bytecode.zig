@@ -141,6 +141,8 @@ pub const CodeBlock = struct {
     num_params: u32 = 0,
     num_registers: u32 = 0,
     is_generator: bool = false,
+    /// Arrow function: has no own `this`/`arguments` and is not `new`-able.
+    is_arrow: bool = false,
     /// Slots in this block's own environment record.
     num_env_slots: u32 = 0,
     /// Env slot to receive the `arguments` object on entry; null for arrow

@@ -20,8 +20,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.cbrt, "name", {
-	value: "cbrt",
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: "cbrt",
+  writable: false,
+  enumerable: false,
+  configurable: true
 });

@@ -113,9 +113,16 @@ pub const Object = struct {
     callable: ?*Closure = null,
     /// [[Extensible]].
     extensible: bool = true,
-    /// Array exotic: when true, indexed elements live in `elements` and
-    /// `length` is `elements.items.len` (see the interpreter's array paths).
+    /// Array exotic: when true, this is an Array. Indexed elements live either
+    /// in the dense `elements` store (fast mode, holes marked with `Value.hole`)
+    /// or, once too sparse, in `array_dict` (dictionary mode). `array_length` is
+    /// the logical `.length`, independent of the backing store's size.
     is_array: bool = false,
+    array_length: u32 = 0,
+    /// Dictionary (slow) element store for sparse arrays. Populated when a write
+    /// would leave too large a gap in the dense store; `elements` is then empty.
+    array_dict: std.AutoHashMapUnmanaged(u32, Value) = .empty,
+    dictionary_mode: bool = false,
     /// Collection kind: Map stores interleaved key/value pairs in `elements`,
     /// Set stores values in `elements`.
     collection: Collection = .none,
@@ -149,6 +156,10 @@ pub const Object = struct {
             if (entry.value_ptr.set) |s| s.mark(t);
         }
         for (self.elements.items) |v| v.mark(t);
+        if (self.dictionary_mode) {
+            var dit = self.array_dict.valueIterator();
+            while (dit.next()) |v| v.mark(t);
+        }
         if (self.ta) |ta| t.mark(&ta.buffer.gc);
         if (self.proxy_target) |p| t.mark(&p.gc);
         if (self.proxy_handler) |h| t.mark(&h.gc);
@@ -165,6 +176,7 @@ pub const Object = struct {
         for (self.properties.keys()) |k| gpa.free(k);
         self.properties.deinit(gpa);
         self.elements.deinit(gpa);
+        self.array_dict.deinit(gpa);
         if (self.buffer_data) |b| gpa.free(b);
         if (self.generator) |g| {
             gpa.free(g.regs);
@@ -176,7 +188,7 @@ pub const Object = struct {
 /// The engine-wide error set (used by the interpreter and native functions).
 /// `JsThrow` means a JS exception is pending in the VM; the others are host
 /// failures.
-pub const VmError = error{ JsThrow, OutOfMemory, StackOverflow };
+pub const VmError = error{ JsThrow, OutOfMemory, StackOverflow, Timeout };
 
 /// A built-in function implemented in Zig. `ctx` is the `*Vm` (opaque here to
 /// avoid a gc→interpreter import cycle); the callee casts it back.

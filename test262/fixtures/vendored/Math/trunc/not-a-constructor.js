@@ -21,8 +21,9 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.trunc), false, "isConstructor(Math.trunc) must return false");
+assert.sameValue(isConstructor(Math.trunc), false, 'isConstructor(Math.trunc) must return false');
 
 assert.throws(TypeError, () => {
-	new Math.trunc();
+  new Math.trunc();
 });
+

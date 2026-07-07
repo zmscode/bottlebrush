@@ -21,8 +21,9 @@ includes: [isConstructor.js]
 features: [Reflect.construct, arrow-function]
 ---*/
 
-assert.sameValue(isConstructor(Math.cos), false, "isConstructor(Math.cos) must return false");
+assert.sameValue(isConstructor(Math.cos), false, 'isConstructor(Math.cos) must return false');
 
 assert.throws(TypeError, () => {
-	new Math.cos();
+  new Math.cos();
 });
+

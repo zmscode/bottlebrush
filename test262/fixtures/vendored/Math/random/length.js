@@ -23,8 +23,8 @@ includes: [propertyHelper.js]
 ---*/
 
 verifyProperty(Math.random, "length", {
-	value: 0,
-	writable: false,
-	enumerable: false,
-	configurable: true,
+  value: 0,
+  writable: false,
+  enumerable: false,
+  configurable: true
 });
