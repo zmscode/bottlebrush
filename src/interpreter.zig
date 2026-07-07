@@ -552,8 +552,18 @@ pub const Vm = struct {
             .load_false => regs[inst.a] = Value.fromBool(false),
             .move => regs[inst.a] = regs[inst.b],
 
-            .get_var => regs[inst.a] = self.envAt(env, inst.b).slots[inst.c],
-            .set_var, .init_var => self.envAt(env, inst.a).slots[inst.b] = regs[inst.c],
+            .get_var => {
+                const v = self.envAt(env, inst.b).slots[inst.c];
+                if (v.isHole()) return self.throwReferenceError("cannot access lexical binding before initialization");
+                regs[inst.a] = v;
+            },
+            .set_var => {
+                const slot = &self.envAt(env, inst.a).slots[inst.b];
+                if (slot.isHole()) return self.throwReferenceError("cannot access lexical binding before initialization");
+                slot.* = regs[inst.c];
+            },
+            .init_var => self.envAt(env, inst.a).slots[inst.b] = regs[inst.c],
+            .set_dead => self.envAt(env, inst.a).slots[inst.b] = Value.hole_value,
 
             .get_global => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, false),
             .get_global_typeof => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, true),

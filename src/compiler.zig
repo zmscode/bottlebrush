@@ -59,6 +59,10 @@ const FnState = struct {
     children: std.ArrayList(*bc.CodeBlock) = .empty,
     handlers: std.ArrayList(bc.Handler) = .empty,
     blocks: std.ArrayList(Block) = .empty,
+    /// Finalizer bodies of the `try` statements enclosing the code being
+    /// compiled. `return`/`break`/`continue` inline these (innermost first)
+    /// before leaving the protected region.
+    finally_stack: std.ArrayList(*Node) = .empty,
 };
 
 pub const Compiler = struct {
@@ -275,6 +279,7 @@ pub const Compiler = struct {
         } else {
             const stmts = body.kind.block_stmt;
             try self.hoist(stmts);
+            try self.declareLexicals(stmts);
             try self.emitHoistedFunctions(stmts);
             for (stmts) |s| try self.compileStmt(s);
             // Implicit `return undefined`.
@@ -342,6 +347,24 @@ pub const Compiler = struct {
         fs.handlers.deinit(self.gpa);
         for (fs.blocks.items) |*b| b.names.deinit(self.gpa);
         fs.blocks.deinit(self.gpa);
+        fs.finally_stack.deinit(self.gpa);
+    }
+
+    /// Inline the pending finalizers from the top of the stack down to (but
+    /// not including) `base`, innermost first — used when a `return`/`break`/
+    /// `continue` leaves their protected regions. While a finalizer compiles,
+    /// the stack is truncated to its own level so abrupt exits *inside* the
+    /// finalizer only run the finalizers that enclose it.
+    fn emitFinalizersDownTo(self: *Compiler, base: usize) CompileError!void {
+        const saved_len = self.fs.finally_stack.items.len;
+        var i = saved_len;
+        while (i > base) {
+            i -= 1;
+            const fin = self.fs.finally_stack.items[i];
+            self.fs.finally_stack.items.len = i;
+            try self.compileStmt(fin);
+            self.fs.finally_stack.items.len = saved_len;
+        }
     }
 
     // ---- statements --------------------------------------------------------
@@ -357,6 +380,7 @@ pub const Compiler = struct {
             .var_decl => |vd| try self.compileVarDecl(vd),
             .block_stmt => |b| {
                 try self.pushBlock();
+                try self.declareLexicals(b);
                 for (b) |s| try self.compileStmt(s);
                 self.popBlock();
             },
@@ -368,11 +392,14 @@ pub const Compiler = struct {
             .for_in_stmt => |s| try self.compileForIn(s),
             .switch_stmt => |s| try self.compileSwitch(s),
             .return_stmt => |arg| {
+                // The return operand is evaluated *before* any pending
+                // finalizers run (spec order), and its register survives them.
                 const r = if (arg) |a| try self.compileExprToNew(a) else blk: {
                     const rr = self.allocReg();
                     _ = try self.emit(.{ .op = .load_undefined, .a = rr });
                     break :blk rr;
                 };
+                try self.emitFinalizersDownTo(0);
                 _ = try self.emit(.{ .op = .ret, .a = r });
                 self.freeTo(r);
             },
@@ -396,6 +423,7 @@ pub const Compiler = struct {
     }
 
     fn compileVarDecl(self: *Compiler, vd: anytype) CompileError!void {
+        const lexical = vd.kind != .keyword_var;
         for (vd.decls) |d| {
             const decl = d.kind.variable_declarator;
             if (decl.id.kind != .ident) return self.fail("destructuring declarations unsupported", decl.id.start);
@@ -406,8 +434,32 @@ pub const Compiler = struct {
                 try self.declare(name);
             if (decl.init) |init_expr| {
                 const r = try self.compileExprToNew(init_expr);
-                _ = try self.emit(.{ .op = .set_var, .a = 0, .b = slot, .c = r });
+                // Lexical declarations write through init_var, which clears TDZ.
+                _ = try self.emit(.{ .op = if (lexical) .init_var else .set_var, .a = 0, .b = slot, .c = r });
                 self.freeTo(r);
+            } else if (lexical) {
+                // `let x;` initializes to undefined (ends the dead zone).
+                const r = self.allocReg();
+                _ = try self.emit(.{ .op = .load_undefined, .a = r });
+                _ = try self.emit(.{ .op = .init_var, .a = 0, .b = slot, .c = r });
+                self.freeTo(r);
+            }
+        }
+    }
+
+    /// Pre-declare a statement list's `let`/`const` bindings and mark their
+    /// slots dead (TDZ) at block entry; the declaration statement later
+    /// initializes them via `init_var`.
+    fn declareLexicals(self: *Compiler, stmts: []*Node) CompileError!void {
+        for (stmts) |stmt| {
+            if (stmt.kind != .var_decl) continue;
+            const vd = stmt.kind.var_decl;
+            if (vd.kind == .keyword_var) continue;
+            for (vd.decls) |d| {
+                const decl = d.kind.variable_declarator;
+                if (decl.id.kind != .ident) continue; // destructuring rejected later
+                const slot = try self.declare(decl.id.kind.ident);
+                _ = try self.emit(.{ .op = .set_dead, .a = 0, .b = slot });
             }
         }
     }
@@ -430,7 +482,7 @@ pub const Compiler = struct {
     const LoopKind = enum { brk, cont };
 
     fn compileWhile(self: *Compiler, s: anytype) CompileError!void {
-        var ctx = LoopCtx{};
+        var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -450,7 +502,7 @@ pub const Compiler = struct {
     }
 
     fn compileDoWhile(self: *Compiler, s: anytype) CompileError!void {
-        var ctx = LoopCtx{};
+        var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -490,7 +542,7 @@ pub const Compiler = struct {
             }
         }
 
-        var ctx = LoopCtx{};
+        var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -536,7 +588,7 @@ pub const Compiler = struct {
         const zero = try self.addConst(.{ .number = 0 });
         _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = zero });
 
-        var ctx = LoopCtx{};
+        var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -591,7 +643,7 @@ pub const Compiler = struct {
             self.freeTo(src_reg + 1); // free src_reg, keep iter_reg
         }
 
-        var ctx = LoopCtx{};
+        var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -663,7 +715,7 @@ pub const Compiler = struct {
         const disc_reg = self.allocReg();
         try self.compileExprInto(disc_reg, s.discriminant);
 
-        var ctx = LoopCtx{};
+        var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
         const prev_break = self.break_target;
         self.break_target = &ctx;
         defer self.break_target = prev_break;
@@ -709,11 +761,18 @@ pub const Compiler = struct {
     }
 
     fn compileTry(self: *Compiler, s: anytype) CompileError!void {
+        // While compiling the block and catch body, the finalizer is pending:
+        // any return/break/continue leaving them inlines it (emitFinalizersDownTo).
+        const has_fin = s.finalizer != null;
+        if (has_fin) try self.fs.finally_stack.append(self.gpa, s.finalizer.?);
+
         const try_start = self.here();
         try self.compileStmt(s.block);
         const try_end = self.here();
-        const jover = try self.emit(.{ .op = .jump }); // skip handler on normal completion
+        const jover = try self.emit(.{ .op = .jump }); // normal completion
 
+        var protect_end = try_end; // end of the region the finalizer protects
+        var jover2: ?u32 = null;
         if (s.handler) |h| {
             const cc = h.kind.catch_clause;
             const catch_reg = self.allocReg();
@@ -734,14 +793,33 @@ pub const Compiler = struct {
             self.freeTo(catch_reg);
             try self.compileStmt(cc.body);
             self.popBlock();
+            protect_end = self.here();
+            if (has_fin) jover2 = try self.emit(.{ .op = .jump });
         }
-        self.patchTarget(jover, self.here());
 
-        if (s.finalizer) |fin| {
-            // Simplified finally: run on the normal path here. Exceptional and
-            // abrupt-completion paths through finally are a later refinement.
-            try self.compileStmt(fin);
+        if (has_fin) {
+            _ = self.fs.finally_stack.pop();
+            // Exceptional path: a catch-all over the block *and* the catch body
+            // that runs the finalizer, then rethrows. If the finalizer itself
+            // completes abruptly (return/break), the rethrow never runs — the
+            // finalizer's completion replaces the exception, per spec.
+            const exc_reg = self.allocReg();
+            try self.fs.handlers.append(self.gpa, .{
+                .try_start = try_start,
+                .try_end = protect_end,
+                .target_pc = self.here(),
+                .catch_reg = exc_reg,
+                .kind = .catch_clause,
+            });
+            try self.compileStmt(s.finalizer.?);
+            _ = try self.emit(.{ .op = .throw, .a = exc_reg });
+            self.freeTo(exc_reg);
         }
+
+        // Normal-completion landing point (block or catch fell through).
+        self.patchTarget(jover, self.here());
+        if (jover2) |j2| self.patchTarget(j2, self.here());
+        if (has_fin) try self.compileStmt(s.finalizer.?);
     }
 
     // ---- loop break/continue plumbing --------------------------------------
@@ -749,17 +827,23 @@ pub const Compiler = struct {
     const LoopCtx = struct {
         breaks: std.ArrayList(u32) = .empty,
         continues: std.ArrayList(u32) = .empty,
+        /// finally_stack depth when this loop/switch began: a break/continue
+        /// targeting it inlines the finalizers pushed since.
+        finally_base: usize = 0,
     };
 
     fn emitLoopJump(self: *Compiler, kind: LoopKind, pos: u32) CompileError!void {
-        const pc = try self.emit(.{ .op = .jump });
         switch (kind) {
             .brk => {
                 const ctx = self.break_target orelse return self.fail("break outside loop or switch", pos);
+                try self.emitFinalizersDownTo(ctx.finally_base);
+                const pc = try self.emit(.{ .op = .jump });
                 try ctx.breaks.append(self.gpa, pc);
             },
             .cont => {
                 const ctx = self.loop orelse return self.fail("continue outside loop", pos);
+                try self.emitFinalizersDownTo(ctx.finally_base);
+                const pc = try self.emit(.{ .op = .jump });
                 try ctx.continues.append(self.gpa, pc);
             },
         }

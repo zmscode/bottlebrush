@@ -27,7 +27,7 @@
 ## 2. Bytecode compiler (AST → bytecode)
 - [x] **Register allocation:** simple scheme first — a bump register file per function, free-list for temporaries; locals get fixed slots. No SSA, no graph coloring yet.
 - [x] **Scope/environment resolution:** at compile time, resolve identifiers to (a) local register, (b) upvalue/closure slot, or (c) dynamic global/`with`/`eval` lookup. Build the scope chain model here.
-  - [x] `var` hoisting; `let`/`const` block scoping + **TDZ** (emit dead-zone checks). **(partial: TDZ NOT enforced — `let`/`const` behave like `var`)**
+  - [x] `var` hoisting; `let`/`const` block scoping + **TDZ** (emit dead-zone checks). *(FIXED 2026-07-08: `set_dead` marks lexical slots at block entry; get/set on a dead slot throws ReferenceError; `init_var` clears)*
   - [x] function declaration hoisting; Annex B sloppy function-in-block semantics (can defer nastiest cases).
 - [x] **Expressions → bytecode:** all operators, short-circuit `&&`/`||`/`??` via jumps, conditional, assignment + compound assignment (incl. destructuring assignment lowering), sequence. *(partial: destructuring assignment not lowered)*
 - [x] **Control flow via emitted jumps** (NOT runtime completion records): `if`, `while`, `do-while`, `for`, `switch` (jump table or if-chain), labeled statements, `break`/`continue` (resolve to jump targets, honoring `finally` — see §4).
@@ -45,7 +45,7 @@
 ## 4. Exceptions (the completion machinery)
 - [x] `Throw` sets `vm.pending_exception`, returns `error.JsException` up the Zig call stack.
 - [x] **Exception-handler table** per `CodeBlock`: (try-range → catch offset, finally offset). Interpreter unwinds frames, consulting tables, until a handler is found or the frame stack empties (→ uncaught).
-- [ ] **`finally` correctness:** `break`/`continue`/`return`/`throw` crossing a `finally` must run it first, then resume the pending completion. Model completion as a small runtime value the `finally` epilogue re-dispatches. This is the one place literal-ish completion handling is worth it. **← GAP (correctness): `finally` only runs on the normal path — throw/break/continue/return skip it (compiler.zig `compileTry`)**
+- [x] **`finally` correctness:** `break`/`continue`/`return`/`throw` crossing a `finally` must run it first, then resume the pending completion. Model completion as a small runtime value the `finally` epilogue re-dispatches. This is the one place literal-ish completion handling is worth it. *(FIXED 2026-07-08: finalizers inline on return/break/continue and run+rethrow via a catch-all handler on the throw path; a finalizer's own abrupt completion replaces the pending one)*
 
 ## 5. Minimal runtime to run tests (`runtime/`)
 - [ ] `Realm` + global object; wire `$262`/`print` from the harness. **← GAP: `$262`/`print` not wired**

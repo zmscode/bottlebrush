@@ -18,7 +18,7 @@ executed)**, 110/110 unit tests, corpus wall time ~0.5 s.
 
 ## The 16 flagged gaps, by severity
 
-### Correctness bugs (fix before they bite)
+### Correctness bugs (ALL FIXED 2026-07-08, same day as the audit)
 1. **`finally` skips abrupt completions** (`compiler.zig` `compileTry`): it only
    runs on the normal path — `throw`/`return`/`break`/`continue` bypass it.
    Phase 2's plan explicitly called this "the one place literal-ish completion

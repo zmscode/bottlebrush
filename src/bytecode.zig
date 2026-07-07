@@ -28,6 +28,7 @@ pub const Op = enum(u8) {
     get_var, // a=dst, b=depth, c=slot
     set_var, // a=depth, b=slot, c=src
     init_var, // a=depth, b=slot, c=src  (declaration init; clears TDZ)
+    set_dead, // a=depth, b=slot  (mark a lexical slot uninitialized — TDZ)
 
     // Globals (properties of the global object)
     get_global, // a=dst, b=name const  (ReferenceError if absent)

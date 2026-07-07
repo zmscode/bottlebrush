@@ -10,6 +10,7 @@ const Vm = interpreter.Vm;
 const Error = interpreter.Error;
 
 const support_mod = @import("../support.zig");
+const sameValue = support_mod.sameValue;
 const argAt = support_mod.argAt;
 const arrayIndex = support_mod.arrayIndex;
 const castVm = support_mod.castVm;
@@ -107,20 +108,89 @@ pub fn nativeObjectCreate(ctx: *anyopaque, this: Value, args: []const Value) Err
 /// (shared by Object.defineProperty / Object.defineProperties).
 pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value) Error!void {
     if (!desc_v.isObject()) return vm.throwTypeError("property descriptor must be an object");
-    var desc = gc.PropertyDescriptor{ .enumerable = false, .writable = false, .configurable = false };
-    const get_v = try vm.getProperty(desc_v, "get");
-    const set_v = try vm.getProperty(desc_v, "set");
-    if (get_v.isObject() or set_v.isObject()) {
-        desc.is_accessor = true;
-        desc.get = if (get_v.isObject()) get_v else null;
-        desc.set = if (set_v.isObject()) set_v else null;
-    } else {
-        desc.value = try vm.getProperty(desc_v, "value");
-        desc.writable = toBoolean(try vm.getProperty(desc_v, "writable"));
-    }
-    desc.enumerable = toBoolean(try vm.getProperty(desc_v, "enumerable"));
-    desc.configurable = toBoolean(try vm.getProperty(desc_v, "configurable"));
+    const d = desc_v.asObject();
 
+    // Which fields the descriptor actually mentions (partial descriptors merge).
+    const has_value = vm.hasProperty(d, "value");
+    const has_writable = vm.hasProperty(d, "writable");
+    const has_get = vm.hasProperty(d, "get");
+    const has_set = vm.hasProperty(d, "set");
+    const has_enumerable = vm.hasProperty(d, "enumerable");
+    const has_configurable = vm.hasProperty(d, "configurable");
+    if ((has_value or has_writable) and (has_get or has_set)) {
+        return vm.throwTypeError("property descriptor cannot be both a data and an accessor descriptor");
+    }
+
+    const v_value = if (has_value) try vm.getProperty(desc_v, "value") else Value.undefined_value;
+    const v_writable = if (has_writable) toBoolean(try vm.getProperty(desc_v, "writable")) else false;
+    const v_get = if (has_get) try vm.getProperty(desc_v, "get") else Value.undefined_value;
+    const v_set = if (has_set) try vm.getProperty(desc_v, "set") else Value.undefined_value;
+    if (has_get and !v_get.isUndefined() and !isCallable(v_get)) return vm.throwTypeError("getter must be a function");
+    if (has_set and !v_set.isUndefined() and !isCallable(v_set)) return vm.throwTypeError("setter must be a function");
+    const v_enumerable = if (has_enumerable) toBoolean(try vm.getProperty(desc_v, "enumerable")) else false;
+    const v_configurable = if (has_configurable) toBoolean(try vm.getProperty(desc_v, "configurable")) else false;
+    const accessor_req = has_get or has_set;
+
+    if (obj.properties.getPtr(key)) |ex| {
+        // ValidateAndApplyPropertyDescriptor over an existing property.
+        if (!ex.configurable) {
+            if (has_configurable and v_configurable)
+                return vm.throwTypeError("cannot redefine non-configurable property");
+            if (has_enumerable and v_enumerable != ex.enumerable)
+                return vm.throwTypeError("cannot change enumerability of non-configurable property");
+            if ((accessor_req and !ex.is_accessor) or ((has_value or has_writable) and ex.is_accessor))
+                return vm.throwTypeError("cannot change the kind of a non-configurable property");
+            if (ex.is_accessor) {
+                const ex_get = ex.get orelse Value.undefined_value;
+                const ex_set = ex.set orelse Value.undefined_value;
+                if (has_get and !sameValue(v_get, ex_get))
+                    return vm.throwTypeError("cannot redefine getter of non-configurable property");
+                if (has_set and !sameValue(v_set, ex_set))
+                    return vm.throwTypeError("cannot redefine setter of non-configurable property");
+            } else if (!ex.writable) {
+                if (has_writable and v_writable)
+                    return vm.throwTypeError("cannot make non-configurable read-only property writable");
+                if (has_value and !sameValue(v_value, ex.value))
+                    return vm.throwTypeError("cannot change value of non-configurable read-only property");
+            }
+        }
+        // Apply: convert kinds first, then merge only the present fields.
+        if (accessor_req and !ex.is_accessor) {
+            ex.is_accessor = true;
+            ex.get = null;
+            ex.set = null;
+            ex.value = Value.undefined_value;
+            ex.writable = false;
+        } else if ((has_value or has_writable) and ex.is_accessor) {
+            ex.is_accessor = false;
+            ex.get = null;
+            ex.set = null;
+            ex.value = Value.undefined_value;
+            ex.writable = false;
+        }
+        if (has_value) ex.value = v_value;
+        if (has_writable) ex.writable = v_writable;
+        if (has_get) ex.get = if (v_get.isUndefined()) null else v_get;
+        if (has_set) ex.set = if (v_set.isUndefined()) null else v_set;
+        if (has_enumerable) ex.enumerable = v_enumerable;
+        if (has_configurable) ex.configurable = v_configurable;
+        return;
+    }
+
+    // New property: absent fields default to false/undefined.
+    if (!obj.extensible) return vm.throwTypeError("cannot define property on non-extensible object");
+    var desc = gc.PropertyDescriptor{
+        .enumerable = v_enumerable,
+        .writable = v_writable,
+        .configurable = v_configurable,
+    };
+    if (accessor_req) {
+        desc.is_accessor = true;
+        desc.get = if (has_get and !v_get.isUndefined()) v_get else null;
+        desc.set = if (has_set and !v_set.isUndefined()) v_set else null;
+    } else {
+        desc.value = v_value;
+    }
     const gop = try obj.properties.getOrPut(vm.gpa, key);
     if (!gop.found_existing) gop.key_ptr.* = try vm.gpa.dupe(u8, key);
     gop.value_ptr.* = desc;

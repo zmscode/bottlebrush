@@ -1050,3 +1050,104 @@ test "objects under GC stress" {
     );
     try testing.expectEqual(@as(f64, 6), v.asNumber());
 }
+
+test "finally runs on abrupt completions" {
+    // throw path: finally observed, exception still propagates to catch.
+    try std.testing.expectEqual(@as(f64, 12), try evalNumber(
+        \\var log = 0;
+        \\try {
+        \\  try { throw 1; } finally { log += 10; }
+        \\} catch (e) { log += e * 2; }
+        \\return log;
+    ));
+    // return path: finally runs before the function returns.
+    try std.testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\var side = 0;
+        \\function f() { try { return 7; } finally { side = 1; } }
+        \\var r = f();
+        \\return side === 1 ? r : -1;
+    ));
+    // break path.
+    try std.testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\var n = 0;
+        \\for (var i = 0; i < 3; i++) {
+        \\  try { if (i === 1) break; } finally { n += 2; }
+        \\  n += 1;
+        \\}
+        \\return n; // i=0: fin+body=3, i=1: fin then break=2 -> 5
+    ));
+    // continue path + nested finallys ordering (inner before outer).
+    try std.testing.expectEqual(@as(f64, 21), try evalNumber(
+        \\var order = 0;
+        \\function g() {
+        \\  try {
+        \\    try { return 0; } finally { order = order * 10 + 1; }
+        \\  } finally { order = order * 10 + 2; }
+        \\}
+        \\g();
+        \\return order + 9; // 12 + 9
+    ));
+    // finally overrides the completion: its return wins over the throw.
+    try std.testing.expectEqual(@as(f64, 42), try evalNumber(
+        \\function h() { try { throw "boom"; } finally { return 42; } }
+        \\return h();
+    ));
+}
+
+test "let/const temporal dead zone" {
+    // Use before declaration in the same block throws ReferenceError.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\try { x; let x = 1; return 0; }
+        \\catch (e) { return (e instanceof ReferenceError) ? 1 : 2; }
+    ));
+    // Assignment before declaration also throws.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\try { y = 5; let y; return 0; }
+        \\catch (e) { return (e instanceof ReferenceError) ? 1 : 2; }
+    ));
+    // After initialization everything works; `let x;` initializes to undefined.
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\let a = 3;
+        \\{ let b; if (b === undefined) { b = a; } return b; }
+    ));
+}
+
+test "ToNumber non-decimal numeric strings" {
+    try std.testing.expectEqual(@as(f64, 16), try evalNumber("return Number('0x10');"));
+    try std.testing.expectEqual(@as(f64, 255), try evalNumber("return Number('0xFF');"));
+    try std.testing.expectEqual(@as(f64, 15), try evalNumber("return Number('0o17');"));
+    try std.testing.expectEqual(@as(f64, 5), try evalNumber("return Number('0b101');"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return isNaN(Number('0xZZ')) ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return isNaN(Number('-0x10')) ? 1 : 0;")); // sign not allowed
+}
+
+test "defineProperty enforces non-configurable invariants" {
+    // Redefining configurable:false -> true throws.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\Object.defineProperty(o, "p", { value: 1 });
+        \\try { Object.defineProperty(o, "p", { configurable: true }); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // Changing the value of a non-configurable, non-writable property throws.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\Object.defineProperty(o, "p", { value: 1 });
+        \\try { Object.defineProperty(o, "p", { value: 2 }); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // Same value is allowed; partial descriptors merge instead of resetting.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\Object.defineProperty(o, "p", { value: 9, enumerable: true });
+        \\Object.defineProperty(o, "p", { value: 9 });
+        \\var d = Object.getOwnPropertyDescriptor(o, "p");
+        \\return (d.value === 9 && d.enumerable === true) ? 1 : 0;
+    ));
+    // New properties on a non-extensible object throw.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = Object.preventExtensions({});
+        \\try { Object.defineProperty(o, "q", { value: 1 }); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+}

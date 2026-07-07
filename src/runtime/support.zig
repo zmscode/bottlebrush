@@ -102,10 +102,35 @@ pub fn stringToNumber(units: []const u16) f64 {
         buf[n] = @intCast(u);
         n += 1;
     }
-    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n\x0b\x0c");
     if (trimmed.len == 0) return 0;
     if (std.mem.eql(u8, trimmed, "Infinity") or std.mem.eql(u8, trimmed, "+Infinity")) return std.math.inf(f64);
     if (std.mem.eql(u8, trimmed, "-Infinity")) return -std.math.inf(f64);
+    // A signed radix prefix is not a StringNumericLiteral ("-0x10" -> NaN).
+    if (trimmed.len > 3 and (trimmed[0] == '+' or trimmed[0] == '-') and trimmed[1] == '0') {
+        switch (trimmed[2]) {
+            'x', 'X', 'o', 'O', 'b', 'B' => return std.math.nan(f64),
+            else => {},
+        }
+    }
+    // Non-decimal numeric strings: 0x/0o/0b (no sign allowed, per spec).
+    if (trimmed.len > 2 and trimmed[0] == '0') {
+        const radix: ?u8 = switch (trimmed[1]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => null,
+        };
+        if (radix) |r| {
+            var v: f64 = 0;
+            for (trimmed[2..]) |c| {
+                const d = hexLikeDigit(c) orelse return std.math.nan(f64);
+                if (d >= r) return std.math.nan(f64);
+                v = v * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(d));
+            }
+            return v;
+        }
+    }
     const compiler = @import("../compiler.zig");
     return compiler.parseNumber(trimmed) catch std.math.nan(f64);
 }
@@ -329,6 +354,19 @@ pub fn thisNumber(vm: *Vm, this: Value) Error!f64 {
         }
     }
     return vm.throwTypeError("Number.prototype method called on non-number");
+}
+
+/// SameValue: like strict equality, except NaN equals NaN and +0 and -0 are
+/// distinct (used by property-descriptor validation).
+pub fn sameValue(a: Value, b: Value) bool {
+    if (a.isNumber() and b.isNumber()) {
+        const x = a.asNumber();
+        const y = b.asNumber();
+        if (std.math.isNan(x) and std.math.isNan(y)) return true;
+        if (x == 0 and y == 0) return std.math.signbit(x) == std.math.signbit(y);
+        return x == y;
+    }
+    return sameTypeStrictEq(a, b);
 }
 
 pub fn sameValueZero(a: Value, b: Value) bool {

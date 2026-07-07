@@ -12,7 +12,7 @@
 ## 1. Object model (`runtime/object.zig`)
 - [x] **Property storage:** ordered map `PropertyKey → PropertyDescriptor` (insertion order matters for enumeration; integer-index keys sort ahead per spec `OrdinaryOwnPropertyKeys`). Shapes/hidden classes are **Phase 7** — keep access behind an API so they can slot in.
 - [x] **PropertyKey:** string or symbol (canonicalize integer-index strings for array-index fast paths later).
-- [x] **PropertyDescriptor:** data (`value`, `writable`) vs accessor (`get`, `set`), plus `enumerable`, `configurable`; validation & completion per `ValidateAndApplyPropertyDescriptor`. **(partial: `ValidateAndApplyPropertyDescriptor` NOT implemented — defineProperty replaces blindly, no non-configurable invariant checks)**
+- [x] **PropertyDescriptor:** data (`value`, `writable`) vs accessor (`get`, `set`), plus `enumerable`, `configurable`; validation & completion per `ValidateAndApplyPropertyDescriptor`. *(FIXED 2026-07-08: partial descriptors merge; non-configurable invariants enforced with TypeError; non-extensible objects reject new properties)*
 - [x] **Ordinary internal methods** (`[[...]]`) as functions, spec-literal:
   - [ ] `[[GetPrototypeOf]]`, `[[SetPrototypeOf]]` (cycle check), `[[IsExtensible]]`, `[[PreventExtensions]]` **← GAP: `[[SetPrototypeOf]]`/`Object.setPrototypeOf` missing entirely (no cycle check); the rest of the line is done**
   - [x] `[[GetOwnProperty]]`, `[[DefineOwnProperty]]` (→ `OrdinaryDefineOwnProperty` + `ValidateAndApplyPropertyDescriptor`)
@@ -21,7 +21,7 @@
 - [x] **Exotic objects (interfaces now, some impls later):** Array (`length` magic — `ArraySetLength`, index defineOwnProperty side effects), String (index access + `length`), arguments (mapped/unmapped), bound functions, `Proxy` (Phase 4), integer-indexed/TypedArray (Phase 4). Define the vtable/dispatch mechanism for exotic overrides here. *(partial: hardcoded branches instead of a vtable; ArraySetLength ignores non-writable length)*
 
 ## 2. Abstract operations — type conversion (spec-literal, cite section numbers)
-- [x] `ToPrimitive` (+ `OrdinaryToPrimitive`, `@@toPrimitive`), `ToBoolean`, `ToNumber` (string→number grammar!), `ToNumeric`, `ToIntegerOrInfinity`, `ToInt32/ToUint32/ToInt16/…`, `ToBigInt`, `ToString` (number→string algorithm), `ToObject`, `ToPropertyKey`, `ToLength`, `ToIndex`. *(partial: `@@toPrimitive` never consulted)* **(partial: numeric-string grammar incomplete — no hex/octal/binary strings: `Number("0x10")` → NaN, should be 16)**
+- [x] `ToPrimitive` (+ `OrdinaryToPrimitive`, `@@toPrimitive`), `ToBoolean`, `ToNumber` (string→number grammar!), `ToNumeric`, `ToIntegerOrInfinity`, `ToInt32/ToUint32/ToInt16/…`, `ToBigInt`, `ToString` (number→string algorithm), `ToObject`, `ToPropertyKey`, `ToLength`, `ToIndex`. *(partial: `@@toPrimitive` never consulted)* *(FIXED 2026-07-08: 0x/0o/0b numeric strings parse; signed radix prefixes are NaN per spec)*
 - [x] `RequireObjectCoercible`, `IsCallable`, `IsConstructor`, `IsArray`, `IsRegExp`, `SameValue`, `SameValueZero`, `SameValueNonNumeric`.
 - [x] **Testing string↔number conversions is high-yield** — Test262 has dense coverage here.
 
