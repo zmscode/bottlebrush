@@ -4,11 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // bilby: the standalone regular-expression engine (sibling repo).
+    const bilby_mod = b.dependency("bilby", .{ .target = target, .optimize = optimize }).module("bilby");
+
     // ---- shared bottlebrush engine module ------------------------------------
     const engine_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "bilby", .module = bilby_mod }},
     });
 
     // ---- `bottlebrush` executable: REPL / file runner ------------------------

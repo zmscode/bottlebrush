@@ -17,6 +17,7 @@
 const std = @import("std");
 const gc = @import("gc.zig");
 const bc = @import("bytecode.zig");
+const bilby = @import("bilby");
 const Value = @import("value.zig").Value;
 
 pub const Error = gc.VmError;
@@ -229,14 +230,29 @@ pub const Vm = struct {
         return o;
     }
 
-    /// Create a RegExp object. Phase 4 stub: the pattern is *not* compiled — the
-    /// object carries `source`/`flags`/`lastIndex` and the derived flag booleans,
-    /// so construction, `instanceof RegExp`, and `toString` work, but `test`/
-    /// `exec` throw until a real matcher lands.
+    /// Create a RegExp object: compile the pattern with bilby (the sibling regex
+    /// engine) and attach the compiled matcher to the object. Throws SyntaxError
+    /// for an invalid pattern or flags, per spec.
     fn makeRegExp(self: *Vm, source: []const u8, flags: []const u8) Error!*gc.Object {
         const obj = try self.newObject(self.regexp_proto);
         try self.protect(Value.fromObject(obj));
         defer self.unprotect();
+
+        const parsed_flags = bilby.Flags.parse(flags) catch
+            return self.throwSyntaxError("invalid regular expression flags");
+        const pattern_units = bilby.utf8ToUtf16(self.gpa, source) catch
+            return self.throwSyntaxError("invalid regular expression");
+        defer self.gpa.free(pattern_units);
+        obj.regex = blk: {
+            const re = try self.gpa.create(bilby.Regex);
+            errdefer self.gpa.destroy(re);
+            re.* = bilby.Regex.compile(self.gpa, pattern_units, parsed_flags) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return self.throwSyntaxError("invalid regular expression"),
+            };
+            break :blk re; // the object owns it from here (freed in deinitCell)
+        };
+
         const src = if (source.len == 0) "(?:)" else source;
         try self.defineData(obj, "source", try self.makeString(src), false, false, false);
         try self.defineData(obj, "flags", try self.makeString(flags), false, false, false);
@@ -448,7 +464,7 @@ pub const Vm = struct {
         try self.defineData(math, "SQRT1_2", Value.fromNumber(0.7071067811865476), false, false, false);
         try self.defineData(global, "Math", Value.fromObject(math), true, false, true);
 
-        // ---- RegExp (Phase 4 stub: construction only; matching throws) ----
+        // ---- RegExp (matching powered by bilby) ----
         const regexp_proto = try self.newObject(self.object_proto);
         self.regexp_proto = regexp_proto;
         try self.defineMethod(regexp_proto, "test", nativeRegExpTest, 1);
@@ -3330,7 +3346,7 @@ fn nativeNumberIsNaN(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
     return Value.fromBool(v.isNumber() and std.math.isNan(v.asNumber()));
 }
 
-// ---- RegExp built-ins (stub) -----------------------------------------------
+// ---- RegExp built-ins (bilby-backed) -----------------------------------------
 
 fn hasFlag(flags: []const u8, f: u8) bool {
     return std.mem.indexOfScalar(u8, flags, f) != null;
@@ -3371,15 +3387,80 @@ fn nativeRegExp(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     return Value.fromObject(try vm.makeRegExp(source, flags));
 }
 
+/// RegExp.prototype.test — spec: equivalent to `exec(s) !== null`.
 fn nativeRegExpTest(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    _ = args;
-    return castVm(ctx).throwTypeError("RegExp matching is not yet implemented (Phase 4 stub)");
+    const r = try nativeRegExpExec(ctx, this, args);
+    return Value.fromBool(!r.isNull());
 }
+
+/// RegExp.prototype.exec — run the compiled bilby matcher against the subject,
+/// honouring `lastIndex` for global/sticky regexes. Returns the match array
+/// (with `index`/`input`/`groups`) or null.
 fn nativeRegExpExec(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = this;
-    _ = args;
-    return castVm(ctx).throwTypeError("RegExp matching is not yet implemented (Phase 4 stub)");
+    const vm = castVm(ctx);
+    if (!this.isObject() or this.asObject().regex == null)
+        return vm.throwTypeError("RegExp.prototype.exec called on a non-RegExp");
+    const re = this.asObject().regex.?;
+
+    const subject = try vm.toStringVal(argAt(args, 0));
+    try vm.protect(subject);
+    defer vm.unprotect();
+    const units = subject.asString().units;
+
+    // Global/sticky regexes resume from (and update) `lastIndex`.
+    const track_last = re.flags.global or re.flags.sticky;
+    var start: usize = 0;
+    if (track_last) {
+        const li = try vm.toNumber(try vm.getProperty(this, "lastIndex"));
+        if (li > @as(f64, @floatFromInt(units.len))) {
+            try vm.setProperty(this, "lastIndex", Value.fromNumber(0));
+            return Value.null_value;
+        }
+        if (li >= 1) start = @intFromFloat(li);
+    }
+
+    const maybe = re.find(vm.gpa, units, start) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Step budget exceeded (catastrophic backtracking).
+        else => return vm.throwRangeError("regular expression too complex"),
+    };
+    const m = maybe orelse {
+        if (track_last) try vm.setProperty(this, "lastIndex", Value.fromNumber(0));
+        return Value.null_value;
+    };
+    defer m.deinit(vm.gpa);
+
+    const whole = m.groups[0].?;
+    if (track_last) try vm.setProperty(this, "lastIndex", Value.fromNumber(@floatFromInt(whole.end)));
+
+    // Result array: [$0, $1, …] plus index / input / groups properties.
+    const arr = try vm.newArray(0);
+    try vm.protect(Value.fromObject(arr));
+    defer vm.unprotect();
+    for (m.groups) |g| {
+        const v = if (g) |span| try vm.makeStringFromUtf16(units[span.start..span.end]) else Value.undefined_value;
+        try vm.arrayAppend(arr, v);
+    }
+    try vm.defineData(arr, "index", Value.fromNumber(@floatFromInt(whole.start)), true, true, true);
+    try vm.defineData(arr, "input", subject, true, true, true);
+
+    // `groups`: an object of named captures, or undefined when there are none.
+    if (re.names.count() > 0) {
+        const groups_obj = try vm.newObject(vm.object_proto);
+        try vm.protect(Value.fromObject(groups_obj));
+        defer vm.unprotect();
+        var it = re.names.iterator();
+        while (it.next()) |entry| {
+            const g = m.groups[entry.value_ptr.*];
+            const v = if (g) |span| try vm.makeStringFromUtf16(units[span.start..span.end]) else Value.undefined_value;
+            try vm.defineData(groups_obj, entry.key_ptr.*, v, true, true, true);
+        }
+        try vm.defineData(arr, "groups", Value.fromObject(groups_obj), true, true, true);
+    } else {
+        try vm.defineData(arr, "groups", Value.undefined_value, true, true, true);
+    }
+
+    return Value.fromObject(arr);
 }
 
 fn nativeRegExpToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -5274,7 +5355,7 @@ test "JSON cyclic structure throws" {
     try testing.expectError(error.JsThrow, eval(&vm, "var o = {}; o.self = o; return JSON.stringify(o);"));
 }
 
-test "RegExp construction (stub)" {
+test "RegExp construction" {
     try testing.expectEqual(@as(f64, 1), try evalNumber(
         \\var re = /abc/gi;
         \\return (re.source === "abc" && re.flags === "gi" && re.global && re.ignoreCase && !re.multiline) ? 1 : 0;
@@ -5287,10 +5368,81 @@ test "RegExp construction (stub)" {
     try testing.expectEqual(@as(f64, 1), try evalNumber("return /ab/g.toString() === '/ab/g' ? 1 : 0;"));
 }
 
-test "RegExp matching throws (stub, replace later)" {
+test "RegExp.prototype.test" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return /x/.test('axb') ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 0), try evalNumber("return /x/.test('ab') ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return /^\\d{3}-\\d{4}$/.test('555-1234') ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return /hello/i.test('HELLO world') ? 1 : 0;"));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return /(?<=\\$)\\d+/.test('$42') ? 1 : 0;")); // lookbehind
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return new RegExp('a+b').test('caaab') ? 1 : 0;"));
+}
+
+test "RegExp.prototype.exec: match array, index, captures" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var m = /(\d{4})-(\d{2})/.exec("born 2026-07!");
+        \\return (m[0] === "2026-07" && m[1] === "2026" && m[2] === "07" &&
+        \\        m.index === 5 && m.input === "born 2026-07!" && m.length === 3) ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return /z/.exec('abc') === null ? 1 : 0;"));
+    // Unmatched optional group is undefined.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var m = /a(b)?c/.exec("ac");
+        \\return (m[0] === "ac" && m[1] === undefined) ? 1 : 0;
+    ));
+    // Named groups.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var m = /(?<y>\d{4})-(?<mo>\d{2})/.exec("2026-07");
+        \\return (m.groups.y === "2026" && m.groups.mo === "07") ? 1 : 0;
+    ));
+    try testing.expectEqual(@as(f64, 1), try evalNumber("return /(a)/.exec('a').groups === undefined ? 1 : 0;"));
+}
+
+test "RegExp global: lastIndex drives repeated exec" {
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = /\d+/g;
+        \\var a = re.exec("a1 b22 c333");
+        \\var b = re.exec("a1 b22 c333");
+        \\var c = re.exec("a1 b22 c333");
+        \\var d = re.exec("a1 b22 c333");
+        \\return (a[0] === "1" && b[0] === "22" && c[0] === "333" && d === null && re.lastIndex === 0) ? 1 : 0;
+    ));
+    // Sticky: anchored at lastIndex exactly.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = /b/y;
+        \\re.lastIndex = 1;
+        \\var hit = re.exec("abc");
+        \\re.lastIndex = 0;
+        \\var miss = re.exec("abc");
+        \\return (hit !== null && miss === null) ? 1 : 0;
+    ));
+}
+
+test "RegExp invalid pattern throws SyntaxError" {
     var vm = Vm.init(testing.allocator);
     defer vm.deinit();
-    try testing.expectError(error.JsThrow, eval(&vm, "return /x/.test('x');"));
+    const v = try eval(&vm,
+        \\try { new RegExp("(unclosed"); return "no-throw"; }
+        \\catch (e) { return (e instanceof SyntaxError) ? "syntax" : "other"; }
+    );
+    try testing.expect(v.isString());
+    const utf8 = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
+    defer testing.allocator.free(utf8);
+    try testing.expectEqualStrings("syntax", utf8);
+}
+
+test "RegExp under GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var total = 0;
+        \\for (var i = 0; i < 5; i++) {
+        \\  var m = /(\w+)-(\w+)/.exec("aa-bb");
+        \\  total += m[1].length + m[2].length;
+        \\}
+        \\return total;
+    );
+    try testing.expectEqual(@as(f64, 20), v.asNumber());
 }
 
 test "TypedArrays: construction and element access" {

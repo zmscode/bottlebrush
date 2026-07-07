@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-pub const version = "0.0.0";
+pub const version = "0.1.0";
 
 // Public modules (grow with each phase).
 pub const gc = @import("gc.zig");

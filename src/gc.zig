@@ -20,6 +20,9 @@ const std = @import("std");
 // (Environment/Closure) reference `Value`. This is cycle-free at the type level
 // because all references are pointers/slices — no struct-size loop.
 const Value = @import("value.zig").Value;
+// bilby is a leaf dependency (no back-reference to bottlebrush); a RegExp object
+// owns a heap-allocated compiled `bilby.Regex`, freed in `deinitCell`.
+const bilby = @import("bilby");
 
 pub const Kind = enum(u8) {
     string,
@@ -145,6 +148,8 @@ pub const Object = struct {
     /// in `elements`).
     bound_target: ?Value = null,
     bound_this: Value = Value.undefined_value,
+    /// RegExp exotic: the compiled matcher (heap-owned); null for non-regexps.
+    regex: ?*bilby.Regex = null,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -181,6 +186,10 @@ pub const Object = struct {
         if (self.generator) |g| {
             gpa.free(g.regs);
             gpa.destroy(g);
+        }
+        if (self.regex) |re| {
+            re.deinit(gpa);
+            gpa.destroy(re);
         }
     }
 };

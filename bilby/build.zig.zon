@@ -1,0 +1,12 @@
+.{
+    .name = .bilby,
+    .version = "0.0.0",
+    .fingerprint = 0x5c2199409c36cc07,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

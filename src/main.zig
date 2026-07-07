@@ -26,6 +26,7 @@ pub fn main() !void {
     std.debug.print("bottlebrush {s} — bytecode VM\n\ndemo program:\n{s}\n\n", .{ bb.version, demo });
 
     var pr = try bb.parser.parse(alloc, demo, .script);
+
     switch (pr) {
         .syntax_error => |d| {
             std.debug.print("syntax error: {s}\n", .{d.message});
@@ -33,7 +34,9 @@ pub fn main() !void {
         },
         .ok => |*a| {
             defer a.deinit();
+
             var cr = try bb.compiler.compile(alloc, a.root, demo);
+
             switch (cr) {
                 .compile_error => |d| {
                     std.debug.print("compile error: {s}\n", .{d.message});
@@ -41,12 +44,15 @@ pub fn main() !void {
                 },
                 .ok => |*program| {
                     defer program.deinit();
+
                     var vm = bb.Vm.init(alloc);
                     defer vm.deinit();
+
                     const result = vm.run(program) catch {
                         std.debug.print("uncaught exception\n", .{});
                         return;
                     };
+
                     if (result.isNumber()) {
                         std.debug.print("=> {d}\n", .{result.asNumber()});
                     } else {
