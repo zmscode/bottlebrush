@@ -667,6 +667,12 @@ pub const Vm = struct {
             .new_regex => regs[inst.a] = Value.fromObject(try self.makeRegExp(code.constants[inst.b].string, code.constants[inst.c].string)),
             .get_prop => regs[inst.a] = try self.getProperty(regs[inst.b], code.constants[inst.c].string),
             .set_prop => try self.setPropertyMode(regs[inst.a], code.constants[inst.b].string, regs[inst.c], code.is_strict),
+            .def_prop => try self.defineData(regs[inst.a].asObject(), code.constants[inst.b].string, regs[inst.c], true, false, true),
+            .def_elem => {
+                const key = try self.toPropertyKey(regs[inst.b]);
+                defer self.gpa.free(key);
+                try self.defineData(regs[inst.a].asObject(), key, regs[inst.c], true, false, true);
+            },
             .get_elem => {
                 const key = try self.toPropertyKey(regs[inst.c]);
                 defer self.gpa.free(key);
@@ -695,6 +701,7 @@ pub const Vm = struct {
             .iter_init => regs[inst.a] = try self.getIterator(regs[inst.b]),
             .iter_next => regs[inst.a] = try self.iteratorNext(regs[inst.b]),
             .enum_keys => regs[inst.a] = Value.fromObject(try self.enumKeys(regs[inst.b])),
+            .copy_rest => try self.copyRestProperties(regs[inst.a].asObject(), regs[inst.b], regs[inst.c]),
             .gen_yield => return Step{ .yielded = regs[inst.b] },
 
             .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env, this_value),
@@ -823,7 +830,10 @@ pub const Vm = struct {
         while (i < code.num_params) : (i += 1) {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
         }
-        if (code.arguments_slot) |slot| env.slots[slot] = args_obj.?;
+        if (code.arguments_slot) |slot| {
+            env.slots[slot] = args_obj.?;
+            mapArguments(args_obj.?.asObject(), code, env, args.len);
+        }
         // Arrows ignore the call receiver: `this` is the creation site's.
         // Sloppy functions coerce a nullish receiver to the global object;
         // strict functions see it as-is.
@@ -836,6 +846,25 @@ pub const Vm = struct {
 
     /// Build an `arguments` object: an ordinary object with own indexed
     /// properties for each argument plus a writable, non-enumerable `length`.
+    /// Turn a fresh arguments object into a mapped one: indices below
+    /// min(argc, num_params) alias the frame's parameter env slots. Only for
+    /// sloppy functions with simple (all-identifier) parameter lists.
+    fn mapArguments(obj: *gc.Object, code: *const bc.CodeBlock, env: *gc.Environment, argc: usize) void {
+        if (code.is_strict or !code.simple_params) return;
+        const n = @min(@min(argc, code.num_params), 64);
+        if (n == 0) return;
+        obj.args_env = env;
+        obj.args_map = if (n == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
+    }
+
+    /// The mapped-slot index for `key` on an arguments object, if still mapped.
+    fn mappedArgIndex(obj: *const gc.Object, key: []const u8) ?u32 {
+        if (obj.args_env == null) return null;
+        const i = arrayIndex(key) orelse return null;
+        if (i < 64 and (obj.args_map >> @intCast(i)) & 1 == 1) return i;
+        return null;
+    }
+
     pub fn makeArgumentsObject(self: *Vm, args: []const Value) Error!*gc.Object {
         const obj = try self.newObject(self.object_proto);
         try self.protect(Value.fromObject(obj));
@@ -904,7 +933,10 @@ pub const Vm = struct {
         while (i < code.num_params) : (i += 1) {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
         }
-        if (code.arguments_slot) |slot| env.slots[slot] = args_obj.?;
+        if (code.arguments_slot) |slot| {
+            env.slots[slot] = args_obj.?;
+            mapArguments(args_obj.?.asObject(), code, env, args.len);
+        }
         // From here on: only gpa allocations (no GC), so env/regs/state stay live.
         const regs = try self.gpa.alloc(Value, code.num_registers);
         @memset(regs, Value.undefined_value);
@@ -1030,6 +1062,67 @@ pub const Vm = struct {
 
     /// Collect the enumerable string keys of an object and its prototype chain
     /// (deduplicated), as an array — for `for-in`.
+    /// CopyDataProperties (object rest + object spread): copy `src`'s own
+    /// enumerable properties onto `target`, minus the keys in the `excluded_v`
+    /// array (non-object = no exclusions). Getters are invoked. For rest
+    /// destructuring a nullish source throws; spread callers pre-filter.
+    pub fn copyRestProperties(self: *Vm, target: *gc.Object, src: Value, excluded_v: Value) Error!void {
+        if (src.isNullish()) return self.throwTypeError("cannot destructure null or undefined");
+
+        // Materialize the excluded keys once.
+        var excluded: std.ArrayList([]u8) = .empty;
+        defer {
+            for (excluded.items) |k| self.gpa.free(k);
+            excluded.deinit(self.gpa);
+        }
+        if (excluded_v.isObject()) {
+            const ex_arr = excluded_v.asObject();
+            var i: u32 = 0;
+            while (i < ex_arr.array_length) : (i += 1) {
+                if (Vm.arrayGetOwn(ex_arr, i)) |kv| {
+                    try excluded.append(self.gpa, try self.toPropertyKey(kv));
+                }
+            }
+        }
+
+        // A string source exposes its indices; other primitives contribute none.
+        if (!src.isObject()) {
+            if (src.isString()) {
+                const units = src.asString().units;
+                var i: usize = 0;
+                var buf: [16]u8 = undefined;
+                while (i < units.len) : (i += 1) {
+                    const key = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+                    if (keyIn(excluded.items, key)) continue;
+                    const ch = try self.makeStringFromUtf16(units[i .. i + 1]);
+                    try self.defineData(target, key, ch, true, true, true);
+                }
+            }
+            return;
+        }
+
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (keys.items) |k| self.gpa.free(k);
+            keys.deinit(self.gpa);
+        }
+        try ownEnumerableKeys(self, src.asObject(), &keys);
+        for (keys.items) |key| {
+            if (keyIn(excluded.items, key)) continue;
+            const v = try self.getProperty(src, key);
+            try self.protect(v);
+            defer self.unprotect();
+            try self.defineData(target, key, v, true, true, true);
+        }
+    }
+
+    fn keyIn(list: []const []u8, key: []const u8) bool {
+        for (list) |k| {
+            if (std.mem.eql(u8, k, key)) return true;
+        }
+        return false;
+    }
+
     pub fn enumKeys(self: *Vm, base: Value) Error!*gc.Object {
         const arr = try self.newArray(0);
         if (!base.isObject()) return arr;
@@ -1330,6 +1423,10 @@ pub const Vm = struct {
             if (base.isSymbol()) return self.getFromProto(self.symbol_proto, base, key);
             return Value.undefined_value;
         }
+        // Mapped `arguments` exotic: mapped indices alias the parameter slots.
+        if (mappedArgIndex(base.asObject(), key)) |i| {
+            return base.asObject().args_env.?.slots[i];
+        }
         // String wrapper exotic: indexed access reads the boxed string.
         if (arrayIndex(key)) |i| {
             if (base.asObject().properties.get(prim_key)) |d| {
@@ -1418,6 +1515,11 @@ pub const Vm = struct {
             if (base.isNullish()) return self.throwTypeError("cannot set property of null or undefined");
             return false; // writes to primitives always fail
         }
+        // Mapped `arguments` exotic: writes flow through to the parameter slot
+        // (and fall through so the backing own property stays in sync).
+        if (mappedArgIndex(base.asObject(), key)) |i| {
+            base.asObject().args_env.?.slots[i] = value;
+        }
         // Array exotic own writes (length + dense elements).
         if (base.asObject().is_array) {
             const arr = base.asObject();
@@ -1488,6 +1590,10 @@ pub const Vm = struct {
     pub fn deleteProperty(self: *Vm, base: Value, key: []const u8) bool {
         if (!base.isObject()) return true;
         const o = base.asObject();
+        // Deleting a mapped arguments index severs the parameter alias.
+        if (mappedArgIndex(o, key)) |i| {
+            o.args_map &= ~(@as(u64, 1) << @intCast(i));
+        }
         if (o.is_array) {
             if (arrayIndex(key)) |i| {
                 self.deleteArrayElement(o, i);

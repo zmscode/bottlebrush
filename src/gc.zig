@@ -150,6 +150,11 @@ pub const Object = struct {
     bound_this: Value = Value.undefined_value,
     /// RegExp exotic: the compiled matcher (heap-owned); null for non-regexps.
     regex: ?*bilby.Regex = null,
+    /// Mapped `arguments` exotic: the frame environment whose parameter slots
+    /// alias this object's indices, and a bitmask of still-mapped indices
+    /// (bit i => index i aliases env slot i; capped at 64 parameters).
+    args_env: ?*Environment = null,
+    args_map: u64 = 0,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -175,6 +180,7 @@ pub const Object = struct {
         }
         if (self.bound_target) |bt| bt.mark(t);
         self.bound_this.mark(t);
+        if (self.args_env) |e| t.mark(&e.gc);
     }
 
     pub fn deinitCell(self: *Object, gpa: std.mem.Allocator) void {

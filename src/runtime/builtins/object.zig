@@ -162,6 +162,23 @@ pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value)
 
     const v_value = if (has_value) try vm.getProperty(desc_v, "value") else Value.undefined_value;
     const v_writable = if (has_writable) toBoolean(try vm.getProperty(desc_v, "writable")) else false;
+
+    // Mapped-arguments interaction (spec 10.4.4.2): an accessor or a
+    // writable:false redefinition severs the parameter alias; a plain value
+    // redefinition writes through it and stays mapped.
+    if (obj.args_env != null) {
+        if (support_mod.arrayIndex(key)) |i| {
+            if (i < 64 and (obj.args_map >> @intCast(i)) & 1 == 1) {
+                if (has_get or has_set or (has_writable and !v_writable)) {
+                    if (has_value) obj.args_env.?.slots[i] = v_value;
+                    obj.args_map &= ~(@as(u64, 1) << @intCast(i));
+                } else if (has_value) {
+                    obj.args_env.?.slots[i] = v_value;
+                }
+            }
+        }
+    }
+
     const v_get = if (has_get) try vm.getProperty(desc_v, "get") else Value.undefined_value;
     const v_set = if (has_set) try vm.getProperty(desc_v, "set") else Value.undefined_value;
     if (has_get and !v_get.isUndefined() and !isCallable(v_get)) return vm.throwTypeError("getter must be a function");

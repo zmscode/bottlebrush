@@ -21,9 +21,12 @@ pub const bytecode = @import("bytecode.zig");
 pub const compiler = @import("compiler.zig");
 pub const interpreter = @import("interpreter.zig");
 pub const Vm = interpreter.Vm;
+pub const support = @import("runtime/support.zig");
 
 test {
-    // Pull in every module's tests. Add new modules here as phases land.
+    // Pull in every module's inline unit tests (`zig build test-unit`).
+    // The end-to-end suites live in src/tests/ with their own build steps
+    // (test-core / test-builtins / test-lang / test-stress).
     _ = @import("gc.zig");
     _ = @import("value.zig");
     _ = @import("handle.zig");
@@ -34,5 +37,4 @@ test {
     _ = @import("bytecode.zig");
     _ = @import("compiler.zig");
     _ = @import("interpreter.zig");
-    _ = @import("vm_tests.zig");
 }

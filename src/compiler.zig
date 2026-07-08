@@ -49,6 +49,7 @@ const FnState = struct {
     is_generator: bool = false,
     is_arrow: bool = false,
     is_strict: bool = false,
+    simple_params: bool = true,
     num_params: u32 = 0,
     fn_length: u32 = 0,
     arguments_slot: ?u32 = null,
@@ -226,6 +227,9 @@ pub const Compiler = struct {
         is_generator: bool,
         is_arrow: bool,
         force_strict: bool,
+        /// Instance-field members (class constructors only): `this.key = init`
+        /// runs in declaration order before the constructor body.
+        class_fields: []const *Node,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
         var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_arrow = is_arrow };
@@ -247,6 +251,7 @@ pub const Compiler = struct {
         // ones before the first default/rest parameter (the `length` property).
         var counting_length = true;
         for (params, 0..) |p, pidx| {
+            if (p.kind != .ident) fs.simple_params = false;
             switch (p.kind) {
                 .ident => |pn| {
                     _ = try self.declare(pn);
@@ -325,6 +330,30 @@ pub const Compiler = struct {
             try self.hoist(stmts);
             try self.declareLexicals(stmts);
             try self.emitHoistedFunctions(stmts);
+            // Instance fields initialize before the constructor body runs.
+            if (class_fields.len > 0) {
+                const thisr = self.allocReg();
+                _ = try self.emit(.{ .op = .load_this, .a = thisr });
+                for (class_fields) |fp| {
+                    const prop = fp.kind.property;
+                    const vreg = self.allocReg();
+                    if (prop.value) |init_expr| {
+                        try self.compileExprInto(vreg, init_expr);
+                    } else {
+                        _ = try self.emit(.{ .op = .load_undefined, .a = vreg });
+                    }
+                    if (prop.computed) {
+                        const k = self.allocReg();
+                        try self.compileExprInto(k, prop.key);
+                        _ = try self.emit(.{ .op = .set_elem, .a = thisr, .b = k, .c = vreg });
+                    } else {
+                        const idx = try self.propNameConst(prop.key);
+                        _ = try self.emit(.{ .op = .set_prop, .a = thisr, .b = idx, .c = vreg });
+                    }
+                    self.freeTo(vreg);
+                }
+                self.freeTo(thisr);
+            }
             for (stmts) |s| try self.compileStmt(s);
             // Implicit `return undefined`.
             const r = self.allocReg();
@@ -341,7 +370,7 @@ pub const Compiler = struct {
         for (body) |stmt| {
             if (stmt.kind == .function_decl) {
                 const f = stmt.kind.function_decl;
-                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, false, self.fs);
+                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, false, &.{}, self.fs);
                 const idx: u32 = @intCast(self.fs.children.items.len);
                 try self.fs.children.append(self.gpa, child);
                 const r = self.allocReg();
@@ -363,6 +392,7 @@ pub const Compiler = struct {
             .is_generator = fs.is_generator,
             .is_arrow = fs.is_arrow,
             .is_strict = fs.is_strict,
+            .simple_params = fs.simple_params,
             .fn_length = fs.fn_length,
             .arguments_slot = fs.arguments_slot,
             .code = try self.arena.dupe(Inst, fs.code.items),
@@ -580,32 +610,63 @@ pub const Compiler = struct {
     }
 
     fn bindObjectPattern(self: *Compiler, props: []*Node, src: u32, mode: BindMode) CompileError!void {
+        // A rest element needs the set of already-bound keys at run time (for
+        // computed keys), so collect every key into an excluded-keys array.
+        // Binding patterns spell rest as a .rest_element node; the assignment
+        // cover grammar spells it as a spread-kind property.
+        var has_rest = false;
+        for (props) |p| {
+            if (p.kind == .rest_element or p.kind == .spread) has_rest = true;
+            if (p.kind == .property and p.kind.property.kind == .spread) has_rest = true;
+        }
+        const excluded: u32 = if (has_rest) blk: {
+            const r = self.allocReg();
+            _ = try self.emit(.{ .op = .new_array, .a = r, .b = 0 });
+            break :blk r;
+        } else 0;
+
         for (props) |p| {
             switch (p.kind) {
-                .rest_element, .spread => return self.fail("object rest pattern unsupported", p.start),
+                .rest_element, .spread => {
+                    const target = if (p.kind == .rest_element) p.kind.rest_element else p.kind.spread;
+                    const rest = self.allocReg();
+                    _ = try self.emit(.{ .op = .new_object, .a = rest });
+                    _ = try self.emit(.{ .op = .copy_rest, .a = rest, .b = src, .c = excluded });
+                    try self.compilePatternBind(target, rest, mode);
+                    self.freeTo(rest);
+                },
                 .property => |prop| {
+                    if (prop.kind == .spread) {
+                        const target = prop.key; // spread stores its expression in `key`
+                        const rest = self.allocReg();
+                        _ = try self.emit(.{ .op = .new_object, .a = rest });
+                        _ = try self.emit(.{ .op = .copy_rest, .a = rest, .b = src, .c = excluded });
+                        try self.compilePatternBind(target, rest, mode);
+                        self.freeTo(rest);
+                        continue;
+                    }
                     if (prop.kind != .init and prop.kind != .method) return self.fail("invalid destructuring property", p.start);
                     const val = self.allocReg();
-                    if (prop.computed) {
+                    if (prop.computed or prop.key.kind == .number) {
+                        // Evaluated keys (computed, numeric literals) go through
+                        // get_elem for canonical ToPropertyKey handling.
                         const k = self.allocReg();
                         try self.compileExprInto(k, prop.key);
                         _ = try self.emit(.{ .op = .get_elem, .a = val, .b = src, .c = k });
-                    } else switch (prop.key.kind) {
-                        .ident => |n| {
-                            const idx = try self.addConst(.{ .string = n });
-                            _ = try self.emit(.{ .op = .get_prop, .a = val, .b = src, .c = idx });
-                        },
-                        .string => |raw| {
-                            const cooked = try self.cookString(raw);
-                            const idx = try self.addConst(.{ .string = cooked });
-                            _ = try self.emit(.{ .op = .get_prop, .a = val, .b = src, .c = idx });
-                        },
-                        .number => {
+                        if (has_rest) _ = try self.emit(.{ .op = .arr_push, .a = excluded, .b = k });
+                    } else {
+                        const idx: u32 = switch (prop.key.kind) {
+                            .ident => |n| try self.addConst(.{ .string = n }),
+                            .string => |raw| try self.addConst(.{ .string = try self.cookString(raw) }),
+                            else => return self.fail("unsupported destructuring key", p.start),
+                        };
+                        _ = try self.emit(.{ .op = .get_prop, .a = val, .b = src, .c = idx });
+                        if (has_rest) {
                             const k = self.allocReg();
-                            try self.compileExprInto(k, prop.key);
-                            _ = try self.emit(.{ .op = .get_elem, .a = val, .b = src, .c = k });
-                        },
-                        else => return self.fail("unsupported destructuring key", p.start),
+                            _ = try self.emit(.{ .op = .load_const, .a = k, .b = idx });
+                            _ = try self.emit(.{ .op = .arr_push, .a = excluded, .b = k });
+                            self.freeTo(k);
+                        }
                     }
                     const target_node = prop.value orelse return self.fail("invalid destructuring property", p.start);
                     try self.compilePatternBind(target_node, val, mode);
@@ -614,6 +675,7 @@ pub const Compiler = struct {
                 else => return self.fail("invalid destructuring property", p.start),
             }
         }
+        if (has_rest) self.freeTo(excluded);
     }
 
     /// Bind a destructuring target (binding pattern *or* the literal cover form
@@ -1422,13 +1484,74 @@ pub const Compiler = struct {
         }
     }
 
+    /// Emit `Object.defineProperty(target, key, { get/set: fr, configurable,
+    /// enumerable })` — used for class accessors (non-enumerable) and object
+    /// literal accessors (enumerable).
+    fn emitDefineAccessor(self: *Compiler, target: u32, prop: ast.Property, fr: u32, enumerable: bool) CompileError!void {
+        const base = self.allocReg(); // receiver = Object
+        const obj_idx = try self.addConst(.{ .string = "Object" });
+        _ = try self.emit(.{ .op = .get_global, .a = base, .b = obj_idx });
+        const callee = self.allocReg();
+        const dp_idx = try self.addConst(.{ .string = "defineProperty" });
+        _ = try self.emit(.{ .op = .get_prop, .a = callee, .b = base, .c = dp_idx });
+        const arg0 = self.allocReg();
+        _ = try self.emit(.{ .op = .move, .a = arg0, .b = target });
+        const arg1 = self.allocReg();
+        if (prop.computed) {
+            try self.compileExprInto(arg1, prop.key);
+        } else {
+            const idx = try self.propNameConst(prop.key);
+            _ = try self.emit(.{ .op = .load_const, .a = arg1, .b = idx });
+        }
+        const arg2 = self.allocReg();
+        _ = try self.emit(.{ .op = .new_object, .a = arg2 });
+        const acc_idx = try self.addConst(.{ .string = if (prop.kind == .get) "get" else "set" });
+        _ = try self.emit(.{ .op = .set_prop, .a = arg2, .b = acc_idx, .c = fr });
+        const tr = self.allocReg();
+        _ = try self.emit(.{ .op = .load_true, .a = tr });
+        const conf_idx = try self.addConst(.{ .string = "configurable" });
+        _ = try self.emit(.{ .op = .set_prop, .a = arg2, .b = conf_idx, .c = tr });
+        if (enumerable) {
+            const enum_idx = try self.addConst(.{ .string = "enumerable" });
+            _ = try self.emit(.{ .op = .set_prop, .a = arg2, .b = enum_idx, .c = tr });
+        }
+        self.freeTo(tr);
+        const res = self.allocReg();
+        _ = try self.emit(.{ .op = .call, .a = res, .b = base, .c = 3 });
+        self.freeTo(base);
+    }
+
     fn compileObjectLiteral(self: *Compiler, dst: u32, props: []*Node, pos: u32) CompileError!void {
         _ = try self.emit(.{ .op = .new_object, .a = dst });
         for (props) |p| {
             const prop = p.kind.property;
             switch (prop.kind) {
-                .spread => return self.fail("object spread unsupported", pos),
-                .get, .set => return self.fail("object literal accessors unsupported", pos),
+                .spread => {
+                    // { ...expr }: copy own enumerable props; nullish is a no-op.
+                    const sreg = self.allocReg();
+                    try self.compileExprInto(sreg, prop.key);
+                    const jskip = try self.emit(.{ .op = .jump_if_nullish, .a = sreg });
+                    const und = self.allocReg();
+                    _ = try self.emit(.{ .op = .load_undefined, .a = und }); // no exclusions
+                    _ = try self.emit(.{ .op = .copy_rest, .a = dst, .b = sreg, .c = und });
+                    self.patchTarget(jskip, self.here());
+                    self.freeTo(sreg);
+                    continue;
+                },
+                .get, .set => {
+                    const fnode = prop.value orelse return self.fail("malformed accessor", pos);
+                    if (fnode.kind != .function) return self.fail("malformed accessor", pos);
+                    const f = fnode.kind.function;
+                    const name = if (!prop.computed and prop.key.kind == .ident) prop.key.kind.ident else "";
+                    const child = try self.compileFunction(name, f.params, f.body, false, false, false, false, &.{}, self.fs);
+                    const child_idx: u32 = @intCast(self.fs.children.items.len);
+                    try self.fs.children.append(self.gpa, child);
+                    const fr = self.allocReg();
+                    _ = try self.emit(.{ .op = .new_closure, .a = fr, .b = child_idx });
+                    try self.emitDefineAccessor(dst, prop, fr, true);
+                    self.freeTo(fr);
+                    continue;
+                },
                 .init, .method => {},
             }
             const value = prop.value orelse return self.fail("invalid object property", pos);
@@ -1699,6 +1822,16 @@ pub const Compiler = struct {
             self.freeTo(r);
         }
 
+        // Instance fields (kind == .init, non-static) initialize inside the
+        // constructor, in declaration order.
+        var instance_fields: std.ArrayList(*Node) = .empty;
+        defer instance_fields.deinit(self.gpa);
+        for (cls.members) |m| {
+            if (m.kind != .property) continue;
+            const prop = m.kind.property;
+            if (prop.kind == .init and !prop.is_static) try instance_fields.append(self.gpa, m);
+        }
+
         // The constructor (or an empty default one).
         var ctor_block: ?*bc.CodeBlock = null;
         for (cls.members) |m| {
@@ -1708,14 +1841,14 @@ pub const Compiler = struct {
                 std.mem.eql(u8, prop.key.kind.ident, "constructor"))
             {
                 const f = (prop.value orelse return self.fail("malformed constructor", m.start)).kind.function;
-                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, self.fs);
+                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, instance_fields.items, self.fs);
                 break;
             }
         }
         if (ctor_block == null) {
             const empty_body = try self.arena.create(Node);
             empty_body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = &.{} } };
-            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, empty_body, false, false, false, true, self.fs);
+            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, empty_body, false, false, false, true, instance_fields.items, self.fs);
         }
         const ctor_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, ctor_block.?);
@@ -1745,13 +1878,41 @@ pub const Compiler = struct {
             const prop = m.kind.property;
             if (prop.kind == .method and !prop.computed and prop.key.kind == .ident and
                 std.mem.eql(u8, prop.key.kind.ident, "constructor")) continue;
-            if (prop.kind == .init) return self.fail("class fields unsupported", m.start);
+            if (prop.kind == .init) {
+                if (!prop.is_static) continue; // instance fields ran in the ctor
+                // Static field: the initializer runs now with `this` = the
+                // constructor (compiled as an expression-body closure).
+                const vreg = self.allocReg();
+                if (prop.value) |init_expr| {
+                    const child = try self.compileFunction("", &.{}, init_expr, true, false, false, true, &.{}, self.fs);
+                    const child_idx: u32 = @intCast(self.fs.children.items.len);
+                    try self.fs.children.append(self.gpa, child);
+                    const base = self.allocReg(); // receiver = the constructor
+                    _ = try self.emit(.{ .op = .move, .a = base, .b = dst });
+                    const callee = self.allocReg();
+                    _ = try self.emit(.{ .op = .new_closure, .a = callee, .b = child_idx });
+                    _ = try self.emit(.{ .op = .call, .a = vreg, .b = base, .c = 0 });
+                    self.freeTo(base);
+                } else {
+                    _ = try self.emit(.{ .op = .load_undefined, .a = vreg });
+                }
+                if (prop.computed) {
+                    const k = self.allocReg();
+                    try self.compileExprInto(k, prop.key);
+                    _ = try self.emit(.{ .op = .set_elem, .a = dst, .b = k, .c = vreg });
+                } else {
+                    const idx = try self.propNameConst(prop.key);
+                    _ = try self.emit(.{ .op = .set_prop, .a = dst, .b = idx, .c = vreg });
+                }
+                self.freeTo(vreg);
+                continue;
+            }
             const fnode = prop.value orelse return self.fail("malformed class member", m.start);
             if (fnode.kind != .function) return self.fail("malformed class member", m.start);
             const f = fnode.kind.function;
 
             const member_name = if (!prop.computed and prop.key.kind == .ident) prop.key.kind.ident else "";
-            const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, false, true, self.fs);
+            const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, false, true, &.{}, self.fs);
             const child_idx: u32 = @intCast(self.fs.children.items.len);
             try self.fs.children.append(self.gpa, child);
             const fr = self.allocReg();
@@ -1760,45 +1921,17 @@ pub const Compiler = struct {
             const target: u32 = if (prop.is_static) dst else proto_reg;
             switch (prop.kind) {
                 .method => {
+                    // Class methods are non-enumerable (spec MethodDefinitionEvaluation).
                     if (prop.computed) {
                         const k = self.allocReg();
                         try self.compileExprInto(k, prop.key);
-                        _ = try self.emit(.{ .op = .set_elem, .a = target, .b = k, .c = fr });
+                        _ = try self.emit(.{ .op = .def_elem, .a = target, .b = k, .c = fr });
                     } else {
                         const idx = try self.propNameConst(prop.key);
-                        _ = try self.emit(.{ .op = .set_prop, .a = target, .b = idx, .c = fr });
+                        _ = try self.emit(.{ .op = .def_prop, .a = target, .b = idx, .c = fr });
                     }
                 },
-                .get, .set => {
-                    // Object.defineProperty(target, key, { get/set: fr })
-                    const base = self.allocReg(); // receiver = Object
-                    const obj_idx = try self.addConst(.{ .string = "Object" });
-                    _ = try self.emit(.{ .op = .get_global, .a = base, .b = obj_idx });
-                    const callee = self.allocReg();
-                    const dp_idx = try self.addConst(.{ .string = "defineProperty" });
-                    _ = try self.emit(.{ .op = .get_prop, .a = callee, .b = base, .c = dp_idx });
-                    const arg0 = self.allocReg();
-                    _ = try self.emit(.{ .op = .move, .a = arg0, .b = target });
-                    const arg1 = self.allocReg();
-                    if (prop.computed) {
-                        try self.compileExprInto(arg1, prop.key);
-                    } else {
-                        const idx = try self.propNameConst(prop.key);
-                        _ = try self.emit(.{ .op = .load_const, .a = arg1, .b = idx });
-                    }
-                    const arg2 = self.allocReg();
-                    _ = try self.emit(.{ .op = .new_object, .a = arg2 });
-                    const acc_idx = try self.addConst(.{ .string = if (prop.kind == .get) "get" else "set" });
-                    _ = try self.emit(.{ .op = .set_prop, .a = arg2, .b = acc_idx, .c = fr });
-                    const conf_idx = try self.addConst(.{ .string = "configurable" });
-                    const tr = self.allocReg();
-                    _ = try self.emit(.{ .op = .load_true, .a = tr });
-                    _ = try self.emit(.{ .op = .set_prop, .a = arg2, .b = conf_idx, .c = tr });
-                    self.freeTo(tr);
-                    const res = self.allocReg();
-                    _ = try self.emit(.{ .op = .call, .a = res, .b = base, .c = 3 });
-                    self.freeTo(base);
-                },
+                .get, .set => try self.emitDefineAccessor(target, prop, fr, false),
                 else => return self.fail("unsupported class member", m.start),
             }
             self.freeTo(fr);
@@ -1815,6 +1948,7 @@ pub const Compiler = struct {
             f.flags.is_generator,
             f.flags.is_arrow,
             false,
+            &.{},
             self.fs,
         );
         const idx: u32 = @intCast(self.fs.children.items.len);
@@ -2010,7 +2144,7 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
     const dummy_body = try c.arena.create(Node);
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
-    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, null) catch |e| switch (e) {
+    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, &.{}, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;
@@ -2077,7 +2211,7 @@ test "compiles control flow and functions" {
 }
 
 test "reports unsupported constructs" {
-    const src = "var { ...rest } = obj;"; // object rest patterns do not compile yet
+    const src = "function f(...args) {}"; // rest parameters do not compile yet
     const parser = @import("parser.zig");
     var pr = try parser.parse(testing.allocator, src, .script);
     switch (pr) {

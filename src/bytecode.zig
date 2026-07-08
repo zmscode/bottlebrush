@@ -83,6 +83,8 @@ pub const Op = enum(u8) {
     new_regex, // a=dst, b=source const, c=flags const
     get_prop, // a=dst, b=obj reg, c=name const index
     set_prop, // a=obj reg, b=name const index, c=value reg
+    def_prop, // a=obj reg, b=name const index, c=value reg  (non-enumerable define; class members)
+    def_elem, // a=obj reg, b=key reg, c=value reg  (computed non-enumerable define)
     get_elem, // a=dst, b=obj reg, c=key reg
     set_elem, // a=obj reg, b=key reg, c=value reg
     delete_prop, // a=dst (bool), b=obj reg, c=name const
@@ -93,6 +95,7 @@ pub const Op = enum(u8) {
     iter_init, // a=dst iterator, b=iterable reg  (GetIterator)
     iter_next, // a=dst result{value,done}, b=iterator reg  (IteratorNext)
     enum_keys, // a=dst array, b=object reg  (enumerable keys, for for-in)
+    copy_rest, // a=target object (mutated), b=src reg, c=excluded-keys array reg or non-object for none  (CopyDataProperties)
     gen_yield, // a=dst (resumed value), b=yielded value reg
 
     // Functions
@@ -147,6 +150,9 @@ pub const CodeBlock = struct {
     /// Strict-mode code: a "use strict" directive here or in an enclosing
     /// function. Gates assignment/delete errors and `this` coercion.
     is_strict: bool = false,
+    /// Every parameter is a plain identifier (no defaults/patterns/rest).
+    /// Pre-condition for mapped `arguments`.
+    simple_params: bool = true,
     /// The function's `length` property: parameters before the first default
     /// or rest parameter (may differ from `num_params`).
     fn_length: u32 = 0,

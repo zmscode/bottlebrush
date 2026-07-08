@@ -41,17 +41,29 @@ executed)**, 110/110 unit tests, corpus wall time ~0.5 s.
 7. ~~**Destructuring**~~ **FIXED 2026-07-08**: array/object patterns lower
    everywhere — declarations, parameters (incl. whole-pattern defaults),
    assignment expressions (incl. member targets), for-of/for-in heads, catch
-   params; iterator-protocol based; nested; defaults; array rest. Object rest
-   still unsupported.
+   params; iterator-protocol based; nested; defaults; array rest. Object
+   rest landed later the same day via the `copy_rest` op
+   (CopyDataProperties with runtime excluded-keys), which also powers
+   object literal spread; literal accessors compile too.
 8. ~~**Classes and template literals**~~ **FIXED 2026-07-08**: classes lower
-   to constructor functions — decl/expr forms, methods, static members,
-   get/set accessors (via runtime defineProperty), `extends` with both
-   prototype chains wired, `super(...)`/`super.m(...)`/`super.x` through
-   synthetic captured bindings, implicitly strict bodies. Class fields remain
-   a compile error (skip). Templates: untagged (string-seeded concat) and
-   tagged (strings array + `.raw` + substitutions).
-9. **Mapped `arguments`** — plain object; no parameter aliasing, no strict
-   variant.
+   to constructor functions — decl/expr forms, methods (non-enumerable via
+   `def_prop`/`def_elem`), static members, get/set accessors (via runtime
+   defineProperty), `extends` with both prototype chains wired,
+   `super(...)`/`super.m(...)`/`super.x` through synthetic captured
+   bindings, implicitly strict bodies. Class FIELDS also landed: instance
+   fields initialize in the constructor prologue (declaration order,
+   `this`-referencing initializers, per-instance values); static fields
+   evaluate at class creation with `this` = the constructor. Private
+   (#name) members still unsupported — the dominant remaining fail
+   cluster. Templates: untagged (string-seeded concat) and tagged (strings
+   array + `.raw` + substitutions).
+9. ~~**Mapped `arguments`**~~ **FIXED 2026-07-08**: sloppy functions with
+   simple parameter lists get mapped arguments — indices alias the
+   parameter env slots both directions (`args_env` + `args_map` bitmask on
+   the object, capped at 64 params); `delete` and
+   defineProperty-with-accessor-or-writable:false sever the alias (value
+   redefinitions write through); strict or non-simple-param functions stay
+   unmapped.
 10. ~~**`[[SetPrototypeOf]]`**~~ **FIXED 2026-07-08**: Object.setPrototypeOf
     with cycle check + `__proto__` accessor; Object.assign/is/hasOwn/
     fromEntries/getOwnPropertyDescriptors added.
