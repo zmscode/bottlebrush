@@ -39,6 +39,12 @@ const CompileError = error{ Unsupported, BadCode, OutOfMemory };
 
 const Binding = struct { depth: u32, slot: u32 };
 
+/// One class body's private-name namespace: maps `#name` (as written) to the
+/// hidden storage key used at run time.
+const PrivateScope = struct {
+    names: std.StringHashMapUnmanaged([]const u8) = .empty,
+};
+
 const Block = struct {
     names: std.StringHashMapUnmanaged(u32) = .empty,
 };
@@ -80,6 +86,12 @@ pub const Compiler = struct {
     loop: ?*LoopCtx = null,
     /// Innermost breakable context (loop or switch), for `break`.
     break_target: ?*LoopCtx = null,
+    /// Lexical stack of class private-name scopes (`#name` -> hidden key).
+    /// Resolving a private name searches inner-to-outer; unresolved is an error.
+    private_scopes: std.ArrayList(PrivateScope) = .empty,
+    /// Monotonic id giving each class body its own private-name namespace, so
+    /// two classes' `#x` never collide.
+    private_class_seq: u32 = 0,
 
     fn fail(self: *Compiler, comptime msg: []const u8, pos: u32) CompileError {
         if (self.diag == null) self.diag = .{ .message = msg, .pos = pos };
@@ -356,19 +368,29 @@ pub const Compiler = struct {
             try self.hoist(stmts);
             try self.declareLexicals(stmts);
             try self.emitHoistedFunctions(stmts);
-            // Instance fields initialize before the constructor body runs.
+            // Instance elements install on `this` before the constructor body
+            // runs. Per spec, private methods/accessors are added first (so
+            // field initializers may call them), then fields in source order.
             if (class_fields.len > 0) {
                 const thisr = self.allocReg();
                 _ = try self.emit(.{ .op = .load_this, .a = thisr });
                 for (class_fields) |fp| {
                     const prop = fp.kind.property;
+                    if (prop.kind == .init) continue; // fields: second pass
+                    try self.emitInstancePrivateMember(thisr, prop, fp.start);
+                }
+                for (class_fields) |fp| {
+                    const prop = fp.kind.property;
+                    if (prop.kind != .init) continue; // methods/accessors: first pass
                     const vreg = self.allocReg();
                     if (prop.value) |init_expr| {
                         try self.compileExprInto(vreg, init_expr);
                     } else {
                         _ = try self.emit(.{ .op = .load_undefined, .a = vreg });
                     }
-                    if (prop.computed) {
+                    if (isPrivateMember(prop)) {
+                        _ = try self.emit(.{ .op = .def_pfield, .a = thisr, .b = try self.privateKeyConst(prop.key.kind.private_name, fp.start), .c = vreg });
+                    } else if (prop.computed) {
                         const k = self.allocReg();
                         try self.compileExprInto(k, prop.key);
                         _ = try self.emit(.{ .op = .set_elem, .a = thisr, .b = k, .c = vreg });
@@ -1319,6 +1341,15 @@ pub const Compiler = struct {
     }
 
     fn compileBinary(self: *Compiler, dst: u32, b: anytype) CompileError!void {
+        // `#x in obj`: an ergonomic brand check, not a normal `in`.
+        if (b.op == .kw_in and b.left.kind == .private_name) {
+            const objreg = self.allocReg();
+            try self.compileExprInto(objreg, b.right);
+            const pk = try self.privateKeyConst(b.left.kind.private_name, b.left.start);
+            _ = try self.emit(.{ .op = .has_private, .a = dst, .b = objreg, .c = pk });
+            self.freeTo(objreg);
+            return;
+        }
         const rhs = self.allocReg();
         try self.compileExprInto(dst, b.left);
         try self.compileExprInto(rhs, b.right);
@@ -1391,6 +1422,7 @@ pub const Compiler = struct {
     }
 
     fn compileUpdate(self: *Compiler, dst: u32, u: anytype, pos: u32) CompileError!void {
+        if (u.operand.kind == .member) return self.compileMemberUpdate(dst, u);
         if (u.operand.kind != .ident) return self.fail("update target must be an identifier", pos);
         const name = u.operand.kind.ident;
         const bind = self.resolve(name);
@@ -1427,6 +1459,34 @@ pub const Compiler = struct {
         } else {
             _ = try self.emit(.{ .op = .set_global, .a = gidx.?, .b = src });
         }
+    }
+
+    /// `obj.p++` / `--obj.p` etc., including private members. The object and
+    /// key are evaluated once; `dst` receives the expression's value.
+    fn compileMemberUpdate(self: *Compiler, dst: u32, u: anytype) CompileError!void {
+        const m = u.operand.kind.member;
+        const objreg = self.allocReg();
+        try self.compileExprInto(objreg, m.object);
+        const key: MemberKey = if (m.property.kind == .private_name)
+            .{ .private = try self.privateKeyConst(m.property.kind.private_name, m.property.start) }
+        else if (m.computed) blk: {
+            const keyreg = self.allocReg();
+            try self.compileExprInto(keyreg, m.property);
+            break :blk MemberKey{ .computed = keyreg };
+        } else .{ .named = try self.propNameConst(m.property) };
+
+        const one = try self.addConst(.{ .number = 1 });
+        const cur = self.allocReg();
+        try self.emitMemberGet(cur, objreg, key);
+        _ = try self.emit(.{ .op = .to_number, .a = cur, .b = cur });
+        const delta = self.allocReg();
+        _ = try self.emit(.{ .op = .load_const, .a = delta, .b = one });
+        const newv = self.allocReg();
+        _ = try self.emit(.{ .op = if (u.op == .plus_plus) .add else .sub, .a = newv, .b = cur, .c = delta });
+        try self.emitMemberSet(objreg, key, newv);
+        // Prefix yields the new value; postfix the old (already ToNumber'd).
+        _ = try self.emit(.{ .op = .move, .a = dst, .b = if (u.prefix) newv else cur });
+        self.freeTo(objreg);
     }
 
     fn compileAssignment(self: *Compiler, dst: u32, a: anytype, pos: u32) CompileError!void {
@@ -1479,21 +1539,54 @@ pub const Compiler = struct {
         }
     }
 
+    /// How a member's key is addressed, so a get/set pair can share it.
+    const MemberKey = union(enum) {
+        private: u32, // private-key const index
+        computed: u32, // register holding the evaluated key
+        named: u32, // property-name const index
+    };
+
+    fn emitMemberGet(self: *Compiler, dst: u32, objreg: u32, key: MemberKey) CompileError!void {
+        _ = try self.emit(switch (key) {
+            .private => |c| .{ .op = .get_private, .a = dst, .b = objreg, .c = c },
+            .computed => |r| .{ .op = .get_elem, .a = dst, .b = objreg, .c = r },
+            .named => |c| .{ .op = .get_prop, .a = dst, .b = objreg, .c = c },
+        });
+    }
+
+    fn emitMemberSet(self: *Compiler, objreg: u32, key: MemberKey, src: u32) CompileError!void {
+        _ = try self.emit(switch (key) {
+            .private => |c| .{ .op = .set_private, .a = objreg, .b = c, .c = src },
+            .computed => |r| .{ .op = .set_elem, .a = objreg, .b = r, .c = src },
+            .named => |c| .{ .op = .set_prop, .a = objreg, .b = c, .c = src },
+        });
+    }
+
     fn compileMemberStore(self: *Compiler, dst: u32, a: anytype, pos: u32) CompileError!void {
-        if (a.op != .assign) return self.fail("compound member assignment unsupported", pos);
+        _ = pos;
         const m = a.target.kind.member;
         const objreg = self.allocReg();
         try self.compileExprInto(objreg, m.object);
-        if (m.computed) {
+        const key: MemberKey = if (m.property.kind == .private_name)
+            .{ .private = try self.privateKeyConst(m.property.kind.private_name, m.property.start) }
+        else if (m.computed) blk: {
             const keyreg = self.allocReg();
             try self.compileExprInto(keyreg, m.property);
+            break :blk MemberKey{ .computed = keyreg };
+        } else .{ .named = try self.propNameConst(m.property) };
+
+        if (a.op == .assign) {
             try self.compileExprInto(dst, a.value);
-            _ = try self.emit(.{ .op = .set_elem, .a = objreg, .b = keyreg, .c = dst });
         } else {
-            const name_idx = try self.propNameConst(m.property);
-            try self.compileExprInto(dst, a.value);
-            _ = try self.emit(.{ .op = .set_prop, .a = objreg, .b = name_idx, .c = dst });
+            // `obj.p op= v`: read, combine, write back (obj/key evaluated once).
+            try self.emitMemberGet(dst, objreg, key);
+            const rhs = self.allocReg();
+            try self.compileExprInto(rhs, a.value);
+            const op = compoundOpcode(a.op) orelse return self.fail("unsupported assignment operator", m.object.start);
+            _ = try self.emit(.{ .op = op, .a = dst, .b = dst, .c = rhs });
+            self.freeTo(rhs);
         }
+        try self.emitMemberSet(objreg, key, dst);
         self.freeTo(objreg);
     }
 
@@ -1505,7 +1598,10 @@ pub const Compiler = struct {
             const sp = self.resolve("\x00super_proto") orelse return self.fail("'super' outside a class method", m.object.start);
             _ = try self.emit(.{ .op = .get_var, .a = objreg, .b = sp.depth, .c = sp.slot });
         } else try self.compileExprInto(objreg, m.object);
-        if (m.computed) {
+        if (m.property.kind == .private_name) {
+            const pk = try self.privateKeyConst(m.property.kind.private_name, m.property.start);
+            _ = try self.emit(.{ .op = .get_private, .a = dst, .b = objreg, .c = pk });
+        } else if (m.computed) {
             const keyreg = self.allocReg();
             try self.compileExprInto(keyreg, m.property);
             _ = try self.emit(.{ .op = .get_elem, .a = dst, .b = objreg, .c = keyreg });
@@ -1709,6 +1805,7 @@ pub const Compiler = struct {
         if (prop.computed) return "";
         const base: []const u8 = switch (prop.key.kind) {
             .ident => |n| n,
+            .private_name => |n| n, // includes the leading '#'
             .string => |raw| try self.cookString(raw),
             .number => |num| num.raw,
             else => return "",
@@ -1718,6 +1815,57 @@ pub const Compiler = struct {
             .set => try std.fmt.allocPrint(self.arena, "set {s}", .{base}),
             else => base,
         };
+    }
+
+    // ---- private class members ---------------------------------------------
+
+    /// The hidden run-time key for a private name, unique per class body.
+    /// Encoded `\x00P<classid>\x00#name`; the NUL prefix keeps it out of
+    /// enumeration and ordinary property access.
+    fn makePrivateKey(self: *Compiler, class_id: u32, name: []const u8) CompileError![]const u8 {
+        return std.fmt.allocPrint(self.arena, "\x00P{d}\x00{s}", .{ class_id, name });
+    }
+
+    /// Resolve `#name` to its hidden key, searching enclosing class scopes.
+    /// A private name with no declaring class in scope is an early error.
+    fn resolvePrivate(self: *Compiler, name: []const u8, pos: u32) CompileError![]const u8 {
+        var i = self.private_scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.private_scopes.items[i].names.get(name)) |key| return key;
+        }
+        return self.fail("private name is not defined in an enclosing class", pos);
+    }
+
+    fn privateKeyConst(self: *Compiler, name: []const u8, pos: u32) CompileError!u32 {
+        return self.addConst(.{ .string = try self.resolvePrivate(name, pos) });
+    }
+
+    /// Whether `prop` is a private member (its key is a `#name`).
+    fn isPrivateMember(prop: ast.Property) bool {
+        return prop.key.kind == .private_name;
+    }
+
+    /// Install one private instance method/accessor on the receiver in `thisr`
+    /// (constructor prologue). The closure captures the constructor's scope, so
+    /// it sees enclosing private names and `super`.
+    fn emitInstancePrivateMember(self: *Compiler, thisr: u32, prop: ast.Property, start: u32) CompileError!void {
+        const fnode = prop.value orelse return self.fail("malformed private member", start);
+        if (fnode.kind != .function) return self.fail("malformed private member", start);
+        const f = fnode.kind.function;
+        const child = try self.compileFunction(try self.functionNameFor(prop), f.params, f.body, false, f.flags.is_generator, false, true, &.{}, self.fs);
+        const child_idx: u32 = @intCast(self.fs.children.items.len);
+        try self.fs.children.append(self.gpa, child);
+        const fr = self.allocReg();
+        _ = try self.emit(.{ .op = .new_closure, .a = fr, .b = child_idx });
+        const pk = try self.privateKeyConst(prop.key.kind.private_name, start);
+        _ = try self.emit(.{ .op = switch (prop.kind) {
+            .method => .def_pmethod,
+            .get => .def_pget,
+            .set => .def_pset,
+            else => return self.fail("unsupported private member", start),
+        }, .a = thisr, .b = pk, .c = fr });
+        self.freeTo(fr);
     }
 
     fn compileConditional(self: *Compiler, dst: u32, c: anytype) CompileError!void {
@@ -1772,7 +1920,10 @@ pub const Compiler = struct {
             const m = c.callee.kind.member;
             try self.compileExprInto(base, m.object);
             const funcreg = self.allocReg(); // base+1
-            if (m.computed) {
+            if (m.property.kind == .private_name) {
+                const pk = try self.privateKeyConst(m.property.kind.private_name, m.property.start);
+                _ = try self.emit(.{ .op = .get_private, .a = funcreg, .b = base, .c = pk });
+            } else if (m.computed) {
                 const keyreg = self.allocReg(); // base+2 (temporary)
                 try self.compileExprInto(keyreg, m.property);
                 _ = try self.emit(.{ .op = .get_elem, .a = funcreg, .b = base, .c = keyreg });
@@ -1940,10 +2091,28 @@ pub const Compiler = struct {
     /// Lower a class to a constructor function + prototype/static members.
     /// `extends` wires both prototype chains and provides `super` via synthetic
     /// bindings (`\x00super_ctor` / `\x00super_proto`) that member closures
-    /// capture. Class fields are unsupported (compile error).
+    /// capture. Private members (`#name`) resolve to hidden per-object keys.
     fn compileClass(self: *Compiler, dst: u32, cls: ast.Class, pos: u32) CompileError!void {
         try self.pushBlock();
         defer self.popBlock();
+
+        // Push this class's private-name scope (active while compiling every
+        // member body, so `this.#x` resolves), popped when the class is done.
+        {
+            const class_id = self.private_class_seq;
+            self.private_class_seq += 1;
+            var scope: PrivateScope = .{};
+            for (cls.members) |m| {
+                if (m.kind != .property) continue;
+                const prop = m.kind.property;
+                if (prop.key.kind != .private_name) continue;
+                const name = prop.key.kind.private_name;
+                if (scope.names.contains(name)) continue; // get/set pairs share one key
+                try scope.names.put(self.arena, name, try self.makePrivateKey(class_id, name));
+            }
+            try self.private_scopes.append(self.gpa, scope);
+        }
+        defer _ = self.private_scopes.pop();
 
         // Superclass bindings, captured by member closures for `super`.
         if (cls.super_class) |sc| {
@@ -1958,14 +2127,16 @@ pub const Compiler = struct {
             self.freeTo(r);
         }
 
-        // Instance fields (kind == .init, non-static) initialize inside the
-        // constructor, in declaration order.
-        var instance_fields: std.ArrayList(*Node) = .empty;
-        defer instance_fields.deinit(self.gpa);
+        // Instance elements installed per-object in the constructor prologue:
+        // public/private fields and private methods/accessors (public methods
+        // live on the prototype, so they're excluded here).
+        var instance_elements: std.ArrayList(*Node) = .empty;
+        defer instance_elements.deinit(self.gpa);
         for (cls.members) |m| {
             if (m.kind != .property) continue;
             const prop = m.kind.property;
-            if (prop.kind == .init and !prop.is_static) try instance_fields.append(self.gpa, m);
+            if (prop.is_static) continue;
+            if (prop.kind == .init or isPrivateMember(prop)) try instance_elements.append(self.gpa, m);
         }
 
         // The constructor (or an empty default one).
@@ -1977,14 +2148,14 @@ pub const Compiler = struct {
                 std.mem.eql(u8, prop.key.kind.ident, "constructor"))
             {
                 const f = (prop.value orelse return self.fail("malformed constructor", m.start)).kind.function;
-                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, instance_fields.items, self.fs);
+                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, instance_elements.items, self.fs);
                 break;
             }
         }
         if (ctor_block == null) {
             const empty_body = try self.arena.create(Node);
             empty_body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = &.{} } };
-            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, empty_body, false, false, false, true, instance_fields.items, self.fs);
+            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, empty_body, false, false, false, true, instance_elements.items, self.fs);
         }
         const ctor_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, ctor_block.?);
@@ -2008,14 +2179,17 @@ pub const Compiler = struct {
             self.freeTo(t);
         }
 
-        // Prototype / static members.
+        // Prototype / static members. Private instance members were installed
+        // per-object in the constructor prologue, so they're skipped here.
         for (cls.members) |m| {
             if (m.kind != .property) continue;
             const prop = m.kind.property;
             if (prop.kind == .method and !prop.computed and prop.key.kind == .ident and
                 std.mem.eql(u8, prop.key.kind.ident, "constructor")) continue;
+            if (isPrivateMember(prop) and !prop.is_static) continue; // done in ctor
+
             if (prop.kind == .init) {
-                if (!prop.is_static) continue; // instance fields ran in the ctor
+                if (!prop.is_static) continue; // public instance field: done in ctor
                 // Static field: the initializer runs now with `this` = the
                 // constructor (compiled as an expression-body closure).
                 const vreg = self.allocReg();
@@ -2032,7 +2206,9 @@ pub const Compiler = struct {
                 } else {
                     _ = try self.emit(.{ .op = .load_undefined, .a = vreg });
                 }
-                if (prop.computed) {
+                if (isPrivateMember(prop)) {
+                    _ = try self.emit(.{ .op = .def_pfield, .a = dst, .b = try self.privateKeyConst(prop.key.kind.private_name, m.start), .c = vreg });
+                } else if (prop.computed) {
                     const k = self.allocReg();
                     try self.compileExprInto(k, prop.key);
                     _ = try self.emit(.{ .op = .set_elem, .a = dst, .b = k, .c = vreg });
@@ -2053,6 +2229,19 @@ pub const Compiler = struct {
             try self.fs.children.append(self.gpa, child);
             const fr = self.allocReg();
             _ = try self.emit(.{ .op = .new_closure, .a = fr, .b = child_idx });
+
+            // Static private method/accessor: install on the constructor itself.
+            if (isPrivateMember(prop)) {
+                const pk = try self.privateKeyConst(prop.key.kind.private_name, m.start);
+                _ = try self.emit(.{ .op = switch (prop.kind) {
+                    .method => .def_pmethod,
+                    .get => .def_pget,
+                    .set => .def_pset,
+                    else => return self.fail("unsupported class member", m.start),
+                }, .a = dst, .b = pk, .c = fr });
+                self.freeTo(fr);
+                continue;
+            }
 
             const target: u32 = if (prop.is_static) dst else proto_reg;
             switch (prop.kind) {
@@ -2274,6 +2463,7 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
         .source = source,
         .fs = undefined,
     };
+    defer c.private_scopes.deinit(gpa);
 
     const body = program.kind.program.body;
     // Wrap the script body as a function with no params.

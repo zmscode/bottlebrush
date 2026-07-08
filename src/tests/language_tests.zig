@@ -496,3 +496,91 @@ test "$262 host object" {
     );
     try std.testing.expectEqual(@as(f64, 1), v.asNumber());
 }
+
+test "private class members" {
+    // Instance fields (with and without initializer), read/write, methods.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class Counter {
+        \\  #count = 0;
+        \\  #step;
+        \\  constructor(s) { this.#step = s; }
+        \\  inc() { this.#count += this.#step; return this.#count; }
+        \\  get value() { return this.#count; }
+        \\}
+        \\var c = new Counter(5);
+        \\return (c.inc() === 5 && c.inc() === 10 && c.value === 10) ? 1 : 0;
+    ));
+    // Private methods, and calling one from another.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class A {
+        \\  #secret() { return 42; }
+        \\  reveal() { return this.#secret(); }
+        \\}
+        \\return new A().reveal() === 42 ? 1 : 0;
+    ));
+    // Private accessors.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class Box {
+        \\  #v = 0;
+        \\  get #inner() { return this.#v; }
+        \\  set #inner(x) { this.#v = x * 2; }
+        \\  run() { this.#inner = 5; return this.#inner; }
+        \\}
+        \\return new Box().run() === 10 ? 1 : 0;
+    ));
+    // Static private field + method + update.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class Reg {
+        \\  static #n = 0;
+        \\  constructor() { Reg.#n++; }
+        \\  static count() { return Reg.#n; }
+        \\}
+        \\new Reg(); new Reg(); new Reg();
+        \\return Reg.count() === 3 ? 1 : 0;
+    ));
+    // Brand check `#x in obj`.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class C {
+        \\  #brand = 1;
+        \\  static has(o) { return #brand in o; }
+        \\}
+        \\return (C.has(new C()) && !C.has({}) && !C.has(null === null ? {} : 0)) ? 1 : 0;
+    ));
+    // Accessing a private member an object never received throws TypeError.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class C {
+        \\  #x = 1;
+        \\  static read(o) { return o.#x; }
+        \\}
+        \\try { C.read({}); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // Writing to a private method throws.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class C {
+        \\  #m() {}
+        \\  static clobber(o) { o.#m = 1; }
+        \\  static run() { try { C.clobber(new C()); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; } }
+        \\}
+        \\return C.run();
+    ));
+    // Two classes with the same private name don't collide.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class A { #x = "a"; getA() { return this.#x; } }
+        \\class B { #x = "b"; getB() { return this.#x; } static hasA(o) { return #x in o; } }
+        \\var a = new A(), b = new B();
+        \\return (a.getA() === "a" && b.getB() === "b" && B.hasA(b) && !B.hasA(a)) ? 1 : 0;
+    ));
+    // Private members are invisible to enumeration and normal access.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class C { #hidden = 1; pub = 2; }
+        \\var c = new C();
+        \\return (Object.keys(c).length === 1 && Object.keys(c)[0] === "pub" && c["#hidden"] === undefined) ? 1 : 0;
+    ));
+    // Private field in derived class alongside super().
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class Base { constructor() { this.base = 1; } }
+        \\class Sub extends Base { #own = 2; constructor() { super(); } total() { return this.base + this.#own; } }
+        \\return new Sub().total() === 3 ? 1 : 0;
+    ));
+}

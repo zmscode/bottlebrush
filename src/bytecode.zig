@@ -86,6 +86,16 @@ pub const Op = enum(u8) {
     set_prop, // a=obj reg, b=name const index, c=value reg
     def_prop, // a=obj reg, b=name const index, c=value reg  (non-enumerable define; class members)
     def_elem, // a=obj reg, b=key reg, c=value reg  (computed non-enumerable define)
+
+    // Private class members (# names). The `c`/`b` const is the resolved
+    // hidden key; access is own-only and brand-checked (TypeError if absent).
+    get_private, // a=dst, b=obj reg, c=private-key const  (PrivateGet)
+    set_private, // a=obj reg, b=private-key const, c=value reg  (PrivateSet)
+    has_private, // a=dst (bool), b=obj reg, c=private-key const  (#x in obj)
+    def_pfield, // a=obj reg, b=private-key const, c=value reg  (PrivateFieldAdd; throws if dup)
+    def_pmethod, // a=obj reg, b=private-key const, c=closure reg  (add non-writable private method)
+    def_pget, // a=obj reg, b=private-key const, c=closure reg  (add/merge private getter)
+    def_pset, // a=obj reg, b=private-key const, c=closure reg  (add/merge private setter)
     get_elem, // a=dst, b=obj reg, c=key reg
     set_elem, // a=obj reg, b=key reg, c=value reg
     delete_prop, // a=dst (bool), b=obj reg, c=name const

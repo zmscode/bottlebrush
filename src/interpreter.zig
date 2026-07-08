@@ -726,6 +726,13 @@ pub const Vm = struct {
             .get_prop => regs[inst.a] = try self.getProperty(regs[inst.b], code.constants[inst.c].string),
             .set_prop => try self.setPropertyMode(regs[inst.a], code.constants[inst.b].string, regs[inst.c], code.is_strict),
             .def_prop => try self.defineData(regs[inst.a].asObject(), code.constants[inst.b].string, regs[inst.c], true, false, true),
+            .get_private => regs[inst.a] = try self.privateGet(regs[inst.b], code.constants[inst.c].string),
+            .set_private => try self.privateSet(regs[inst.a], code.constants[inst.b].string, regs[inst.c]),
+            .has_private => regs[inst.a] = Value.fromBool(try self.privateHas(regs[inst.b], code.constants[inst.c].string)),
+            .def_pfield => try self.privateFieldAdd(regs[inst.a].asObject(), code.constants[inst.b].string, regs[inst.c]),
+            .def_pmethod => try self.privateMethodAdd(regs[inst.a].asObject(), code.constants[inst.b].string, regs[inst.c]),
+            .def_pget => try self.privateAccessorAdd(regs[inst.a].asObject(), code.constants[inst.b].string, regs[inst.c], true),
+            .def_pset => try self.privateAccessorAdd(regs[inst.a].asObject(), code.constants[inst.b].string, regs[inst.c], false),
             .def_elem => {
                 const key = try self.toPropertyKey(regs[inst.b]);
                 defer self.gpa.free(key);
@@ -1465,6 +1472,66 @@ pub const Vm = struct {
         const gop = try obj.properties.getOrPut(self.gpa, key);
         if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, key);
         gop.value_ptr.* = .{ .value = value, .writable = w, .enumerable = e, .configurable = c, .is_accessor = false };
+    }
+
+    // ---- private class members (# names) -----------------------------------
+    //
+    // A private element is a per-object property stored under a hidden,
+    // class-unique key (encoded `\x00P<classid>\x00#name`). These keys are never
+    // produced by ordinary property access or enumeration, so private elements
+    // are invisible except through the dedicated private opcodes. Access is
+    // own-only (no prototype walk) and brand-checked: touching a private member
+    // an object never received is a TypeError.
+
+    pub fn privateGet(self: *Vm, base: Value, key: []const u8) Error!Value {
+        if (!base.isObject()) return self.throwTypeError("cannot read a private member from a non-object");
+        const desc = base.asObject().properties.get(key) orelse
+            return self.throwTypeError("cannot read private member from an object whose class did not declare it");
+        if (desc.is_accessor) {
+            const getter = desc.get orelse return self.throwTypeError("private member was defined without a getter");
+            return self.callValue(getter, base, &.{});
+        }
+        return desc.value;
+    }
+
+    pub fn privateSet(self: *Vm, base: Value, key: []const u8, v: Value) Error!void {
+        if (!base.isObject()) return self.throwTypeError("cannot write a private member to a non-object");
+        const desc = base.asObject().properties.getPtr(key) orelse
+            return self.throwTypeError("cannot write private member to an object whose class did not declare it");
+        if (desc.is_accessor) {
+            const setter = desc.set orelse return self.throwTypeError("private member was defined without a setter");
+            _ = try self.callValue(setter, base, &.{v});
+            return;
+        }
+        if (!desc.writable) return self.throwTypeError("cannot write to a private method");
+        desc.value = v;
+    }
+
+    pub fn privateHas(self: *Vm, base: Value, key: []const u8) Error!bool {
+        // `#x in obj`: the right operand must be an object.
+        if (!base.isObject()) return self.throwTypeError("cannot use 'in' to test a private member on a non-object");
+        return base.asObject().properties.contains(key);
+    }
+
+    pub fn privateFieldAdd(self: *Vm, obj: *gc.Object, key: []const u8, v: Value) Error!void {
+        if (obj.properties.contains(key)) {
+            return self.throwTypeError("cannot initialize the same private member twice on an object");
+        }
+        try self.defineData(obj, key, v, true, false, false); // writable, non-enumerable, non-configurable
+    }
+
+    pub fn privateMethodAdd(self: *Vm, obj: *gc.Object, key: []const u8, closure: Value) Error!void {
+        // Non-writable: `obj.#m = x` throws. Added once per object.
+        try self.defineData(obj, key, closure, false, false, false);
+    }
+
+    pub fn privateAccessorAdd(self: *Vm, obj: *gc.Object, key: []const u8, fnv: Value, is_get: bool) Error!void {
+        const gop = try obj.properties.getOrPut(self.gpa, key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.gpa.dupe(u8, key);
+            gop.value_ptr.* = .{ .is_accessor = true, .get = null, .set = null, .enumerable = false, .configurable = false, .writable = false };
+        }
+        if (is_get) gop.value_ptr.get = fnv else gop.value_ptr.set = fnv;
     }
 
     /// [[Get]] on a value: walk the prototype chain; invoke getters.
