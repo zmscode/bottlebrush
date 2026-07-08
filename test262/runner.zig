@@ -32,6 +32,10 @@ const Runner = struct {
     includes: *const std.StringHashMapUnmanaged([]const u8),
     sta_src: []const u8,
     assert_src: []const u8,
+    /// Scratch: the reason the most recent test failed (for trace_files),
+    /// filled by runVariant, read by the worker loop.
+    fail_reason: [200]u8 = undefined,
+    fail_reason_len: usize = 0,
 
     /// Features the engine doesn't implement; tests requiring them SKIP.
     const unsupported_features = [_][]const u8{
@@ -51,6 +55,7 @@ const Runner = struct {
 
     /// Run one test file to an outcome.
     fn classify(self: *Runner, source: []const u8, meta: frontmatter.Meta) report.Outcome {
+        self.fail_reason_len = 0; // clear any prior test's reason
         if (unsupportedFeature(meta)) |f| {
             if (trace_skips) std.debug.print("SKIP feature:{s}\n", .{f});
             return .skip;
@@ -82,6 +87,7 @@ const Runner = struct {
         switch (result) {
             .ok => |*tree| {
                 tree.deinit();
+                self.setReason("parse-negative: expected SyntaxError, parsed OK", .{});
                 return .fail; // expected a SyntaxError, but it parsed
             },
             .syntax_error => return .pass,
@@ -148,7 +154,11 @@ const Runner = struct {
                 defer if (name) |n| self.gpa.free(n);
                 if (expected_error) |want| {
                     // Negative test: the thrown error's type must match.
-                    if (name) |n| return if (std.mem.eql(u8, n, want)) .pass else .fail;
+                    if (name) |n| {
+                        if (std.mem.eql(u8, n, want)) return .pass;
+                        self.setReason("negative: wanted {s}, got {s}", .{ want, n });
+                        return .fail;
+                    }
                     return .fail;
                 }
                 // Positive test threw. A ReferenceError almost always means the
@@ -167,7 +177,7 @@ const Runner = struct {
                 if (trace_files) {
                     const msg = vm.pendingErrorMessage(self.gpa);
                     defer if (msg) |m| self.gpa.free(m);
-                    std.debug.print("FAILMSG [{s}] {s}\n", .{ name orelse "?", msg orelse "?" });
+                    self.setReason("threw {s}: {s}", .{ name orelse "?", msg orelse "?" });
                 }
                 return .fail;
             },
@@ -181,7 +191,16 @@ const Runner = struct {
             },
         };
         // Completed without throwing.
-        return if (expected_error != null) .fail else .pass;
+        if (expected_error != null) {
+            self.setReason("expected {s}, did not throw", .{expected_error.?});
+            return .fail;
+        }
+        return .pass;
+    }
+
+    fn setReason(self: *Runner, comptime fmt: []const u8, a: anytype) void {
+        const s = std.fmt.bufPrint(&self.fail_reason, fmt, a) catch self.fail_reason[0..0];
+        self.fail_reason_len = s.len;
     }
 
     /// Concatenate: [use strict] + sta.js + assert.js + includes + test source.
@@ -260,7 +279,10 @@ fn workerMain(w: *Worker) void {
         defer meta.deinit(gpa);
 
         const outcome = runner.classify(source, meta);
-        if (trace_files and outcome == .fail) std.debug.print("FAIL {s}\n", .{rel});
+        if (trace_files and outcome == .fail) {
+            const reason = if (runner.fail_reason_len > 0) runner.fail_reason[0..runner.fail_reason_len] else "assertion mismatch";
+            std.debug.print("FAILCASE\t{s}\t{s}\n", .{ rel, reason });
+        }
         w.board.record(outcome);
     }
 }
