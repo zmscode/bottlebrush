@@ -15,6 +15,7 @@ const castVm = support_mod.castVm;
 const isCallable = support_mod.isCallable;
 const sameValueZero = support_mod.sameValueZero;
 const thisCollection = support_mod.thisCollection;
+const toBoolean = support_mod.toBoolean;
 
 /// Index of `key` in a Map's interleaved entries (the key slot), or null.
 pub fn mapFind(map: *gc.Object, key: Value) ?usize {
@@ -190,10 +191,33 @@ fn requireObjectKey(vm: *Vm, v: Value) Error!void {
 }
 
 pub fn nativeWeakMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
     const vm = castVm(ctx);
     if (!this.isObject()) return vm.throwTypeError("constructor WeakMap requires 'new'");
-    this.asObject().collection = .weak_map;
+    const map = this.asObject();
+    map.collection = .weak_map;
+    // Optional iterable of [key, value] entries.
+    const init_v = argAt(args, 0);
+    if (!init_v.isNullish()) {
+        const iter = try vm.getIterator(init_v);
+        try vm.protect(iter);
+        defer vm.unprotect();
+        while (true) {
+            const r = try vm.iteratorNext(iter);
+            if (toBoolean(try vm.getProperty(r, "done"))) break;
+            const entry = try vm.getProperty(r, "value");
+            try vm.protect(entry);
+            defer vm.unprotect();
+            const k = try vm.getProperty(entry, "0");
+            const val = try vm.getProperty(entry, "1");
+            try requireObjectKey(vm, k);
+            if (mapFind(map, k)) |idx| {
+                map.elements.items[idx + 1] = val;
+            } else {
+                try map.elements.append(vm.gpa, k);
+                try map.elements.append(vm.gpa, val);
+            }
+        }
+    }
     return this;
 }
 
@@ -238,10 +262,23 @@ pub fn nativeWeakMapDelete(ctx: *anyopaque, this: Value, args: []const Value) Er
 }
 
 pub fn nativeWeakSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = args;
     const vm = castVm(ctx);
     if (!this.isObject()) return vm.throwTypeError("constructor WeakSet requires 'new'");
-    this.asObject().collection = .weak_set;
+    const set = this.asObject();
+    set.collection = .weak_set;
+    const init_v = argAt(args, 0);
+    if (!init_v.isNullish()) {
+        const iter = try vm.getIterator(init_v);
+        try vm.protect(iter);
+        defer vm.unprotect();
+        while (true) {
+            const r = try vm.iteratorNext(iter);
+            if (toBoolean(try vm.getProperty(r, "done"))) break;
+            const v = try vm.getProperty(r, "value");
+            try requireObjectKey(vm, v);
+            if (setFind(set, v) == null) try set.elements.append(vm.gpa, v);
+        }
+    }
     return this;
 }
 
