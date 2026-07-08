@@ -804,3 +804,39 @@ test "function and method .name" {
         \\return (d.writable === false && d.configurable === true && d.enumerable === false) ? 1 : 0;
     ));
 }
+
+test "RegExp exec protocol (Symbol methods honor custom exec)" {
+    // A custom `exec` on a RegExp is used by String.prototype.match.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = /x/;
+        \\var calls = 0;
+        \\re.exec = function () { calls++; return calls === 1 ? ["HIT"] : null; };
+        \\var m = "zzz".match(re);
+        \\return (calls >= 1 && m[0] === "HIT") ? 1 : 0;
+    ));
+    // Symbol.search returns the result's `index` and restores lastIndex.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = /b/;
+        \\re.lastIndex = 5;
+        \\var idx = "aabaa".search(re);
+        \\return (idx === 2 && re.lastIndex === 5) ? 1 : 0;
+    ));
+    // A plain object with a Symbol.replace is honored by String.prototype.replace.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var pat = {};
+        \\pat[Symbol.replace] = function (s, r) { return "[" + s + "|" + r + "]"; };
+        \\return "abc".replace(pat, "X") === "[abc|X]" ? 1 : 0;
+    ));
+    // Symbol.match on a non-object receiver throws TypeError.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\try { RegExp.prototype[Symbol.match].call(5, "x"); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // Custom exec whose result isn't object/null throws TypeError.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = /x/g;
+        \\re.exec = function () { return 42; };
+        \\try { "x".match(re); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+}

@@ -14,6 +14,8 @@ const regexp_mod = @import("regexp.zig");
 const nativeRegExpExec = regexp_mod.nativeRegExpExec;
 const support_mod = @import("../support.zig");
 const toIntegerOrInfinity = support_mod.toIntegerOrInfinity;
+const toBoolean = support_mod.toBoolean;
+const sameValue = support_mod.sameValue;
 const argAt = support_mod.argAt;
 const castVm = support_mod.castVm;
 const clampIndex = support_mod.clampIndex;
@@ -840,44 +842,251 @@ pub fn nativeStringReplaceAll(ctx: *anyopaque, this: Value, args: []const Value)
 // ---- RegExp.prototype pattern-protocol methods ------------------------------
 
 /// Validate the receiver of a RegExp @@-method and coerce the subject string.
-fn regexProtocolThis(vm: *Vm, this: Value, args: []const Value) Error!struct { rx: *gc.Object, sv: Value } {
-    if (!this.isObject() or this.asObject().regex == null) {
-        return vm.throwTypeError("receiver is not a RegExp");
+/// RegExpExec(R, S): drive a user-overridden `exec` when present (its result
+/// must be an object or null), else fall back to the builtin exec.
+fn regExpExec(vm: *Vm, rx: Value, subject: Value) Error!Value {
+    const exec = try vm.getProperty(rx, "exec");
+    if (isCallable(exec)) {
+        const r = try vm.callValue(exec, rx, &.{subject});
+        if (!r.isObject() and !r.isNull()) return vm.throwTypeError("exec method must return an object or null");
+        return r;
     }
-    const sv = try coerceToString(vm, argAt(args, 0));
-    return .{ .rx = this.asObject(), .sv = sv };
+    if (!rx.isObject() or rx.asObject().regex == null) {
+        return vm.throwTypeError("receiver does not have a regular-expression matcher");
+    }
+    return nativeRegExpExec(@ptrCast(vm), rx, &.{subject});
+}
+
+/// AdvanceStringIndex: +1, or +2 across a surrogate pair when in unicode mode.
+fn advanceStringIndex(units: []const u16, index: usize, unicode: bool) usize {
+    if (!unicode or index + 1 >= units.len) return index + 1;
+    const hi = units[index];
+    const lo = units[index + 1];
+    if (hi >= 0xd800 and hi <= 0xdbff and lo >= 0xdc00 and lo <= 0xdfff) return index + 2;
+    return index + 1;
+}
+
+/// Whether `rx` is a plain built-in RegExp (real matcher + unshadowed `exec`),
+/// so the fast internal path is observably equivalent to the exec protocol.
+fn isPlainRegExp(vm: *Vm, rx: Value) Error!bool {
+    if (!rx.isObject() or rx.asObject().regex == null) return false;
+    const exec = try vm.getProperty(rx, "exec");
+    if (!exec.isObject()) return false;
+    // The unmodified exec lives on RegExp.prototype.
+    const own = rx.asObject().properties.get("exec");
+    return own == null; // no own override; prototype's builtin exec
 }
 
 pub fn nativeRegExpSymbolMatch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const p = try regexProtocolThis(vm, this, args);
-    try vm.protect(p.sv);
+    if (!this.isObject()) return vm.throwTypeError("Symbol.match called on a non-object");
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
     defer vm.unprotect();
-    return matchRegexImpl(vm, p.rx, p.sv);
+
+    // Fast path: an unmodified built-in RegExp.
+    if (try isPlainRegExp(vm, this)) return matchRegexImpl(vm, this.asObject(), sv);
+
+    const global = toBoolean(try vm.getProperty(this, "global"));
+    if (!global) return regExpExec(vm, this, sv);
+
+    const unicode = toBoolean(try vm.getProperty(this, "unicode"));
+    try vm.setProperty(this, "lastIndex", Value.fromNumber(0));
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    var any = false;
+    while (true) {
+        try vm.checkBudget();
+        const r = try regExpExec(vm, this, sv);
+        if (r.isNull()) break;
+        any = true;
+        const match_str = try vm.toStringVal(try vm.getProperty(r, "0"));
+        try vm.arrayAppend(result, match_str);
+        if (match_str.asString().units.len == 0) {
+            const li: usize = @intFromFloat(@max(0, try toIntegerOrInfinity(vm, try vm.getProperty(this, "lastIndex"))));
+            try vm.setProperty(this, "lastIndex", Value.fromNumber(@floatFromInt(advanceStringIndex(units, li, unicode))));
+        }
+    }
+    return if (any) Value.fromObject(result) else Value.null_value;
 }
 
 pub fn nativeRegExpSymbolSearch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const p = try regexProtocolThis(vm, this, args);
-    try vm.protect(p.sv);
+    if (!this.isObject()) return vm.throwTypeError("Symbol.search called on a non-object");
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
     defer vm.unprotect();
-    return searchRegexImpl(vm, p.rx, p.sv);
+    // search does not mutate lastIndex: save, run, restore.
+    const previous = try vm.getProperty(this, "lastIndex");
+    if (!sameValue(previous, Value.fromNumber(0))) try vm.setProperty(this, "lastIndex", Value.fromNumber(0));
+    const result = try regExpExec(vm, this, sv);
+    try vm.protect(result);
+    defer vm.unprotect();
+    const current = try vm.getProperty(this, "lastIndex");
+    if (!sameValue(current, previous)) try vm.setProperty(this, "lastIndex", previous);
+    if (result.isNull()) return Value.fromNumber(-1);
+    return vm.getProperty(result, "index");
 }
 
 pub fn nativeRegExpSymbolReplace(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const p = try regexProtocolThis(vm, this, args);
-    try vm.protect(p.sv);
+    if (!this.isObject()) return vm.throwTypeError("Symbol.replace called on a non-object");
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
     defer vm.unprotect();
-    return replaceRegexImpl(vm, p.rx, p.sv, argAt(args, 1));
+    if (try isPlainRegExp(vm, this)) return replaceRegexImpl(vm, this.asObject(), sv, argAt(args, 1));
+    return replaceExecImpl(vm, this, sv, argAt(args, 1));
 }
 
 pub fn nativeRegExpSymbolSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const p = try regexProtocolThis(vm, this, args);
-    try vm.protect(p.sv);
+    if (!this.isObject()) return vm.throwTypeError("Symbol.split called on a non-object");
+    const sv = try coerceToString(vm, argAt(args, 0));
+    try vm.protect(sv);
     defer vm.unprotect();
     const limit_v = argAt(args, 1);
     const lim: u32 = if (limit_v.isUndefined()) std.math.maxInt(u32) else try vm.toUint32(limit_v);
-    return splitRegexImpl(vm, p.rx.regex.?, p.sv, lim);
+    if (this.asObject().regex == null) return vm.throwTypeError("Symbol.split requires a RegExp matcher");
+    return splitRegexImpl(vm, this.asObject().regex.?, sv, lim);
+}
+
+/// @@replace via the exec protocol (custom `exec` / subclasses). Reads each
+/// match's fields with [[Get]] and expands the replacement per GetSubstitution.
+fn replaceExecImpl(vm: *Vm, rx: Value, sv: Value, rep: Value) Error!Value {
+    const units = sv.asString().units;
+    const rep_is_fn = isCallable(rep);
+    const global = toBoolean(try vm.getProperty(rx, "global"));
+    const unicode = if (global) toBoolean(try vm.getProperty(rx, "unicode")) else false;
+    if (global) try vm.setProperty(rx, "lastIndex", Value.fromNumber(0));
+
+    // Collect every match object first (protected), then build the result.
+    const results = try vm.newArray(0);
+    try vm.protect(Value.fromObject(results));
+    defer vm.unprotect();
+    while (true) {
+        try vm.checkBudget();
+        const r = try regExpExec(vm, rx, sv);
+        if (r.isNull()) break;
+        try vm.arrayAppend(results, r);
+        if (!global) break;
+        const match_str = try vm.toStringVal(try vm.getProperty(r, "0"));
+        if (match_str.asString().units.len == 0) {
+            const li: usize = @intFromFloat(@max(0, try toIntegerOrInfinity(vm, try vm.getProperty(rx, "lastIndex"))));
+            try vm.setProperty(rx, "lastIndex", Value.fromNumber(@floatFromInt(advanceStringIndex(units, li, unicode))));
+        }
+    }
+
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(vm.gpa);
+    var next: usize = 0;
+    var ri: u32 = 0;
+    while (ri < results.array_length) : (ri += 1) {
+        const r = Vm.arrayGetOwn(results, ri).?;
+        const ngroups_f = try toIntegerOrInfinity(vm, try vm.getProperty(r, "length"));
+        const ngroups: usize = if (ngroups_f < 1) 0 else @intFromFloat(@min(ngroups_f - 1, 1000));
+        const matched = try vm.toStringVal(try vm.getProperty(r, "0"));
+        try vm.protect(matched);
+        defer vm.unprotect();
+        const idx_f = try toIntegerOrInfinity(vm, try vm.getProperty(r, "index"));
+        const position: usize = @intFromFloat(@max(0, @min(idx_f, @as(f64, @floatFromInt(units.len)))));
+
+        // Gather captures as spans over an assembled buffer would be complex;
+        // instead expand the replacement directly here.
+        if (position < next) continue;
+        try out.appendSlice(vm.gpa, units[next..position]);
+        if (rep_is_fn) {
+            var argv: std.ArrayList(Value) = .empty;
+            defer argv.deinit(vm.gpa);
+            try argv.append(vm.gpa, matched);
+            var g: usize = 1;
+            while (g <= ngroups) : (g += 1) {
+                var b: [24]u8 = undefined;
+                const cap = try vm.getProperty(r, std.fmt.bufPrint(&b, "{d}", .{g}) catch unreachable);
+                try argv.append(vm.gpa, cap);
+            }
+            try argv.append(vm.gpa, Value.fromNumber(@floatFromInt(position)));
+            try argv.append(vm.gpa, sv);
+            const rv = try vm.callValue(rep, Value.undefined_value, argv.items);
+            const rs = try vm.toStringVal(rv);
+            try out.appendSlice(vm.gpa, rs.asString().units);
+        } else {
+            const rs = try vm.toStringVal(rep);
+            try vm.protect(rs);
+            defer vm.unprotect();
+            try expandExecSubstitution(vm, &out, rs.asString().units, units, r, matched.asString().units, position, ngroups);
+        }
+        next = position + matched.asString().units.len;
+    }
+    if (next < units.len) try out.appendSlice(vm.gpa, units[next..]);
+    return vm.makeStringFromUtf16(out.items);
+}
+
+/// GetSubstitution using [[Get]]-fetched captures from a match result.
+fn expandExecSubstitution(
+    vm: *Vm,
+    out: *std.ArrayList(u16),
+    rep: []const u16,
+    units: []const u16,
+    result: Value,
+    matched: []const u16,
+    position: usize,
+    ngroups: usize,
+) Error!void {
+    var i: usize = 0;
+    while (i < rep.len) {
+        const c = rep[i];
+        if (c != '$' or i + 1 >= rep.len) {
+            try out.append(vm.gpa, c);
+            i += 1;
+            continue;
+        }
+        switch (rep[i + 1]) {
+            '$' => {
+                try out.append(vm.gpa, '$');
+                i += 2;
+            },
+            '&' => {
+                try out.appendSlice(vm.gpa, matched);
+                i += 2;
+            },
+            '`' => {
+                try out.appendSlice(vm.gpa, units[0..position]);
+                i += 2;
+            },
+            '\'' => {
+                const end = @min(position + matched.len, units.len);
+                try out.appendSlice(vm.gpa, units[end..]);
+                i += 2;
+            },
+            '0'...'9' => {
+                var num: usize = rep[i + 1] - '0';
+                var consumed: usize = 2;
+                if (i + 2 < rep.len and rep[i + 2] >= '0' and rep[i + 2] <= '9') {
+                    const two = num * 10 + (rep[i + 2] - '0');
+                    if (two >= 1 and two <= ngroups) {
+                        num = two;
+                        consumed = 3;
+                    }
+                }
+                if (num >= 1 and num <= ngroups) {
+                    var b: [24]u8 = undefined;
+                    const cap = try vm.getProperty(result, std.fmt.bufPrint(&b, "{d}", .{num}) catch unreachable);
+                    if (!cap.isUndefined()) {
+                        const cs = try vm.toStringVal(cap);
+                        try out.appendSlice(vm.gpa, cs.asString().units);
+                    }
+                    i += consumed;
+                } else {
+                    try out.append(vm.gpa, '$');
+                    i += 1;
+                }
+            },
+            else => {
+                try out.append(vm.gpa, '$');
+                i += 1;
+            },
+        }
+    }
 }
