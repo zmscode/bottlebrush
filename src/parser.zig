@@ -47,6 +47,12 @@ pub const Parser = struct {
     /// errors here. Cleared while parsing a nested non-arrow function body
     /// (which establishes its own `arguments`/super), kept through arrows.
     in_field_init: bool = false,
+    /// Inside an async function body: `await` is reserved (not an identifier).
+    in_async: bool = false,
+    /// Inside a generator body: `yield` is reserved (not an identifier).
+    in_generator: bool = false,
+    /// Scratch buffer for the decoded spelling of an escaped identifier.
+    name_buf: [64]u8 = undefined,
     diag: ?Diagnostic = null,
 
     const Snapshot = struct {
@@ -500,11 +506,10 @@ pub const Parser = struct {
         } else if (!is_expr) {
             return self.fail("function declaration requires a name");
         }
-        const saved_fi = self.in_field_init;
-        self.in_field_init = false; // a nested function has its own arguments/super
+        const saved_ctx = self.enterFn(flags);
         const params = try self.parseParams();
         const body = try self.parseBlock();
-        self.in_field_init = saved_fi;
+        self.exitFn(saved_ctx);
         const func: ast.Function = .{ .name = name, .params = params, .body = body, .flags = flags };
         return self.node(start, self.prev_end, if (is_expr)
             .{ .function = func }
@@ -715,11 +720,10 @@ pub const Parser = struct {
 
         if (self.at(.l_paren)) {
             // Method (or get/set/constructor).
-            const saved_fi = self.in_field_init;
-            self.in_field_init = false;
+            const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
             const body = try self.parseBlock();
-            self.in_field_init = saved_fi;
+            self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
                 .params = params,
@@ -776,7 +780,7 @@ pub const Parser = struct {
     fn parseBindingTarget(self: *Parser) ParseError!*Node {
         switch (self.cur.kind) {
             .identifier => {
-                try self.checkStrictBindingName(self.cur.lexeme(self.source));
+                try self.checkStrictBindingName(self.canonicalName(self.cur));
                 return self.parseIdentifier();
             },
             .l_bracket => return self.parseArrayPattern(),
@@ -902,16 +906,58 @@ pub const Parser = struct {
         }
     }
 
-    fn parseIdentifier(self: *Parser) ParseError!*Node {
-        if (!self.at(.identifier)) return self.fail("expected identifier");
-        const start = self.cur.start;
-        const name = self.cur.lexeme(self.source);
-        // A class field initializer may not reference `arguments`.
+    /// The decoded spelling of an identifier token (escapes resolved). For a
+    /// plain identifier this is just its lexeme.
+    fn canonicalName(self: *Parser, tok: Token) []const u8 {
+        const raw = tok.lexeme(self.source);
+        if (!tok.escaped) return raw;
+        return Lexer.decodeIdentifier(raw, &self.name_buf) orelse raw;
+    }
+
+    /// Context-sensitive identifier-reference / binding-name validation:
+    /// an escaped ReservedWord is illegal, `await` is reserved in async code,
+    /// and `yield` is reserved in generators and in strict mode.
+    fn checkIdentifierName(self: *Parser, tok: Token) ParseError!void {
+        const name = self.canonicalName(tok);
+        if (tok.escaped and token.keywordKind(name) != .identifier) {
+            return self.fail("reserved word must not contain a unicode escape");
+        }
+        if (self.in_async and std.mem.eql(u8, name, "await")) {
+            return self.fail("'await' is reserved inside an async function");
+        }
+        if ((self.in_generator or self.strict) and std.mem.eql(u8, name, "yield")) {
+            return self.fail("'yield' is reserved here");
+        }
         if (self.in_field_init and std.mem.eql(u8, name, "arguments")) {
             return self.fail("'arguments' is not allowed in a class field initializer");
         }
+    }
+
+    const FnCtx = struct { fi: bool, is_async: bool, is_gen: bool };
+
+    /// Enter a (non-arrow) function body: reset field-init state and set the
+    /// await/yield reservation from the function's own async/generator kind.
+    fn enterFn(self: *Parser, flags: ast.FunctionFlags) FnCtx {
+        const saved = FnCtx{ .fi = self.in_field_init, .is_async = self.in_async, .is_gen = self.in_generator };
+        self.in_field_init = false;
+        self.in_async = flags.is_async;
+        self.in_generator = flags.is_generator;
+        return saved;
+    }
+    fn exitFn(self: *Parser, saved: FnCtx) void {
+        self.in_field_init = saved.fi;
+        self.in_async = saved.is_async;
+        self.in_generator = saved.is_gen;
+    }
+
+    fn parseIdentifier(self: *Parser) ParseError!*Node {
+        if (!self.at(.identifier)) return self.fail("expected identifier");
+        const start = self.cur.start;
+        try self.checkIdentifierName(self.cur);
+        const name = self.canonicalName(self.cur);
+        const owned = if (self.cur.escaped) try self.arena.dupe(u8, name) else name;
         self.advance();
-        return self.node(start, self.prev_end, .{ .ident = name });
+        return self.node(start, self.prev_end, .{ .ident = owned });
     }
 
     // ---- expressions -------------------------------------------------------
@@ -1419,11 +1465,10 @@ pub const Parser = struct {
         const key = try self.parsePropertyKey(&computed, &is_private);
 
         if (self.at(.l_paren)) {
-            const saved_fi = self.in_field_init;
-            self.in_field_init = false;
+            const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
             const body = try self.parseBlock();
-            self.in_field_init = saved_fi;
+            self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
                 .params = params,

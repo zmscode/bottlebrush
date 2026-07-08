@@ -663,3 +663,41 @@ test "strict-mode reserved binding names" {
         .syntax_error => return error.UnexpectedSyntaxError,
     }
 }
+
+test "escaped keywords and async/generator context" {
+    const parser = @import("bottlebrush").parser;
+    const bad = [_][]const u8{
+        "var \\u0069f = 1;", // escaped `if` (reserved) as a binding
+        "\\u0076ar x;", // escaped `var`
+        "x = \\u0074his;", // escaped `this` as reference
+        "class C { async m() { void \\u0061wait; } }", // escaped await in async
+        "function* g() { var \\u0079ield = 1; }", // escaped yield in generator
+    };
+    for (bad) |src| {
+        var pr = try parser.parse(std.testing.allocator, src, .script);
+        switch (pr) {
+            .syntax_error => {},
+            .ok => |*a| {
+                a.deinit();
+                std.debug.print("expected SyntaxError: {s}\n", .{src});
+                return error.ExpectedSyntaxError;
+            },
+        }
+    }
+    // Escaped keywords ARE valid as property names / keys.
+    const ok = [_][]const u8{
+        "var o = { \\u0069f: 1 }; o.\\u0063lass;",
+        "var o = {}; o.\\u0066or = 1;",
+        "var \\u0066oo = 5;", // escaped non-keyword identifier
+    };
+    for (ok) |src| {
+        var pr = try parser.parse(std.testing.allocator, src, .script);
+        switch (pr) {
+            .ok => |*a| a.deinit(),
+            .syntax_error => {
+                std.debug.print("unexpected SyntaxError: {s}\n", .{src});
+                return error.UnexpectedSyntaxError;
+            },
+        }
+    }
+}

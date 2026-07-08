@@ -194,27 +194,72 @@ pub const Lexer = struct {
     }
 
     fn scanIdentifierTail(self: *Lexer, start: u32, line: u32, base_kind: Kind) Token {
+        var escaped = false;
         while (!self.eof()) {
             const c = self.peek();
             if (isIdentPart(c) or c >= 0x80) {
                 self.bump();
             } else if (c == '\\' and self.peek1() == 'u') {
                 // Unicode escape in identifier: validate shape, skip it.
+                escaped = true;
                 if (!self.consumeUnicodeEscape()) {
                     return self.fail(start, line, "invalid unicode escape in identifier");
                 }
             } else break;
         }
         if (base_kind == .private_identifier) {
-            return self.make(.private_identifier, start, line);
+            var t = self.make(.private_identifier, start, line);
+            t.escaped = escaped;
+            return t;
         }
         const text = self.source[start..self.pos];
-        // Escaped identifiers are never keywords; only match when unescaped.
-        const kind = if (std.mem.indexOfScalar(u8, text, '\\') == null)
-            token.keywordKind(text)
-        else
-            .identifier;
-        return self.make(kind, start, line);
+        if (!escaped) {
+            return self.make(token.keywordKind(text), start, line);
+        }
+        // An escaped identifier is lexically always an `Identifier` (a keyword
+        // spelled with an escape is legal as a property name; whether it's a
+        // ReservedWord violation elsewhere is the parser's context-aware call).
+        var t = self.make(.identifier, start, line);
+        t.escaped = escaped;
+        return t;
+    }
+
+    /// Decode an identifier's `\uHHHH` / `\u{H+}` escapes into `buf` (UTF-8),
+    /// yielding its canonical spelling; null if it overflows or is malformed.
+    pub fn decodeIdentifier(text: []const u8, buf: []u8) ?[]const u8 {
+        var out: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] != '\\') {
+                if (out >= buf.len) return null;
+                buf[out] = text[i];
+                out += 1;
+                i += 1;
+                continue;
+            }
+            // `\u` escape.
+            if (i + 1 >= text.len or text[i + 1] != 'u') return null;
+            i += 2;
+            var cp: u32 = 0;
+            if (i < text.len and text[i] == '{') {
+                i += 1;
+                while (i < text.len and text[i] != '}') : (i += 1) {
+                    cp = cp * 16 + (hexVal(text[i]) orelse return null);
+                }
+                if (i >= text.len) return null;
+                i += 1; // '}'
+            } else {
+                var k: usize = 0;
+                while (k < 4) : (k += 1) {
+                    if (i >= text.len) return null;
+                    cp = cp * 16 + (hexVal(text[i]) orelse return null);
+                    i += 1;
+                }
+            }
+            const n = std.unicode.utf8Encode(@intCast(cp), buf[out..]) catch return null;
+            out += n;
+        }
+        return buf[0..out];
     }
 
     /// Consume `\uHHHH` or `\u{H+}` starting at the backslash. Returns false on
@@ -621,6 +666,15 @@ fn isHexDigit(c: u8) bool {
     return isDigit(c) or (c | 0x20 >= 'a' and c | 0x20 <= 'f');
 }
 
+fn hexVal(c: u8) ?u32 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
 fn isOctalDigit(c: u8) bool {
     return c >= '0' and c <= '7';
 }
@@ -741,7 +795,18 @@ test "private identifier" {
     try testing.expectEqual(Kind.private_identifier, lx.next().kind);
 }
 
-test "escaped identifier is not a keyword" {
+test "escaped identifier lexes as an identifier and is flagged" {
+    // Lexically, an escaped keyword is an Identifier tagged `escaped`; whether
+    // it's an illegal ReservedWord is the parser's context-aware decision.
     var lx = Lexer.init("\\u0069f"); // "if" spelled with an escape
-    try testing.expectEqual(Kind.identifier, lx.next().kind);
+    const t = lx.next();
+    try testing.expectEqual(Kind.identifier, t.kind);
+    try testing.expect(t.escaped);
+}
+
+test "decodeIdentifier resolves escapes to the canonical name" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("if", Lexer.decodeIdentifier("\\u0069f", &buf).?);
+    try testing.expectEqualStrings("await", Lexer.decodeIdentifier("\\u{61}wait", &buf).?);
+    try testing.expectEqualStrings("foo", Lexer.decodeIdentifier("foo", &buf).?);
 }

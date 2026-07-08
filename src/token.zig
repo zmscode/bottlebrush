@@ -150,6 +150,10 @@ pub const Token = struct {
     /// A line terminator appeared between the previous token and this one.
     /// Drives Automatic Semicolon Insertion.
     newline_before: bool,
+    /// An identifier that contained a `\u` escape. A ReservedWord written with
+    /// an escape is illegal, and a contextual keyword (await/yield/…) spelled
+    /// with one must still be recognised by its decoded name.
+    escaped: bool = false,
 
     pub fn lexeme(self: Token, source: []const u8) []const u8 {
         return source[self.start..self.end];
