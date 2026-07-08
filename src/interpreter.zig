@@ -146,6 +146,10 @@ pub const Vm = struct {
     symbol_to_primitive_key: []const u8 = &.{},
     symbol_to_string_tag_key: []const u8 = &.{},
     symbol_has_instance_key: []const u8 = &.{},
+    symbol_match_key: []const u8 = &.{},
+    symbol_replace_key: []const u8 = &.{},
+    symbol_search_key: []const u8 = &.{},
+    symbol_split_key: []const u8 = &.{},
     iterator_proto: ?*gc.Object = null,
     generator_proto: ?*gc.Object = null,
 
@@ -163,6 +167,10 @@ pub const Vm = struct {
         if (self.symbol_to_primitive_key.len != 0) self.gpa.free(self.symbol_to_primitive_key);
         if (self.symbol_to_string_tag_key.len != 0) self.gpa.free(self.symbol_to_string_tag_key);
         if (self.symbol_has_instance_key.len != 0) self.gpa.free(self.symbol_has_instance_key);
+        if (self.symbol_match_key.len != 0) self.gpa.free(self.symbol_match_key);
+        if (self.symbol_replace_key.len != 0) self.gpa.free(self.symbol_replace_key);
+        if (self.symbol_search_key.len != 0) self.gpa.free(self.symbol_search_key);
+        if (self.symbol_split_key.len != 0) self.gpa.free(self.symbol_split_key);
         // Programs compiled by eval/Function() live as long as the VM: closures
         // created inside them keep pointing at their bytecode arenas.
         for (self.eval_programs.items) |*p| p.deinit();

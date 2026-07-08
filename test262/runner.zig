@@ -35,9 +35,9 @@ const Runner = struct {
 
     /// Features the engine doesn't implement; tests requiring them SKIP.
     const unsupported_features = [_][]const u8{
-        "Math.sumPrecise", "Symbol",          "Symbol.iterator", "Symbol.toStringTag",
-        "generators",      "async-iteration", "TypedArray",      "BigInt",
-        "Proxy",           "Reflect",         "WeakRef",         "tail-call-optimization",
+        "Math.sumPrecise", "generators", "async-iteration",
+        "TypedArray",      "BigInt",     "Proxy",
+        "Reflect",         "WeakRef",    "tail-call-optimization",
         "Float16Array",
     };
 

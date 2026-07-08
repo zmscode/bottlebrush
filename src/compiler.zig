@@ -225,12 +225,14 @@ pub const Compiler = struct {
         is_expression_body: bool,
         is_generator: bool,
         is_arrow: bool,
+        force_strict: bool,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
         var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_arrow = is_arrow };
-        // Strict mode is inherited from the enclosing function and switched on
-        // by a "use strict" directive in this body's prologue.
+        // Strict mode is inherited from the enclosing function, forced by the
+        // context (class bodies), or switched on by a "use strict" directive.
         if (parent_fs) |pf| fs.is_strict = pf.is_strict;
+        if (force_strict) fs.is_strict = true;
         if (!is_expression_body and body.kind == .block_stmt and hasUseStrictDirective(body.kind.block_stmt)) {
             fs.is_strict = true;
         }
@@ -339,7 +341,7 @@ pub const Compiler = struct {
         for (body) |stmt| {
             if (stmt.kind == .function_decl) {
                 const f = stmt.kind.function_decl;
-                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, self.fs);
+                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, false, self.fs);
                 const idx: u32 = @intCast(self.fs.children.items.len);
                 try self.fs.children.append(self.gpa, child);
                 const r = self.allocReg();
@@ -461,6 +463,14 @@ pub const Compiler = struct {
             },
             .try_stmt => |s| try self.compileTry(s),
             .labeled_stmt => |s| try self.compileStmt(s.body), // label ignored for now
+            .class_decl => |cls| {
+                const name = cls.name orelse return self.fail("class declaration requires a name", stmt.start);
+                const slot = try self.declare(name);
+                const r = self.allocReg();
+                try self.compileClass(r, cls, stmt.start);
+                _ = try self.emit(.{ .op = .init_var, .a = 0, .b = slot, .c = r });
+                self.freeTo(r);
+            },
             else => return self.fail("unsupported statement", stmt.start),
         }
     }
@@ -1139,6 +1149,9 @@ pub const Compiler = struct {
             },
             .call => |c| try self.compileCall(dst, c, node.start),
             .function => |f| try self.compileFunctionExpr(dst, f),
+            .template => |t| try self.compileTemplate(dst, t),
+            .tagged_template => |tt| try self.compileTaggedTemplate(dst, tt),
+            .class => |cls| try self.compileClass(dst, cls, node.start),
             .yield_expr => |y| try self.compileYield(dst, y),
             else => return self.fail("unsupported expression", node.start),
         }
@@ -1322,7 +1335,11 @@ pub const Compiler = struct {
     fn compileMemberLoad(self: *Compiler, dst: u32, m: anytype) CompileError!void {
         if (m.optional) return self.fail("optional chaining unsupported", 0);
         const objreg = self.allocReg();
-        try self.compileExprInto(objreg, m.object);
+        if (m.object.kind == .super_expr) {
+            // super.x reads from the parent prototype.
+            const sp = self.resolve("\x00super_proto") orelse return self.fail("'super' outside a class method", m.object.start);
+            _ = try self.emit(.{ .op = .get_var, .a = objreg, .b = sp.depth, .c = sp.slot });
+        } else try self.compileExprInto(objreg, m.object);
         if (m.computed) {
             const keyreg = self.allocReg();
             try self.compileExprInto(keyreg, m.property);
@@ -1465,7 +1482,33 @@ pub const Compiler = struct {
 
         // Call layout: base=receiver (this), base+1=callee.
         const base = self.allocReg();
-        if (c.callee.kind == .member and !c.callee.kind.member.optional) {
+        if (c.callee.kind == .super_expr) {
+            // super(...): call the parent constructor with the current `this`
+            // (approximation of derived-constructor semantics: `this` is
+            // created from the subclass prototype, then parent-initialized).
+            const sc = self.resolve("\x00super_ctor") orelse return self.fail("'super' outside a derived class", pos);
+            _ = try self.emit(.{ .op = .load_this, .a = base });
+            const funcreg = self.allocReg();
+            _ = try self.emit(.{ .op = .get_var, .a = funcreg, .b = sc.depth, .c = sc.slot });
+        } else if (c.callee.kind == .member and c.callee.kind.member.object.kind == .super_expr) {
+            // super.m(...): look the method up on the parent prototype, call
+            // it with the current `this`.
+            const m = c.callee.kind.member;
+            const sp = self.resolve("\x00super_proto") orelse return self.fail("'super' outside a class method", pos);
+            _ = try self.emit(.{ .op = .load_this, .a = base });
+            const funcreg = self.allocReg();
+            const protoreg = self.allocReg();
+            _ = try self.emit(.{ .op = .get_var, .a = protoreg, .b = sp.depth, .c = sp.slot });
+            if (m.computed) {
+                const keyreg = self.allocReg();
+                try self.compileExprInto(keyreg, m.property);
+                _ = try self.emit(.{ .op = .get_elem, .a = funcreg, .b = protoreg, .c = keyreg });
+            } else {
+                const name_idx = try self.propNameConst(m.property);
+                _ = try self.emit(.{ .op = .get_prop, .a = funcreg, .b = protoreg, .c = name_idx });
+            }
+            self.freeTo(funcreg + 1);
+        } else if (c.callee.kind == .member and !c.callee.kind.member.optional) {
             // Method call: receiver is the object; callee is obj.prop.
             const m = c.callee.kind.member;
             try self.compileExprInto(base, m.object);
@@ -1563,6 +1606,206 @@ pub const Compiler = struct {
         self.freeTo(iter_reg);
     }
 
+    /// Untagged template: seed with the first cooked quasi (so the accumulator
+    /// is always a string), then alternate `+ ToString(sub)` and `+ quasi`.
+    fn compileTemplate(self: *Compiler, dst: u32, t: anytype) CompileError!void {
+        const c0 = try self.addConst(.{ .string = try self.cookTemplateQuasi(t.quasis[0]) });
+        _ = try self.emit(.{ .op = .load_const, .a = dst, .b = c0 });
+        for (t.exprs, 0..) |e, i| {
+            const r = self.allocReg();
+            try self.compileExprInto(r, e);
+            _ = try self.emit(.{ .op = .add, .a = dst, .b = dst, .c = r });
+            const cq = try self.addConst(.{ .string = try self.cookTemplateQuasi(t.quasis[i + 1]) });
+            _ = try self.emit(.{ .op = .load_const, .a = r, .b = cq });
+            _ = try self.emit(.{ .op = .add, .a = dst, .b = dst, .c = r });
+            self.freeTo(r);
+        }
+    }
+
+    /// Tagged template: `tag(strings, ...subs)` where `strings` is the cooked
+    /// array carrying a `.raw` array of the uncooked text.
+    fn compileTaggedTemplate(self: *Compiler, dst: u32, tt: anytype) CompileError!void {
+        if (tt.quasi.kind != .template) return self.fail("malformed tagged template", tt.quasi.start);
+        const t = tt.quasi.kind.template;
+
+        // Receiver + callee follow the standard call layout.
+        const base = self.allocReg();
+        if (tt.tag.kind == .member and !tt.tag.kind.member.optional) {
+            const m = tt.tag.kind.member;
+            try self.compileExprInto(base, m.object);
+            const funcreg = self.allocReg(); // base+1
+            if (m.computed) {
+                const keyreg = self.allocReg();
+                try self.compileExprInto(keyreg, m.property);
+                _ = try self.emit(.{ .op = .get_elem, .a = funcreg, .b = base, .c = keyreg });
+                self.freeTo(funcreg + 1);
+            } else {
+                const name_idx = try self.propNameConst(m.property);
+                _ = try self.emit(.{ .op = .get_prop, .a = funcreg, .b = base, .c = name_idx });
+            }
+        } else {
+            _ = try self.emit(.{ .op = .load_undefined, .a = base });
+            const funcreg = self.allocReg();
+            try self.compileExprInto(funcreg, tt.tag);
+        }
+
+        // strings array (first argument, at base+2), with .raw attached.
+        const sarr = self.allocReg();
+        _ = try self.emit(.{ .op = .new_array, .a = sarr, .b = 0 });
+        {
+            const rarr = self.allocReg();
+            _ = try self.emit(.{ .op = .new_array, .a = rarr, .b = 0 });
+            const tmp = self.allocReg();
+            for (t.quasis) |q| {
+                const cooked = try self.addConst(.{ .string = try self.cookTemplateQuasi(q) });
+                _ = try self.emit(.{ .op = .load_const, .a = tmp, .b = cooked });
+                _ = try self.emit(.{ .op = .arr_push, .a = sarr, .b = tmp });
+                const raw = try self.addConst(.{ .string = try self.arena.dupe(u8, templateQuasiInner(q)) });
+                _ = try self.emit(.{ .op = .load_const, .a = tmp, .b = raw });
+                _ = try self.emit(.{ .op = .arr_push, .a = rarr, .b = tmp });
+            }
+            const raw_idx = try self.addConst(.{ .string = "raw" });
+            _ = try self.emit(.{ .op = .set_prop, .a = sarr, .b = raw_idx, .c = rarr });
+            self.freeTo(rarr);
+        }
+
+        // Substitution values at base+3, base+4, …
+        for (t.exprs) |e| {
+            const ar = self.allocReg();
+            try self.compileExprInto(ar, e);
+        }
+        _ = try self.emit(.{ .op = .call, .a = dst, .b = base, .c = @intCast(1 + t.exprs.len) });
+        self.freeTo(base);
+    }
+
+    /// Lower a class to a constructor function + prototype/static members.
+    /// `extends` wires both prototype chains and provides `super` via synthetic
+    /// bindings (`\x00super_ctor` / `\x00super_proto`) that member closures
+    /// capture. Class fields are unsupported (compile error).
+    fn compileClass(self: *Compiler, dst: u32, cls: ast.Class, pos: u32) CompileError!void {
+        try self.pushBlock();
+        defer self.popBlock();
+
+        // Superclass bindings, captured by member closures for `super`.
+        if (cls.super_class) |sc| {
+            const sc_slot = try self.declare("\x00super_ctor");
+            const sp_slot = try self.declare("\x00super_proto");
+            const r = try self.compileExprToNew(sc);
+            _ = try self.emit(.{ .op = .init_var, .a = 0, .b = sc_slot, .c = r });
+            const pr = self.allocReg();
+            const proto_idx = try self.addConst(.{ .string = "prototype" });
+            _ = try self.emit(.{ .op = .get_prop, .a = pr, .b = r, .c = proto_idx });
+            _ = try self.emit(.{ .op = .init_var, .a = 0, .b = sp_slot, .c = pr });
+            self.freeTo(r);
+        }
+
+        // The constructor (or an empty default one).
+        var ctor_block: ?*bc.CodeBlock = null;
+        for (cls.members) |m| {
+            if (m.kind != .property) continue;
+            const prop = m.kind.property;
+            if (prop.kind == .method and !prop.computed and prop.key.kind == .ident and
+                std.mem.eql(u8, prop.key.kind.ident, "constructor"))
+            {
+                const f = (prop.value orelse return self.fail("malformed constructor", m.start)).kind.function;
+                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, self.fs);
+                break;
+            }
+        }
+        if (ctor_block == null) {
+            const empty_body = try self.arena.create(Node);
+            empty_body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = &.{} } };
+            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, empty_body, false, false, false, true, self.fs);
+        }
+        const ctor_idx: u32 = @intCast(self.fs.children.items.len);
+        try self.fs.children.append(self.gpa, ctor_block.?);
+        _ = try self.emit(.{ .op = .new_closure, .a = dst, .b = ctor_idx });
+
+        const proto_reg = self.allocReg();
+        const proto_idx = try self.addConst(.{ .string = "prototype" });
+        _ = try self.emit(.{ .op = .get_prop, .a = proto_reg, .b = dst, .c = proto_idx });
+
+        // extends: wire prototype.[[Prototype]] and constructor.[[Prototype]]
+        // through the `__proto__` accessor.
+        if (cls.super_class != null) {
+            const dunder = try self.addConst(.{ .string = "__proto__" });
+            const t = self.allocReg();
+            const sp = self.resolve("\x00super_proto").?;
+            _ = try self.emit(.{ .op = .get_var, .a = t, .b = sp.depth, .c = sp.slot });
+            _ = try self.emit(.{ .op = .set_prop, .a = proto_reg, .b = dunder, .c = t });
+            const sc = self.resolve("\x00super_ctor").?;
+            _ = try self.emit(.{ .op = .get_var, .a = t, .b = sc.depth, .c = sc.slot });
+            _ = try self.emit(.{ .op = .set_prop, .a = dst, .b = dunder, .c = t });
+            self.freeTo(t);
+        }
+
+        // Prototype / static members.
+        for (cls.members) |m| {
+            if (m.kind != .property) continue;
+            const prop = m.kind.property;
+            if (prop.kind == .method and !prop.computed and prop.key.kind == .ident and
+                std.mem.eql(u8, prop.key.kind.ident, "constructor")) continue;
+            if (prop.kind == .init) return self.fail("class fields unsupported", m.start);
+            const fnode = prop.value orelse return self.fail("malformed class member", m.start);
+            if (fnode.kind != .function) return self.fail("malformed class member", m.start);
+            const f = fnode.kind.function;
+
+            const member_name = if (!prop.computed and prop.key.kind == .ident) prop.key.kind.ident else "";
+            const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, false, true, self.fs);
+            const child_idx: u32 = @intCast(self.fs.children.items.len);
+            try self.fs.children.append(self.gpa, child);
+            const fr = self.allocReg();
+            _ = try self.emit(.{ .op = .new_closure, .a = fr, .b = child_idx });
+
+            const target: u32 = if (prop.is_static) dst else proto_reg;
+            switch (prop.kind) {
+                .method => {
+                    if (prop.computed) {
+                        const k = self.allocReg();
+                        try self.compileExprInto(k, prop.key);
+                        _ = try self.emit(.{ .op = .set_elem, .a = target, .b = k, .c = fr });
+                    } else {
+                        const idx = try self.propNameConst(prop.key);
+                        _ = try self.emit(.{ .op = .set_prop, .a = target, .b = idx, .c = fr });
+                    }
+                },
+                .get, .set => {
+                    // Object.defineProperty(target, key, { get/set: fr })
+                    const base = self.allocReg(); // receiver = Object
+                    const obj_idx = try self.addConst(.{ .string = "Object" });
+                    _ = try self.emit(.{ .op = .get_global, .a = base, .b = obj_idx });
+                    const callee = self.allocReg();
+                    const dp_idx = try self.addConst(.{ .string = "defineProperty" });
+                    _ = try self.emit(.{ .op = .get_prop, .a = callee, .b = base, .c = dp_idx });
+                    const arg0 = self.allocReg();
+                    _ = try self.emit(.{ .op = .move, .a = arg0, .b = target });
+                    const arg1 = self.allocReg();
+                    if (prop.computed) {
+                        try self.compileExprInto(arg1, prop.key);
+                    } else {
+                        const idx = try self.propNameConst(prop.key);
+                        _ = try self.emit(.{ .op = .load_const, .a = arg1, .b = idx });
+                    }
+                    const arg2 = self.allocReg();
+                    _ = try self.emit(.{ .op = .new_object, .a = arg2 });
+                    const acc_idx = try self.addConst(.{ .string = if (prop.kind == .get) "get" else "set" });
+                    _ = try self.emit(.{ .op = .set_prop, .a = arg2, .b = acc_idx, .c = fr });
+                    const conf_idx = try self.addConst(.{ .string = "configurable" });
+                    const tr = self.allocReg();
+                    _ = try self.emit(.{ .op = .load_true, .a = tr });
+                    _ = try self.emit(.{ .op = .set_prop, .a = arg2, .b = conf_idx, .c = tr });
+                    self.freeTo(tr);
+                    const res = self.allocReg();
+                    _ = try self.emit(.{ .op = .call, .a = res, .b = base, .c = 3 });
+                    self.freeTo(base);
+                },
+                else => return self.fail("unsupported class member", m.start),
+            }
+            self.freeTo(fr);
+        }
+        self.freeTo(proto_reg);
+    }
+
     fn compileFunctionExpr(self: *Compiler, dst: u32, f: ast.Function) CompileError!void {
         const child = try self.compileFunction(
             f.name orelse "",
@@ -1571,6 +1814,7 @@ pub const Compiler = struct {
             f.flags.expression_body,
             f.flags.is_generator,
             f.flags.is_arrow,
+            false,
             self.fs,
         );
         const idx: u32 = @intCast(self.fs.children.items.len);
@@ -1580,10 +1824,31 @@ pub const Compiler = struct {
 
     // ---- literal cooking ---------------------------------------------------
 
+    /// Strip a template quasi's delimiters: a leading `` ` `` or `}` and a
+    /// trailing `` ` `` or `${`.
+    fn templateQuasiInner(raw: []const u8) []const u8 {
+        var inner = raw;
+        if (inner.len > 0 and (inner[0] == '`' or inner[0] == '}')) inner = inner[1..];
+        if (std.mem.endsWith(u8, inner, "${")) {
+            inner = inner[0 .. inner.len - 2];
+        } else if (std.mem.endsWith(u8, inner, "`")) {
+            inner = inner[0 .. inner.len - 1];
+        }
+        return inner;
+    }
+
+    /// Cook a template quasi: escape-process the delimiter-stripped text.
+    fn cookTemplateQuasi(self: *Compiler, raw: []const u8) CompileError![]u8 {
+        return self.cookInner(templateQuasiInner(raw));
+    }
+
     /// Strip quotes and process common escape sequences into UTF-8.
     fn cookString(self: *Compiler, raw: []const u8) CompileError![]u8 {
         if (raw.len < 2) return self.arena.dupe(u8, "");
-        const inner = raw[1 .. raw.len - 1];
+        return self.cookInner(raw[1 .. raw.len - 1]);
+    }
+
+    fn cookInner(self: *Compiler, inner: []const u8) CompileError![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.gpa);
         var i: usize = 0;
@@ -1745,7 +2010,7 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
     const dummy_body = try c.arena.create(Node);
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
-    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, null) catch |e| switch (e) {
+    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;
@@ -1812,7 +2077,7 @@ test "compiles control flow and functions" {
 }
 
 test "reports unsupported constructs" {
-    const src = "class C {}"; // classes do not compile yet
+    const src = "var { ...rest } = obj;"; // object rest patterns do not compile yet
     const parser = @import("parser.zig");
     var pr = try parser.parse(testing.allocator, src, .script);
     switch (pr) {

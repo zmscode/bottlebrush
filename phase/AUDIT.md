@@ -43,16 +43,24 @@ executed)**, 110/110 unit tests, corpus wall time ~0.5 s.
    assignment expressions (incl. member targets), for-of/for-in heads, catch
    params; iterator-protocol based; nested; defaults; array rest. Object rest
    still unsupported.
-8. **Classes and template literals** — parse but do not compile.
+8. ~~**Classes and template literals**~~ **FIXED 2026-07-08**: classes lower
+   to constructor functions — decl/expr forms, methods, static members,
+   get/set accessors (via runtime defineProperty), `extends` with both
+   prototype chains wired, `super(...)`/`super.m(...)`/`super.x` through
+   synthetic captured bindings, implicitly strict bodies. Class fields remain
+   a compile error (skip). Templates: untagged (string-seeded concat) and
+   tagged (strings array + `.raw` + substitutions).
 9. **Mapped `arguments`** — plain object; no parameter aliasing, no strict
    variant.
 10. ~~**`[[SetPrototypeOf]]`**~~ **FIXED 2026-07-08**: Object.setPrototypeOf
     with cycle check + `__proto__` accessor; Object.assign/is/hasOwn/
     fromEntries/getOwnPropertyDescriptors added.
-11. ~~**Well-known symbols are inert**~~ **PARTLY FIXED 2026-07-08**:
+11. ~~**Well-known symbols are inert**~~ **FIXED 2026-07-08**:
     @@toPrimitive (with hints), @@toStringTag (plus builtin tags), and
-    @@hasInstance are consulted. @@match/@@replace/@@split/@@search still
-    inert.
+    @@hasInstance are consulted; RegExp.prototype implements
+    @@match/@@replace/@@search/@@split and the String methods dispatch
+    through them (object patterns only, per spec — primitives never
+    consult the symbol). Runner denylist no longer skips Symbol features.
 12. **BigInt is an i64 stub** — no bignum, no `asIntN`, no mixed-type errors.
 13. **WeakMap/WeakSet** — need GC ephemeron support.
 14. **Proxy invariants** — 5 of 13 traps dispatch; no invariant checks.

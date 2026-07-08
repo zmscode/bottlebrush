@@ -45,6 +45,8 @@ pub const Property = struct {
     kind: PropKind,
     computed: bool = false,
     shorthand: bool = false,
+    /// Class members only: declared with `static`.
+    is_static: bool = false,
 };
 
 pub const ClassMember = struct {

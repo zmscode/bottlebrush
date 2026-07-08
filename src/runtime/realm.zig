@@ -247,6 +247,10 @@ const nativeStringSubstr = string_mod.nativeStringSubstr;
 const nativeStringTrimStart = string_mod.nativeStringTrimStart;
 const nativeStringTrimEnd = string_mod.nativeStringTrimEnd;
 const nativeStringReplaceAll = string_mod.nativeStringReplaceAll;
+const nativeRegExpSymbolMatch = string_mod.nativeRegExpSymbolMatch;
+const nativeRegExpSymbolReplace = string_mod.nativeRegExpSymbolReplace;
+const nativeRegExpSymbolSearch = string_mod.nativeRegExpSymbolSearch;
+const nativeRegExpSymbolSplit = string_mod.nativeRegExpSymbolSplit;
 const nativeString = string_mod.nativeString;
 const nativeStringCharAt = string_mod.nativeStringCharAt;
 const nativeStringCharCodeAt = string_mod.nativeStringCharCodeAt;
@@ -742,8 +746,23 @@ pub fn installBuiltins(vm: *Vm) Error!void {
             vm.symbol_to_string_tag_key = try vm.toPropertyKey(sym);
         } else if (comptime std.mem.eql(u8, name, "hasInstance")) {
             vm.symbol_has_instance_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "match")) {
+            vm.symbol_match_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "replace")) {
+            vm.symbol_replace_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "search")) {
+            vm.symbol_search_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "split")) {
+            vm.symbol_split_key = try vm.toPropertyKey(sym);
         }
     }
+
+    // RegExp.prototype implements the string-pattern protocol; String methods
+    // dispatch through these, so custom pattern objects can hook them too.
+    try vm.defineMethod(vm.regexp_proto.?, vm.symbol_match_key, nativeRegExpSymbolMatch, 1);
+    try vm.defineMethod(vm.regexp_proto.?, vm.symbol_replace_key, nativeRegExpSymbolReplace, 2);
+    try vm.defineMethod(vm.regexp_proto.?, vm.symbol_search_key, nativeRegExpSymbolSearch, 1);
+    try vm.defineMethod(vm.regexp_proto.?, vm.symbol_split_key, nativeRegExpSymbolSplit, 2);
     try vm.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 
     // ---- Proxy + Reflect ----

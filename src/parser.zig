@@ -613,6 +613,7 @@ pub const Parser = struct {
                     else => .method,
                 },
                 .computed = computed,
+                .is_static = is_static,
             } });
         }
 
@@ -626,6 +627,7 @@ pub const Parser = struct {
             .value = value,
             .kind = .init,
             .computed = computed,
+            .is_static = is_static,
         } });
     }
 

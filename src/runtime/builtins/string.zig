@@ -265,60 +265,80 @@ pub fn nativeStringConcat(ctx: *anyopaque, this: Value, args: []const Value) Err
     return vm.makeStringFromUtf16(buf.items);
 }
 
+/// If `pat` has a callable method under `sym_key`, invoke it — this is the
+/// @@match/@@replace/@@search/@@split protocol (RegExp.prototype provides the
+/// built-in implementations; custom pattern objects can hook it). Primitives
+/// never dispatch: the spec only consults the symbol when the pattern is an
+/// Object, so e.g. a poisoned String.prototype[@@match] must not be read.
+fn dispatchPatternSymbol(vm: *Vm, pat: Value, sym_key: []const u8, argv: []const Value) Error!?Value {
+    if (!pat.isObject() or sym_key.len == 0) return null;
+    const method = try vm.getProperty(pat, sym_key);
+    if (!isCallable(method)) return null;
+    return try vm.callValue(method, pat, argv);
+}
+
+/// RegExp @@split core: split between matches; captures are spliced in.
+fn splitRegexImpl(vm: *Vm, re: *const bilby.Regex, sv: Value, lim: u32) Error!Value {
+    const units = sv.asString().units;
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    if (lim == 0) return Value.fromObject(result);
+    if (units.len == 0) {
+        // Empty subject: [] if the pattern matches empty, else [S].
+        if (try regexFind(vm, re, units, 0)) |m| {
+            m.deinit(vm.gpa);
+        } else {
+            try vm.arrayAppend(result, sv);
+        }
+        return Value.fromObject(result);
+    }
+    var p: usize = 0; // start of the current unmatched piece
+    var pos: usize = 0;
+    while (pos < units.len) {
+        const m = (try regexFind(vm, re, units, pos)) orelse break;
+        defer m.deinit(vm.gpa);
+        const w = m.groups[0].?;
+        if (w.start >= units.len) break; // separator may not match at the very end
+        if (w.end == p) {
+            pos = w.start + 1; // empty/degenerate match: advance, no split
+            continue;
+        }
+        try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..w.start]));
+        if (result.array_length >= lim) return Value.fromObject(result);
+        for (m.groups[1..]) |g| {
+            const v = if (g) |sp| try vm.makeStringFromUtf16(units[sp.start..sp.end]) else Value.undefined_value;
+            try vm.arrayAppend(result, v);
+            if (result.array_length >= lim) return Value.fromObject(result);
+        }
+        p = w.end;
+        pos = if (w.end == w.start) w.start + 1 else w.end;
+    }
+    try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..]));
+    return Value.fromObject(result);
+}
+
 pub fn nativeStringSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const sv = try coerceToString(vm, this);
     try vm.protect(sv);
     defer vm.unprotect();
+
+    const sep_v = argAt(args, 0);
+    const limit_v = argAt(args, 1);
+    // Protocol dispatch happens before limit coercion (spec order).
+    if (try dispatchPatternSymbol(vm, sep_v, vm.symbol_split_key, &.{ sv, limit_v })) |r| return r;
+
     const units = sv.asString().units;
     const result = try vm.newArray(0);
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
 
-    const sep_v = argAt(args, 0);
-    const limit_v = argAt(args, 1);
     const lim: u32 = if (limit_v.isUndefined()) std.math.maxInt(u32) else try vm.toUint32(limit_v);
     if (lim == 0) return Value.fromObject(result);
 
     if (sep_v.isUndefined()) {
         try vm.arrayAppend(result, sv);
-        return Value.fromObject(result);
-    }
-
-    // RegExp separator: split between matches; captures are spliced in.
-    if (sep_v.isObject() and sep_v.asObject().regex != null) {
-        const re = sep_v.asObject().regex.?;
-        if (units.len == 0) {
-            // Empty subject: [] if the pattern matches empty, else [S].
-            if (try regexFind(vm, re, units, 0)) |m| {
-                m.deinit(vm.gpa);
-            } else {
-                try vm.arrayAppend(result, sv);
-            }
-            return Value.fromObject(result);
-        }
-        var p: usize = 0; // start of the current unmatched piece
-        var pos: usize = 0;
-        while (pos < units.len) {
-            const m = (try regexFind(vm, re, units, pos)) orelse break;
-            defer m.deinit(vm.gpa);
-            const w = m.groups[0].?;
-            if (w.start >= units.len) break; // separator may not match at the very end
-            if (w.end == p) {
-                pos = w.start + 1; // empty/degenerate match: advance, no split
-                continue;
-            }
-            try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..w.start]));
-            if (result.array_length >= lim) return Value.fromObject(result);
-            for (m.groups[1..]) |g| {
-                const v = if (g) |sp| try vm.makeStringFromUtf16(units[sp.start..sp.end]) else Value.undefined_value;
-                try vm.arrayAppend(result, v);
-                if (result.array_length >= lim) return Value.fromObject(result);
-            }
-            p = w.end;
-            pos = if (w.end == w.start) w.start + 1 else w.end;
-        }
-        try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..]));
         return Value.fromObject(result);
     }
 
@@ -375,32 +395,32 @@ pub fn regexFind(vm: *Vm, re: *const bilby.Regex, units: []const u16, start: usi
     };
 }
 
-pub fn nativeStringSearch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    const vm = castVm(ctx);
-    const sv = try coerceToString(vm, this);
-    try vm.protect(sv);
-    defer vm.unprotect();
-    const rx = try regexArgObject(vm, argAt(args, 0));
-    try vm.protect(Value.fromObject(rx));
-    defer vm.unprotect();
-    // search ignores (and does not mutate) lastIndex.
+/// RegExp @@search core: first match index or -1; lastIndex untouched.
+fn searchRegexImpl(vm: *Vm, rx: *gc.Object, sv: Value) Error!Value {
     const m = (try regexFind(vm, rx.regex.?, sv.asString().units, 0)) orelse return Value.fromNumber(-1);
     defer m.deinit(vm.gpa);
     return Value.fromNumber(@floatFromInt(m.groups[0].?.start));
 }
 
-pub fn nativeStringMatch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+pub fn nativeStringSearch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const sv = try coerceToString(vm, this);
     try vm.protect(sv);
     defer vm.unprotect();
+    if (try dispatchPatternSymbol(vm, argAt(args, 0), vm.symbol_search_key, &.{sv})) |r| return r;
     const rx = try regexArgObject(vm, argAt(args, 0));
     try vm.protect(Value.fromObject(rx));
     defer vm.unprotect();
+    return searchRegexImpl(vm, rx, sv);
+}
+
+/// RegExp @@match core: exec once (non-global) or collect all matched
+/// substrings (global), null when nothing matches.
+fn matchRegexImpl(vm: *Vm, rx: *gc.Object, sv: Value) Error!Value {
     const re = rx.regex.?;
 
     // Non-global: identical to rx.exec(S).
-    if (!re.flags.global) return nativeRegExpExec(ctx, Value.fromObject(rx), &.{sv});
+    if (!re.flags.global) return nativeRegExpExec(@ptrCast(vm), Value.fromObject(rx), &.{sv});
 
     // Global: an array of all matched substrings (no captures), or null.
     try vm.setProperty(Value.fromObject(rx), "lastIndex", Value.fromNumber(0));
@@ -420,6 +440,18 @@ pub fn nativeStringMatch(ctx: *anyopaque, this: Value, args: []const Value) Erro
     }
     if (!found) return Value.null_value;
     return Value.fromObject(result);
+}
+
+pub fn nativeStringMatch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    if (try dispatchPatternSymbol(vm, argAt(args, 0), vm.symbol_match_key, &.{sv})) |r| return r;
+    const rx = try regexArgObject(vm, argAt(args, 0));
+    try vm.protect(Value.fromObject(rx));
+    defer vm.unprotect();
+    return matchRegexImpl(vm, rx, sv);
 }
 
 /// GetSubstitution: expand `$$ $& $` $' $n $nn $<name>` in a replacement
@@ -541,6 +573,37 @@ pub fn appendReplacerCall(
     try out.appendSlice(vm.gpa, rs.asString().units);
 }
 
+/// RegExp @@replace core: substitute the first (or all, when global) matches
+/// with a replacement string or callback result.
+fn replaceRegexImpl(vm: *Vm, rx: *gc.Object, sv: Value, rep: Value) Error!Value {
+    const units = sv.asString().units;
+    const rep_is_fn = isCallable(rep);
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(vm.gpa);
+    const re = rx.regex.?;
+    var last_end: usize = 0;
+    var pos: usize = 0;
+    while (pos <= units.len) {
+        const m = (try regexFind(vm, re, units, pos)) orelse break;
+        defer m.deinit(vm.gpa);
+        const w = m.groups[0].?;
+        try out.appendSlice(vm.gpa, units[last_end..w.start]);
+        if (rep_is_fn) {
+            try appendReplacerCall(vm, &out, rep, units, m.groups, sv);
+        } else {
+            const rs = try vm.toStringVal(rep);
+            try vm.protect(rs);
+            defer vm.unprotect();
+            try appendSubstitution(vm, &out, rs.asString().units, units, m.groups, &re.names);
+        }
+        last_end = w.end;
+        pos = if (w.end == w.start) w.end + 1 else w.end;
+        if (!re.flags.global) break;
+    }
+    try out.appendSlice(vm.gpa, units[last_end..]);
+    return vm.makeStringFromUtf16(out.items);
+}
+
 pub fn nativeStringReplace(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const sv = try coerceToString(vm, this);
@@ -549,36 +612,11 @@ pub fn nativeStringReplace(ctx: *anyopaque, this: Value, args: []const Value) Er
     const units = sv.asString().units;
     const pat = argAt(args, 0);
     const rep = argAt(args, 1);
+    if (try dispatchPatternSymbol(vm, pat, vm.symbol_replace_key, &.{ sv, rep })) |r| return r;
     const rep_is_fn = isCallable(rep);
 
     var out: std.ArrayList(u16) = .empty;
     defer out.deinit(vm.gpa);
-
-    if (pat.isObject() and pat.asObject().regex != null) {
-        const rx = pat.asObject();
-        const re = rx.regex.?;
-        var last_end: usize = 0;
-        var pos: usize = 0;
-        while (pos <= units.len) {
-            const m = (try regexFind(vm, re, units, pos)) orelse break;
-            defer m.deinit(vm.gpa);
-            const w = m.groups[0].?;
-            try out.appendSlice(vm.gpa, units[last_end..w.start]);
-            if (rep_is_fn) {
-                try appendReplacerCall(vm, &out, rep, units, m.groups, sv);
-            } else {
-                const rs = try vm.toStringVal(rep);
-                try vm.protect(rs);
-                defer vm.unprotect();
-                try appendSubstitution(vm, &out, rs.asString().units, units, m.groups, &re.names);
-            }
-            last_end = w.end;
-            pos = if (w.end == w.start) w.end + 1 else w.end;
-            if (!re.flags.global) break;
-        }
-        try out.appendSlice(vm.gpa, units[last_end..]);
-        return vm.makeStringFromUtf16(out.items);
-    }
 
     // String pattern: replace the first occurrence only.
     const pat_s = try vm.toStringVal(pat);
@@ -754,12 +792,15 @@ pub fn nativeStringTrimEnd(ctx: *anyopaque, this: Value, args: []const Value) Er
 pub fn nativeStringReplaceAll(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const pat = argAt(args, 0);
-    // A RegExp pattern must be global; delegate to replace (which loops on g).
+    // A RegExp pattern must be global; its @@replace already loops on g.
     if (pat.isObject() and pat.asObject().regex != null) {
         if (!pat.asObject().regex.?.flags.global) {
             return vm.throwTypeError("replaceAll must be called with a global RegExp");
         }
-        return nativeStringReplace(ctx, this, args);
+        const rx_sv = try coerceToString(vm, this);
+        try vm.protect(rx_sv);
+        defer vm.unprotect();
+        return replaceRegexImpl(vm, pat.asObject(), rx_sv, argAt(args, 1));
     }
     const sv = try coerceToString(vm, this);
     try vm.protect(sv);
@@ -794,4 +835,49 @@ pub fn nativeStringReplaceAll(ctx: *anyopaque, this: Value, args: []const Value)
     }
     if (pos <= units.len) try out.appendSlice(vm.gpa, units[pos..]);
     return vm.makeStringFromUtf16(out.items);
+}
+
+// ---- RegExp.prototype pattern-protocol methods ------------------------------
+
+/// Validate the receiver of a RegExp @@-method and coerce the subject string.
+fn regexProtocolThis(vm: *Vm, this: Value, args: []const Value) Error!struct { rx: *gc.Object, sv: Value } {
+    if (!this.isObject() or this.asObject().regex == null) {
+        return vm.throwTypeError("receiver is not a RegExp");
+    }
+    const sv = try coerceToString(vm, argAt(args, 0));
+    return .{ .rx = this.asObject(), .sv = sv };
+}
+
+pub fn nativeRegExpSymbolMatch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const p = try regexProtocolThis(vm, this, args);
+    try vm.protect(p.sv);
+    defer vm.unprotect();
+    return matchRegexImpl(vm, p.rx, p.sv);
+}
+
+pub fn nativeRegExpSymbolSearch(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const p = try regexProtocolThis(vm, this, args);
+    try vm.protect(p.sv);
+    defer vm.unprotect();
+    return searchRegexImpl(vm, p.rx, p.sv);
+}
+
+pub fn nativeRegExpSymbolReplace(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const p = try regexProtocolThis(vm, this, args);
+    try vm.protect(p.sv);
+    defer vm.unprotect();
+    return replaceRegexImpl(vm, p.rx, p.sv, argAt(args, 1));
+}
+
+pub fn nativeRegExpSymbolSplit(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const p = try regexProtocolThis(vm, this, args);
+    try vm.protect(p.sv);
+    defer vm.unprotect();
+    const limit_v = argAt(args, 1);
+    const lim: u32 = if (limit_v.isUndefined()) std.math.maxInt(u32) else try vm.toUint32(limit_v);
+    return splitRegexImpl(vm, p.rx.regex.?, p.sv, lim);
 }

@@ -1358,3 +1358,111 @@ test "strict mode semantics" {
         \\return outer() ? 1 : 0;
     ));
 }
+
+test "template literals" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("var n = 7; return `n is ${n}!` === 'n is 7!' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return `${1}${2}` === '12' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return `a${'b'}c${'d'}e` === 'abcde' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return `line\\n` === 'line\\n' ? 1 : 0;")); // escapes cook
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return `${`in${'ner'}`}!` === 'inner!' ? 1 : 0;")); // nesting
+    // Tagged: strings, raw, and substitutions all arrive.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function tag(strings, a, b) {
+        \\  return (strings[0] === "x" && strings[1] === "y" && strings[2] === "z" &&
+        \\          strings.raw[1] === "y" && a === 1 && b === 2) ? 1 : 0;
+        \\}
+        \\return tag`x${1}y${2}z`;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function raw(strings) { return strings.raw[0] === "a\\nb" ? 1 : 0; }
+        \\return raw`a\nb`; // raw keeps the backslash-n as two characters
+    ));
+}
+
+test "classes: methods, static, accessors, extends, super" {
+    try std.testing.expectEqual(@as(f64, 25), try evalNumber(
+        \\class Point {
+        \\  constructor(x, y) { this.x = x; this.y = y; }
+        \\  sum() { return this.x + this.y; }
+        \\}
+        \\var p = new Point(10, 15);
+        \\return p.sum();
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class A {}
+        \\var a = new A();
+        \\return (a instanceof A && typeof A === "function") ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 99), try evalNumber(
+        \\class Util { static answer() { return 99; } }
+        \\return Util.answer();
+    ));
+    try std.testing.expectEqual(@as(f64, 8), try evalNumber(
+        \\class Box {
+        \\  constructor(v) { this._v = v; }
+        \\  get value() { return this._v; }
+        \\  set value(v) { this._v = v * 2; }
+        \\}
+        \\var b = new Box(1);
+        \\b.value = 4;
+        \\return b.value;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class Animal {
+        \\  constructor(name) { this.name = name; }
+        \\  speak() { return this.name + " makes a sound"; }
+        \\}
+        \\class Dog extends Animal {
+        \\  constructor(name) { super(name); this.kind = "dog"; }
+        \\  speak() { return super.speak() + ", woof"; }
+        \\}
+        \\var d = new Dog("Rex");
+        \\return (d.speak() === "Rex makes a sound, woof" &&
+        \\        d instanceof Dog && d instanceof Animal && d.kind === "dog") ? 1 : 0;
+    ));
+    // Class expressions work too.
+    try std.testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\var C = class { five() { return 5; } };
+        \\return new C().five();
+    ));
+    // Class bodies are strict.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class S { m() { return this; } }
+        \\var m = new S().m;
+        \\return m() === undefined ? 1 : 0;
+    ));
+}
+
+test "regex symbol protocol: @@match/@@replace/@@search/@@split" {
+    // RegExp.prototype provides the built-ins (String methods still work).
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return ("a1b2".match(/\d/g).join(",") === "1,2" &&
+        \\        "hay".search(/y/) === 2 &&
+        \\        "x-y".split(/-/).join("") === "xy" &&
+        \\        "aaa".replace(/a/g, "b") === "bbb") ? 1 : 0;
+    ));
+    // They are real methods on RegExp.prototype.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return (typeof RegExp.prototype[Symbol.match] === "function" &&
+        \\        typeof RegExp.prototype[Symbol.replace] === "function" &&
+        \\        typeof RegExp.prototype[Symbol.search] === "function" &&
+        \\        typeof RegExp.prototype[Symbol.split] === "function") ? 1 : 0;
+    ));
+    // Direct invocation works.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return /o/[Symbol.search]("hoot") === 1 ? 1 : 0;
+    ));
+    // Custom pattern objects hook the String methods.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var pat = {};
+        \\pat[Symbol.match] = function (s) { return "matched:" + s; };
+        \\pat[Symbol.replace] = function (s, r) { return s + "|" + r; };
+        \\pat[Symbol.search] = function (s) { return 42; };
+        \\pat[Symbol.split] = function (s, lim) { return [s, lim]; };
+        \\var sp = "str".split(pat, 7);
+        \\return ("abc".match(pat) === "matched:abc" &&
+        \\        "abc".replace(pat, "R") === "abc|R" &&
+        \\        "abc".search(pat) === 42 &&
+        \\        sp[0] === "str" && sp[1] === 7) ? 1 : 0;
+    ));
+}
