@@ -717,6 +717,16 @@ pub const Parser = struct {
         if (is_static and !computed and self.staticKeyNameEquals(key, "prototype")) {
             return self.fail("a static class member may not be named 'prototype'");
         }
+        // Early error: `constructor` may only be a plain (non-static) method.
+        // A field named `constructor` (static or not) or a non-static special
+        // method (get/set/async/generator) named `constructor` is illegal.
+        if (!computed and self.staticKeyNameEquals(key, "constructor")) {
+            const is_method = self.at(.l_paren);
+            if (!is_method) return self.fail("class field may not be named 'constructor'");
+            if (!is_static and (m_kind != .method or flags.is_generator or flags.is_async)) {
+                return self.fail("class constructor may not be an accessor, generator, or async method");
+            }
+        }
 
         if (self.at(.l_paren)) {
             // Method (or get/set/constructor).

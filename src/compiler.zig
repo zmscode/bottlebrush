@@ -2153,9 +2153,24 @@ pub const Compiler = struct {
             }
         }
         if (ctor_block == null) {
-            const empty_body = try self.arena.create(Node);
-            empty_body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = &.{} } };
-            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, empty_body, false, false, false, true, instance_elements.items, self.fs);
+            // Synthesize the default constructor. A derived class's default
+            // constructor forwards to the parent via `super(...)` (here a plain
+            // `super()`), so the parent's instance elements get installed.
+            var body_stmts: []*Node = &.{};
+            if (cls.super_class != null) {
+                const super_node = try self.arena.create(Node);
+                super_node.* = .{ .start = pos, .end = pos, .kind = .super_expr };
+                const call_node = try self.arena.create(Node);
+                call_node.* = .{ .start = pos, .end = pos, .kind = .{ .call = .{ .callee = super_node, .args = &.{}, .optional = false } } };
+                const stmt = try self.arena.create(Node);
+                stmt.* = .{ .start = pos, .end = pos, .kind = .{ .expression_stmt = call_node } };
+                const arr = try self.arena.alloc(*Node, 1);
+                arr[0] = stmt;
+                body_stmts = arr;
+            }
+            const body = try self.arena.create(Node);
+            body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = body_stmts } };
+            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, body, false, false, false, true, instance_elements.items, self.fs);
         }
         const ctor_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, ctor_block.?);

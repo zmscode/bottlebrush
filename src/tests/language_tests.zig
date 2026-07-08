@@ -701,3 +701,40 @@ test "escaped keywords and async/generator context" {
         }
     }
 }
+
+test "derived default constructor installs parent elements; constructor-name errors" {
+    // A derived class with no explicit constructor must still run the parent
+    // constructor (default `super()`), so parent private fields/methods exist.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class A { #x = "Av"; read() { return this.#x; } }
+        \\class B extends A {}
+        \\return new B().read() === "Av" ? 1 : 0;
+    ));
+    // Private members from both a class and its superclass coexist per instance.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class S { get #m() { return "s"; } sup() { return this.#m; } }
+        \\class C extends S { get #m() { return "c"; } acc() { return this.#m; } }
+        \\var c = new C();
+        \\return (c.sup() === "s" && c.acc() === "c") ? 1 : 0;
+    ));
+    // constructor-name early errors (parser).
+    const parser = @import("bottlebrush").parser;
+    const bad = [_][]const u8{
+        "class C { constructor; }",
+        "class C { static constructor; }",
+        "class C { get constructor() {} }",
+        "class C { *constructor() {} }",
+        "class C { async constructor() {} }",
+    };
+    for (bad) |src| {
+        var pr = try parser.parse(std.testing.allocator, src, .script);
+        switch (pr) {
+            .syntax_error => {},
+            .ok => |*a| {
+                a.deinit();
+                std.debug.print("expected SyntaxError: {s}\n", .{src});
+                return error.ExpectedSyntaxError;
+            },
+        }
+    }
+}
