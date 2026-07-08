@@ -56,6 +56,9 @@ const FnState = struct {
     env_slot_count: u32 = 0,
     reg_top: u32 = 0,
     max_regs: u32 = 0,
+    /// Script top only: a reserved register holding the running completion
+    /// value, returned instead of undefined (eval/REPL completion semantics).
+    completion_reg: ?u32 = null,
     code: std.ArrayList(Inst) = .empty,
     constants: std.ArrayList(bc.Const) = .empty,
     children: std.ArrayList(*bc.CodeBlock) = .empty,
@@ -167,7 +170,17 @@ pub const Compiler = struct {
                 }
             },
             .function_decl => |f| {
-                if (f.name) |n| _ = try self.declare(n);
+                // Top-level function declarations become global properties
+                // (defined here, assigned in emitHoistedFunctions so strict
+                // set_global finds them); nested ones get env slots.
+                if (f.name) |n| {
+                    if (self.atScriptTop()) {
+                        const idx = try self.addConst(.{ .string = n });
+                        _ = try self.emit(.{ .op = .ensure_global, .a = idx });
+                    } else {
+                        _ = try self.declare(n);
+                    }
+                }
             },
             .if_stmt => |s| {
                 try self.hoistStmt(s.then_branch);
@@ -198,9 +211,22 @@ pub const Compiler = struct {
             else => {},
         }
     }
+    /// True when compiling the top-level script itself (not a function): var
+    /// and function declarations become global-object properties.
+    fn atScriptTop(self: *const Compiler) bool {
+        return self.fs.parent == null;
+    }
+
     fn hoistTarget(self: *Compiler, target: *Node) CompileError!void {
         switch (target.kind) {
-            .ident => |name| _ = try self.declare(name),
+            .ident => |name| {
+                if (self.atScriptTop()) {
+                    const idx = try self.addConst(.{ .string = name });
+                    _ = try self.emit(.{ .op = .ensure_global, .a = idx });
+                } else {
+                    _ = try self.declare(name);
+                }
+            },
             .assignment_pattern => |ap| try self.hoistTarget(ap.left),
             .rest_element => |inner| try self.hoistTarget(inner),
             .array_pattern => |elems| for (elems) |maybe| {
@@ -354,11 +380,22 @@ pub const Compiler = struct {
                 }
                 self.freeTo(thisr);
             }
+            // Script top: reserve reg 0 as the completion value (seeded
+            // undefined), which top-level expression statements update.
+            if (parent_fs == null) {
+                const creg = self.allocReg();
+                _ = try self.emit(.{ .op = .load_undefined, .a = creg });
+                fs.completion_reg = creg;
+            }
             for (stmts) |s| try self.compileStmt(s);
-            // Implicit `return undefined`.
-            const r = self.allocReg();
-            _ = try self.emit(.{ .op = .load_undefined, .a = r });
-            _ = try self.emit(.{ .op = .ret, .a = r });
+            if (fs.completion_reg) |creg| {
+                _ = try self.emit(.{ .op = .ret, .a = creg });
+            } else {
+                // Implicit `return undefined`.
+                const r = self.allocReg();
+                _ = try self.emit(.{ .op = .load_undefined, .a = r });
+                _ = try self.emit(.{ .op = .ret, .a = r });
+            }
             self.freeTo(0);
         }
 
@@ -375,8 +412,13 @@ pub const Compiler = struct {
                 try self.fs.children.append(self.gpa, child);
                 const r = self.allocReg();
                 _ = try self.emit(.{ .op = .new_closure, .a = r, .b = idx });
-                const bind = self.resolve(f.name.?).?;
-                _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = r });
+                if (self.resolve(f.name.?)) |bind| {
+                    _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = r });
+                } else {
+                    // Top-level function: a property of the global object.
+                    const nidx = try self.addConst(.{ .string = f.name.? });
+                    _ = try self.emit(.{ .op = .set_global, .a = nidx, .b = r });
+                }
                 self.freeTo(r);
             }
         }
@@ -450,6 +492,10 @@ pub const Compiler = struct {
             .function_decl => {}, // handled by emitHoistedFunctions
             .expression_stmt => |e| {
                 const r = try self.compileExprToNew(e);
+                // Script top: record it as the running completion value.
+                if (self.fs.completion_reg) |creg| {
+                    _ = try self.emit(.{ .op = .move, .a = creg, .b = r });
+                }
                 self.freeTo(r);
             },
             .var_decl => |vd| try self.compileVarDecl(vd),
@@ -516,6 +562,13 @@ pub const Compiler = struct {
                 _ = try self.emit(.{ .op = .init_var, .a = 0, .b = slot, .c = src });
             },
             .decl_var => {
+                // Top-level `var` patterns bind global properties (hoistTarget
+                // already emitted ensure_global for each name).
+                if (self.atScriptTop()) {
+                    const idx = try self.addConst(.{ .string = name });
+                    _ = try self.emit(.{ .op = .set_global, .a = idx, .b = src });
+                    return;
+                }
                 const slot = if (self.resolve(name)) |b| (if (b.depth == 0) b.slot else try self.declare(name)) else try self.declare(name);
                 _ = try self.emit(.{ .op = .init_var, .a = 0, .b = slot, .c = src });
             },
@@ -714,6 +767,18 @@ pub const Compiler = struct {
                 continue;
             }
             const name = decl.id.kind.ident;
+            // Top-level `var` targets the global object (ensure_global made the
+            // property; init writes through it). No initializer -> already
+            // undefined, nothing to emit.
+            if (vd.kind == .keyword_var and self.atScriptTop()) {
+                if (decl.init) |init_expr| {
+                    const r = try self.compileExprToNew(init_expr);
+                    const idx = try self.addConst(.{ .string = name });
+                    _ = try self.emit(.{ .op = .set_global, .a = idx, .b = r });
+                    self.freeTo(r);
+                }
+                continue;
+            }
             const slot = if (vd.kind == .keyword_var)
                 self.resolve(name).?.slot // already hoisted
             else
@@ -993,6 +1058,10 @@ pub const Compiler = struct {
                     return .{ .pattern = .{ .node = id, .mode = mode } };
                 }
                 const name = id.kind.ident;
+                // Top-level `for (var x of …)` binds the global property.
+                if (vd.kind == .keyword_var and self.atScriptTop()) {
+                    return .{ .global = try self.addConst(.{ .string = name }) };
+                }
                 const slot = if (vd.kind == .keyword_var) (self.resolve(name) orelse unreachable).slot else try self.declare(name);
                 return .{ .local = .{ .depth = 0, .slot = slot } };
             },
@@ -1317,26 +1386,40 @@ pub const Compiler = struct {
     fn compileUpdate(self: *Compiler, dst: u32, u: anytype, pos: u32) CompileError!void {
         if (u.operand.kind != .ident) return self.fail("update target must be an identifier", pos);
         const name = u.operand.kind.ident;
-        const bind = self.resolve(name) orelse return self.fail("undeclared identifier", pos);
+        const bind = self.resolve(name);
+        // A free identifier updates the corresponding global property.
+        const gidx: ?u32 = if (bind == null) try self.addConst(.{ .string = name }) else null;
         const one = try self.addConst(.{ .number = 1 });
 
         // Load current value into dst.
-        _ = try self.emit(.{ .op = .get_var, .a = dst, .b = bind.depth, .c = bind.slot });
+        if (bind) |b| {
+            _ = try self.emit(.{ .op = .get_var, .a = dst, .b = b.depth, .c = b.slot });
+        } else {
+            _ = try self.emit(.{ .op = .get_global, .a = dst, .b = gidx.? });
+        }
         const delta = self.allocReg();
         if (u.prefix) {
             _ = try self.emit(.{ .op = .load_const, .a = delta, .b = one });
             _ = try self.emit(.{ .op = if (u.op == .plus_plus) .add else .sub, .a = dst, .b = dst, .c = delta });
-            _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = dst });
+            try self.emitUpdateStore(bind, gidx, dst);
         } else {
             // Postfix: dst keeps the old (numeric) value; compute new separately.
             _ = try self.emit(.{ .op = .to_number, .a = dst, .b = dst });
             const newv = self.allocReg();
             _ = try self.emit(.{ .op = .load_const, .a = delta, .b = one });
             _ = try self.emit(.{ .op = if (u.op == .plus_plus) .add else .sub, .a = newv, .b = dst, .c = delta });
-            _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = newv });
+            try self.emitUpdateStore(bind, gidx, newv);
             self.freeTo(newv);
         }
         self.freeTo(delta);
+    }
+
+    fn emitUpdateStore(self: *Compiler, bind: ?Binding, gidx: ?u32, src: u32) CompileError!void {
+        if (bind) |b| {
+            _ = try self.emit(.{ .op = .set_var, .a = b.depth, .b = b.slot, .c = src });
+        } else {
+            _ = try self.emit(.{ .op = .set_global, .a = gidx.?, .b = src });
+        }
     }
 
     fn compileAssignment(self: *Compiler, dst: u32, a: anytype, pos: u32) CompileError!void {

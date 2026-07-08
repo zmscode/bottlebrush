@@ -41,6 +41,9 @@ pub const Flags = struct {
             's' => f.dot_all = true,
             'y' => f.sticky = true,
             'u' => f.unicode = true,
+            // v (unicodeSets) gets u's code-point semantics; the extra class
+            // set notation is not implemented (those patterns error).
+            'v' => f.unicode = true,
             'd' => f.has_indices = true,
             else => return error.InvalidPattern,
         };
@@ -151,6 +154,8 @@ const Parser = struct {
     /// Named capture groups: name (UTF-8) -> 1-based index.
     names: *std.StringHashMapUnmanaged(u32),
     gpa: std.mem.Allocator,
+    /// u/v mode: code-point atoms, `\u{…}` escapes, strict escape errors.
+    unicode: bool = false,
 
     fn peek(self: *Parser) ?u16 {
         return if (self.pos < self.src.len) self.src[self.pos] else null;
@@ -282,9 +287,34 @@ const Parser = struct {
             '*', '+', '?' => return error.InvalidPattern, // nothing to quantify
             else => {
                 self.pos += 1;
+                // u-mode: a literal surrogate pair is one code-point atom
+                // (so quantifiers apply to the whole pair).
+                if (self.unicode and isHighSurrogate(c)) {
+                    if (self.peek()) |lo| {
+                        if (isLowSurrogate(lo)) {
+                            self.pos += 1;
+                            return self.pairNode(c, lo);
+                        }
+                    }
+                }
                 return self.node(.{ .char = c });
             },
         }
+    }
+
+    /// A surrogate-pair atom: matches exactly the two units, quantified as one.
+    fn pairNode(self: *Parser, hi: u16, lo: u16) Error!*Node {
+        const parts = try self.arena.alloc(*Node, 2);
+        parts[0] = try self.node(.{ .char = hi });
+        parts[1] = try self.node(.{ .char = lo });
+        return self.node(.{ .concat = parts });
+    }
+
+    /// An atom matching `cp` (a surrogate pair when astral).
+    fn codePointNode(self: *Parser, cp: u21) Error!*Node {
+        if (cp <= 0xffff) return self.node(.{ .char = @intCast(cp) });
+        const c = @as(u32, cp) - 0x10000;
+        return self.pairNode(@intCast(0xd800 + (c >> 10)), @intCast(0xdc00 + (c & 0x3ff)));
     }
 
     fn parseGroup(self: *Parser) Error!*Node {
@@ -365,8 +395,60 @@ const Parser = struct {
                 const idx = self.parseInt().?;
                 return self.node(.{ .backref = idx });
             },
-            else => return self.node(.{ .char = try self.decodeEscapeChar(c) }),
+            'u' => {
+                // u-mode `\u{…}`: an arbitrary code point.
+                if (self.unicode and self.peek() == '{') {
+                    return self.codePointNode(try self.parseHexBraces());
+                }
+                const unit = try self.parseHex(4);
+                // u-mode: `\uD8xx\uDCxx` escape pairs form one atom.
+                if (self.unicode and isHighSurrogate(unit) and
+                    self.pos + 1 < self.src.len and self.src[self.pos] == '\\' and self.src[self.pos + 1] == 'u')
+                {
+                    const saved = self.pos;
+                    self.pos += 2;
+                    if (self.parseHex(4)) |lo| {
+                        if (isLowSurrogate(lo)) return self.pairNode(unit, lo);
+                    } else |_| {}
+                    self.pos = saved; // not a trail escape: leave it for later
+                }
+                return self.node(.{ .char = unit });
+            },
+            else => {
+                if (self.unicode) return self.node(.{ .char = try self.decodeEscapeCharStrict(c) });
+                return self.node(.{ .char = try self.decodeEscapeChar(c) });
+            },
         }
+    }
+
+    /// u-mode escapes are strict: only recognized escapes and syntax-character
+    /// identity escapes are legal (spec: anything else is a SyntaxError).
+    fn decodeEscapeCharStrict(self: *Parser, c: u16) Error!u16 {
+        return switch (c) {
+            'n', 'r', 't', 'f', 'v', '0', 'x', 'u' => self.decodeEscapeChar(c),
+            '^', '$', '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '/', '-' => c,
+            else => error.InvalidPattern,
+        };
+    }
+
+    /// `{XXXXXX}` after `\u` (u-mode): 1-6 hex digits, at most 0x10FFFF.
+    fn parseHexBraces(self: *Parser) Error!u21 {
+        if (!self.eat('{')) return error.InvalidPattern;
+        var v: u32 = 0;
+        var n: usize = 0;
+        while (self.peek()) |c| {
+            if (c == '}') {
+                self.pos += 1;
+                if (n == 0 or v > 0x10FFFF) return error.InvalidPattern;
+                return @intCast(v);
+            }
+            const d = hexDigit(c) orelse return error.InvalidPattern;
+            v = v * 16 + d;
+            n += 1;
+            if (n > 6) return error.InvalidPattern;
+            self.pos += 1;
+        }
+        return error.InvalidPattern;
     }
 
     fn classNode(self: *Parser, negated: bool, items: []const ClassItem) Error!*Node {
@@ -448,6 +530,14 @@ const Parser = struct {
         return null;
     }
 };
+
+fn isHighSurrogate(u: u16) bool {
+    return u >= 0xd800 and u <= 0xdbff;
+}
+
+fn isLowSurrogate(u: u16) bool {
+    return u >= 0xdc00 and u <= 0xdfff;
+}
 
 fn hexDigit(c: u16) ?u32 {
     return switch (c) {
@@ -688,7 +778,7 @@ pub const Regex = struct {
         var names: std.StringHashMapUnmanaged(u32) = .empty;
         errdefer names.deinit(gpa);
 
-        var parser = Parser{ .src = pattern, .arena = aa, .names = &names, .gpa = gpa };
+        var parser = Parser{ .src = pattern, .arena = aa, .names = &names, .gpa = gpa, .unicode = flags.unicode };
         const root = try parser.parseAlternation();
         if (parser.pos != pattern.len) return error.InvalidPattern; // stray `)` etc.
 
@@ -898,7 +988,18 @@ const Matcher = struct {
             if (ok) {
                 // Consuming ops (char/any/class/backref set `ok`; anchors don't advance).
                 switch (inst.op) {
-                    .char, .char_ci, .any, .class => sp += 1,
+                    .char, .char_ci, .class => sp += 1,
+                    .any => {
+                        // u-mode: `.` consumes a whole code point, so a
+                        // surrogate pair is a single step.
+                        if (self.re.flags.unicode and isHighSurrogate(self.input[sp]) and
+                            sp + 1 < self.input.len and isLowSurrogate(self.input[sp + 1]))
+                        {
+                            sp += 2;
+                        } else {
+                            sp += 1;
+                        }
+                    },
                     else => {},
                 }
                 pc += 1;
@@ -1142,4 +1243,39 @@ test "invalid patterns" {
     try testing.expectError(error.InvalidPattern, matches("a)", "", ""));
     try testing.expectError(error.InvalidPattern, matches("*", "", ""));
     try testing.expectError(error.InvalidPattern, matches("a{3,2}", "", ""));
+}
+
+test "u-mode: code points" {
+    // Dot consumes a whole surrogate pair.
+    const m1 = (try firstMatch("^.$", "u", "😀")).?;
+    try testing.expectEqual(@as(usize, 0), m1.start);
+    try testing.expectEqual(@as(usize, 2), m1.end); // two code units, one code point
+    try testing.expect(!(try matches("^.$", "", "😀"))); // non-u: two units
+
+    // Quantifiers bind the whole astral atom.
+    try testing.expect(try matches("^😀+$", "u", "😀😀😀"));
+    {
+        // Trailing lone surrogate: not another 😀 atom.
+        var re = try Regex.compileUtf8(testing.allocator, "^😀+$", "u");
+        defer re.deinit(testing.allocator);
+        const units = [_]u16{ 0xd83d, 0xde00, 0xd83d };
+        const m = try re.find(testing.allocator, &units, 0);
+        try testing.expect(m == null);
+    }
+
+    // \u{...} escapes.
+    try testing.expect(try matches("^\\u{1F600}$", "u", "😀"));
+    try testing.expect(try matches("^\\u{61}$", "u", "a"));
+    try testing.expectError(error.InvalidPattern, matches("\\u{110000}", "u", "x"));
+    try testing.expectError(error.InvalidPattern, matches("\\u{}", "u", "x"));
+
+    // Escape-pair combining: 😀 is one atom.
+    try testing.expect(try matches("^\\uD83D\\uDE00+$", "u", "😀😀"));
+
+    // Strict escapes: \q is a SyntaxError only in u-mode.
+    try testing.expectError(error.InvalidPattern, matches("\\q", "u", "q"));
+    try testing.expect(try matches("\\q", "", "q"));
+
+    // v flag gets u semantics.
+    try testing.expect(try matches("^.$", "v", "😀"));
 }

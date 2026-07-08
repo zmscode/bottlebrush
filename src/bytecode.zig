@@ -34,6 +34,7 @@ pub const Op = enum(u8) {
     get_global, // a=dst, b=name const  (ReferenceError if absent)
     get_global_typeof, // a=dst, b=name const  (undefined if absent)
     set_global, // a=name const, b=src
+    ensure_global, // a=name const  (define undefined var-property if absent; script prologue)
 
     // Arithmetic
     add, // a=dst, b=lhs, c=rhs  (numeric add or string concat)

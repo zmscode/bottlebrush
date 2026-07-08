@@ -103,9 +103,20 @@ executed)**, 110/110 unit tests, corpus wall time ~0.5 s.
     set/defineProperty/preventExtensions/setPrototypeOf results throw.
     Proxy.revocable + revoked-proxy TypeErrors everywhere. Deep ownKeys
     invariant checks remain simplified.
-15. **Regex `u`/`v` modes** — flags accepted but matching is code-unit based;
-    no `\p{…}`.
-16. **No file runner / REPL** — `main.zig` still runs a fixed demo.
+15. ~~**Regex `u`/`v` modes**~~ **MOSTLY FIXED 2026-07-09**: bilby gained
+    code-point semantics under u/v — `\u{XXXXXX}` escapes, `.` and
+    quantifiers span whole surrogate pairs (literal pairs and `\uD8..\uDC..`
+    escape pairs become single atoms), strict escape errors. `v` accepted
+    with u semantics; `\p{…}` property escapes and v-mode set notation still
+    unimplemented.
+16. ~~**No file runner / REPL**~~ **FIXED 2026-07-09**: `bottlebrush file.js`
+    runs a script (real parse/compile/runtime diagnostics); no args starts a
+    REPL (persistent realm, `.exit`/EOF quits). Required two engine
+    additions: **GlobalDeclarationInstantiation** (top-level `var`/`function`
+    become global-object properties via the new `ensure_global` op, so they
+    persist across REPL lines and across `$262.evalScript`) and **completion
+    values** (the script top returns its last expression statement, seeded
+    undefined). Added `console.log`/`error`/`warn`/`info`/`debug` + `print`.
 
 *(The "also missing but small" Array/String method tail below was also filled
 on 2026-07-08: 21 Array methods + Array.from/of, 9 String methods +

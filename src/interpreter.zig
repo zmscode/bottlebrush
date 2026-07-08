@@ -545,6 +545,7 @@ pub const Vm = struct {
     /// semantics; direct eval's caller-scope capture is not supported). The
     /// compiled program is kept alive for the VM's lifetime.
     pub fn evalSource(self: *Vm, src8: []const u8) Error!Value {
+        try self.bootstrap(); // a fresh VM (e.g. the REPL) may eval before any run()
         const parser_mod = @import("parser.zig");
         const compiler_mod = @import("compiler.zig");
         const pr = parser_mod.parse(self.gpa, src8, .script) catch return error.OutOfMemory;
@@ -650,6 +651,14 @@ pub const Vm = struct {
 
             .get_global => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, false),
             .get_global_typeof => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, true),
+            .ensure_global => {
+                // GlobalDeclarationInstantiation: top-level `var`/`function`
+                // declarations create global properties (kept if they exist).
+                const gname = code.constants[inst.a].string;
+                if (!self.hasProperty(self.global_object.?, gname)) {
+                    try self.defineData(self.global_object.?, gname, Value.undefined_value, true, true, false);
+                }
+            },
             .set_global => {
                 const gname = code.constants[inst.a].string;
                 // Strict mode: assigning to an undeclared global is a ReferenceError.

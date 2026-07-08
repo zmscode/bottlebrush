@@ -188,3 +188,43 @@ pub fn nativeDecodeURIComponent(ctx: *anyopaque, this: Value, args: []const Valu
     }
     return vm.makeString(out.items);
 }
+
+/// console.log / console.error / print: stringify args, space-joined, to
+/// stdout (stderr for error/warn), with a trailing newline.
+fn consoleWrite(vm: *Vm, args: []const Value, to_stderr: bool) Error!Value {
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(vm.gpa);
+    for (args, 0..) |a, i| {
+        if (i > 0) try line.append(vm.gpa, ' ');
+        const sv = vm.toStringVal(a) catch {
+            try line.appendSlice(vm.gpa, "<uninspectable>");
+            continue;
+        };
+        try vm.protect(sv);
+        defer vm.unprotect();
+        const utf8 = try utf16ToUtf8Alloc(vm.gpa, sv.asString().units);
+        defer vm.gpa.free(utf8);
+        try line.appendSlice(vm.gpa, utf8);
+    }
+    try line.append(vm.gpa, '\n');
+    if (to_stderr) {
+        std.debug.print("{s}", .{line.items});
+        return Value.undefined_value;
+    }
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(threaded.io(), &buf);
+    w.interface.writeAll(line.items) catch {};
+    w.interface.flush() catch {};
+    return Value.undefined_value;
+}
+
+pub fn nativeConsoleLog(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return consoleWrite(castVm(ctx), args, false);
+}
+
+pub fn nativeConsoleError(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    return consoleWrite(castVm(ctx), args, true);
+}

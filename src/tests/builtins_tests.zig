@@ -701,3 +701,19 @@ test "regex symbol protocol: @@match/@@replace/@@search/@@split" {
         \\        sp[0] === "str" && sp[1] === 7) ? 1 : 0;
     ));
 }
+
+test "RegExp u/v modes" {
+    // Dot spans a full code point under u; two units without it.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return (/^.$/u.test("😀") && !/^.$/.test("😀") && /^.$/v.test("😀")) ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return (/\u{1F600}/u.test("ab😀c") && /^😀+$/u.test("😀😀")) ? 1 : 0;
+    ));
+    // Strict escapes: \q throws only in u-mode.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var threw = false;
+        \\try { new RegExp("\\q", "u"); } catch (e) { threw = e instanceof SyntaxError; }
+        \\return (threw && new RegExp("\\q").test("q")) ? 1 : 0;
+    ));
+}

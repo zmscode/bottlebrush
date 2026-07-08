@@ -116,6 +116,8 @@ const nativeFunctionCtor = function_mod.nativeFunctionCtor;
 const nativeFunctionToString = function_mod.nativeFunctionToString;
 
 const global_mod = @import("builtins/global.zig");
+const nativeConsoleLog = global_mod.nativeConsoleLog;
+const nativeConsoleError = global_mod.nativeConsoleError;
 const nativeDecodeURIComponent = global_mod.nativeDecodeURIComponent;
 const nativeEncodeURI = global_mod.nativeEncodeURI;
 const nativeEncodeURIComponent = global_mod.nativeEncodeURIComponent;
@@ -847,6 +849,16 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(json, "stringify", nativeJSONStringify, 3);
     try vm.defineMethod(json, "parse", nativeJSONParse, 2);
     try vm.defineData(global, "JSON", Value.fromObject(json), true, false, true);
+
+    // ---- console + print ----
+    const console = try vm.newObject(vm.object_proto);
+    try vm.defineMethod(console, "log", nativeConsoleLog, 0);
+    try vm.defineMethod(console, "info", nativeConsoleLog, 0);
+    try vm.defineMethod(console, "debug", nativeConsoleLog, 0);
+    try vm.defineMethod(console, "error", nativeConsoleError, 0);
+    try vm.defineMethod(console, "warn", nativeConsoleError, 0);
+    try vm.defineData(global, "console", Value.fromObject(console), true, false, true);
+    try vm.defineMethod(global, "print", nativeConsoleLog, 1);
 
     // ---- global functions ----
     try vm.defineMethod(global, "isNaN", nativeIsNaN, 1);
