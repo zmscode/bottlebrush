@@ -759,7 +759,10 @@ pub const Parser = struct {
 
     fn parseBindingTarget(self: *Parser) ParseError!*Node {
         switch (self.cur.kind) {
-            .identifier => return self.parseIdentifier(),
+            .identifier => {
+                try self.checkStrictBindingName(self.cur.lexeme(self.source));
+                return self.parseIdentifier();
+            },
             .l_bracket => return self.parseArrayPattern(),
             .l_brace => return self.parseObjectPattern(),
             else => {
@@ -767,6 +770,20 @@ pub const Parser = struct {
                 if (self.cur.kind.isKeyword()) return self.fail("unexpected keyword in binding");
                 return self.fail("invalid binding target");
             },
+        }
+    }
+
+    /// In strict mode, `eval`, `arguments`, and the future-reserved words may
+    /// not be used as binding names (spec 13.1.1 / BindingIdentifier).
+    fn checkStrictBindingName(self: *Parser, name: []const u8) ParseError!void {
+        if (!self.strict) return;
+        const reserved = [_][]const u8{
+            "eval",      "arguments", "implements", "interface", "package",
+            "protected", "private",   "public",     "let",       "static",
+            "yield",
+        };
+        for (reserved) |r| {
+            if (std.mem.eql(u8, name, r)) return self.fail("binding name is reserved in strict mode");
         }
     }
 

@@ -83,7 +83,15 @@ const Runner = struct {
 
     fn scoreParseNegative(self: *Runner, source: []const u8, meta: frontmatter.Meta) report.Outcome {
         const source_type: bottlebrush.ast.SourceType = if (meta.flags.module) .module else .script;
-        var result = parser.parse(self.gpa, source, source_type) catch return .skip;
+        // An onlyStrict parse-negative must be parsed as strict code; the raw
+        // fixture has no directive, so prepend one.
+        var owned: ?[]u8 = null;
+        defer if (owned) |o| self.gpa.free(o);
+        const src = if (meta.flags.only_strict) blk: {
+            owned = std.fmt.allocPrint(self.gpa, "\"use strict\";\n{s}", .{source}) catch return .skip;
+            break :blk owned.?;
+        } else source;
+        var result = parser.parse(self.gpa, src, source_type) catch return .skip;
         switch (result) {
             .ok => |*tree| {
                 tree.deinit();

@@ -633,3 +633,30 @@ test "early errors: delete private and field-init super/arguments" {
         }
     }
 }
+
+test "strict-mode reserved binding names" {
+    const parser = @import("bottlebrush").parser;
+    const bad = [_][]const u8{
+        "\"use strict\"; var eval = 1;",
+        "\"use strict\"; let package = 1;",
+        "\"use strict\"; function f(arguments) {}",
+        "\"use strict\"; var [implements] = [1];",
+    };
+    for (bad) |src| {
+        var pr = try parser.parse(std.testing.allocator, src, .script);
+        switch (pr) {
+            .syntax_error => {},
+            .ok => |*a| {
+                a.deinit();
+                std.debug.print("expected SyntaxError: {s}\n", .{src});
+                return error.ExpectedSyntaxError;
+            },
+        }
+    }
+    // Legal in sloppy mode.
+    var pr = try parser.parse(std.testing.allocator, "var eval = 1; function f(arguments) {}", .script);
+    switch (pr) {
+        .ok => |*a| a.deinit(),
+        .syntax_error => return error.UnexpectedSyntaxError,
+    }
+}
