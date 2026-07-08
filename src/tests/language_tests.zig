@@ -584,3 +584,43 @@ test "private class members" {
         \\return new Sub().total() === 3 ? 1 : 0;
     ));
 }
+
+test "early errors: delete private and field-init super/arguments" {
+    const parser = @import("bottlebrush").parser;
+    const bad = [_][]const u8{
+        "class C { #x; m() { delete this.#x; } }",
+        "class C { #x; m() { delete (this.#x); } }",
+        "class C { x = arguments; }",
+        "class C { x = super(); }",
+        "class C { x = () => arguments; }",
+        "class C { x = y ? arguments : 0; }",
+    };
+    for (bad) |src| {
+        var pr = try parser.parse(testing.allocator, src, .script);
+        switch (pr) {
+            .syntax_error => {},
+            .ok => |*a| {
+                a.deinit();
+                std.debug.print("expected SyntaxError for: {s}\n", .{src});
+                return error.ExpectedSyntaxError;
+            },
+        }
+    }
+    // These are legal and must still parse.
+    const ok = [_][]const u8{
+        "class C { x = 1; m() { return arguments; } }",
+        "class C { x = function () { return arguments; }; }",
+        "class D {} class C extends D { x = 1; constructor() { super(); } }",
+        "class C { m() { delete this.x; } }",
+    };
+    for (ok) |src| {
+        var pr = try parser.parse(testing.allocator, src, .script);
+        switch (pr) {
+            .ok => |*a| a.deinit(),
+            .syntax_error => {
+                std.debug.print("unexpected SyntaxError for: {s}\n", .{src});
+                return error.UnexpectedSyntaxError;
+            },
+        }
+    }
+}

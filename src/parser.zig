@@ -43,6 +43,10 @@ pub const Parser = struct {
     source_type: ast.SourceType,
     /// Disallow the `in` operator (inside a for-loop header). RAII-style saved.
     no_in: bool = false,
+    /// Inside a class field initializer: `super()` and `arguments` are early
+    /// errors here. Cleared while parsing a nested non-arrow function body
+    /// (which establishes its own `arguments`/super), kept through arrows.
+    in_field_init: bool = false,
     diag: ?Diagnostic = null,
 
     const Snapshot = struct {
@@ -496,8 +500,11 @@ pub const Parser = struct {
         } else if (!is_expr) {
             return self.fail("function declaration requires a name");
         }
+        const saved_fi = self.in_field_init;
+        self.in_field_init = false; // a nested function has its own arguments/super
         const params = try self.parseParams();
         const body = try self.parseBlock();
+        self.in_field_init = saved_fi;
         const func: ast.Function = .{ .name = name, .params = params, .body = body, .flags = flags };
         return self.node(start, self.prev_end, if (is_expr)
             .{ .function = func }
@@ -593,8 +600,11 @@ pub const Parser = struct {
 
         if (self.at(.l_paren)) {
             // Method (or get/set/constructor).
+            const saved_fi = self.in_field_init;
+            self.in_field_init = false;
             const params = try self.parseParams();
             const body = try self.parseBlock();
+            self.in_field_init = saved_fi;
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
                 .params = params,
@@ -620,7 +630,12 @@ pub const Parser = struct {
         // Field. (Phase 1 records fields as `property` nodes; static/private
         // flags are parsed for validity but not yet threaded into the AST.)
         var value: ?*Node = null;
-        if (self.eat(.assign)) value = try self.parseAssignment();
+        if (self.eat(.assign)) {
+            const saved = self.in_field_init;
+            self.in_field_init = true;
+            defer self.in_field_init = saved;
+            value = try self.parseAssignment();
+        }
         try self.semicolon();
         return self.node(start, self.prev_end, .{ .property = .{
             .key = key,
@@ -759,6 +774,10 @@ pub const Parser = struct {
         if (!self.at(.identifier)) return self.fail("expected identifier");
         const start = self.cur.start;
         const name = self.cur.lexeme(self.source);
+        // A class field initializer may not reference `arguments`.
+        if (self.in_field_init and std.mem.eql(u8, name, "arguments")) {
+            return self.fail("'arguments' is not allowed in a class field initializer");
+        }
         self.advance();
         return self.node(start, self.prev_end, .{ .ident = name });
     }
@@ -908,6 +927,12 @@ pub const Parser = struct {
                 const op = self.cur.kind;
                 self.advance();
                 const operand = try self.parseUnary();
+                // Early error: deleting a private member reference is illegal
+                // (`delete obj.#x`, incl. through parens/calls that reduce to a
+                // top-level private member access).
+                if (op == .kw_delete and operand.kind == .member and operand.kind.member.property.kind == .private_name) {
+                    return self.fail("private members cannot be deleted");
+                }
                 return self.node(start, self.prev_end, .{ .unary = .{ .op = op, .operand = operand } });
             },
             .plus_plus, .minus_minus => {
@@ -989,6 +1014,10 @@ pub const Parser = struct {
                     expr = try self.node(expr.start, self.prev_end, .{ .member = .{ .object = expr, .property = prop, .computed = true, .optional = false } });
                 },
                 .l_paren => {
+                    // A class field initializer may not contain a `super()` call.
+                    if (self.in_field_init and expr.kind == .super_expr) {
+                        return self.fail("'super' call is not allowed in a class field initializer");
+                    }
                     const args = try self.parseArguments();
                     expr = try self.node(expr.start, self.prev_end, .{ .call = .{ .callee = expr, .args = args, .optional = false } });
                 },
@@ -1242,8 +1271,11 @@ pub const Parser = struct {
         const key = try self.parsePropertyKey(&computed, &is_private);
 
         if (self.at(.l_paren)) {
+            const saved_fi = self.in_field_init;
+            self.in_field_init = false;
             const params = try self.parseParams();
             const body = try self.parseBlock();
+            self.in_field_init = saved_fi;
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
                 .params = params,
