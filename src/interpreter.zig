@@ -763,6 +763,7 @@ pub const Vm = struct {
             .gen_yield => return Step{ .yielded = regs[inst.b] },
 
             .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env, this_value),
+            .set_fn_name => try self.setFunctionName(regs[inst.a], code.constants[inst.b].string),
             .call => {
                 const receiver = regs[inst.b];
                 const callee = regs[inst.b + 1];
@@ -802,6 +803,19 @@ pub const Vm = struct {
     }
 
     // ---- calls & closures --------------------------------------------------
+
+    /// SetFunctionName (NamedEvaluation): give an anonymous function the name
+    /// of the binding/property it's assigned to — but only if it doesn't
+    /// already have one (`function foo(){}` keeps "foo").
+    pub fn setFunctionName(self: *Vm, v: Value, name: []const u8) Error!void {
+        if (!v.isObject()) return;
+        const o = v.asObject();
+        if (o.callable == null and o.proxy_target == null) return;
+        if (o.properties.getPtr("name")) |desc| {
+            if (desc.value.isString() and desc.value.asString().units.len != 0) return; // already named
+        }
+        try self.defineData(o, "name", try self.makeString(name), false, false, true);
+    }
 
     pub fn makeClosure(self: *Vm, child: *const bc.CodeBlock, env: *gc.Environment, creator_this: Value) Error!Value {
         self.maybeStress();
@@ -1878,6 +1892,22 @@ pub const Vm = struct {
         const s = try self.heap.create(gc.String);
         s.units = try self.gpa.dupe(u16, units);
         return Value.fromString(s);
+    }
+
+    /// A registered symbol is one produced by `Symbol.for` (present in the
+    /// global registry). Registered symbols cannot be held weakly.
+    pub fn symbolIsRegistered(self: *Vm, sym: *gc.Symbol) bool {
+        for (self.symbol_registry.items) |r| {
+            if (r.sym == sym) return true;
+        }
+        return false;
+    }
+
+    /// CanBeHeldWeakly: objects always; non-registered symbols too.
+    pub fn canBeHeldWeakly(self: *Vm, v: Value) bool {
+        if (v.isObject()) return true;
+        if (v.isSymbol()) return !self.symbolIsRegistered(v.asSymbol());
+        return false;
     }
 
     pub fn makeSymbol(self: *Vm, description: ?[]const u8) Error!Value {

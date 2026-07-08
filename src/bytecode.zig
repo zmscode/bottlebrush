@@ -101,6 +101,7 @@ pub const Op = enum(u8) {
 
     // Functions
     new_closure, // a=dst, b=child code-block index
+    set_fn_name, // a=fn reg, b=name const  (SetFunctionName: sets .name iff currently empty)
     call, // a=dst, b=base reg, c=argc  (this=base, callee=base+1, args=base+2..)
     call_apply, // a=dst, b=base reg  (this=base, callee=base+1, args array=base+2)
     construct, // a=dst, b=callee reg, c=argc  (args in callee+1 .. callee+argc)

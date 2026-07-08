@@ -774,6 +774,7 @@ pub const Compiler = struct {
                 if (decl.init) |init_expr| {
                     const r = try self.compileExprToNew(init_expr);
                     const idx = try self.addConst(.{ .string = name });
+                    if (isAnonFnLike(init_expr)) _ = try self.emit(.{ .op = .set_fn_name, .a = r, .b = idx });
                     _ = try self.emit(.{ .op = .set_global, .a = idx, .b = r });
                     self.freeTo(r);
                 }
@@ -785,6 +786,12 @@ pub const Compiler = struct {
                 try self.declare(name);
             if (decl.init) |init_expr| {
                 const r = try self.compileExprToNew(init_expr);
+                // `var f = function(){}` / `= () => …` / `= class {}` names the
+                // function after the binding (NamedEvaluation).
+                if (isAnonFnLike(init_expr)) {
+                    const idx = try self.addConst(.{ .string = name });
+                    _ = try self.emit(.{ .op = .set_fn_name, .a = r, .b = idx });
+                }
                 // Lexical declarations write through init_var, which clears TDZ.
                 _ = try self.emit(.{ .op = if (lexical) .init_var else .set_var, .a = 0, .b = slot, .c = r });
                 self.freeTo(r);
@@ -1441,6 +1448,10 @@ pub const Compiler = struct {
         if (self.resolve(name)) |bind| {
             if (a.op == .assign) {
                 try self.compileExprInto(dst, a.value);
+                if (isAnonFnLike(a.value)) {
+                    const nidx = try self.addConst(.{ .string = name });
+                    _ = try self.emit(.{ .op = .set_fn_name, .a = dst, .b = nidx });
+                }
             } else {
                 _ = try self.emit(.{ .op = .get_var, .a = dst, .b = bind.depth, .c = bind.slot });
                 const rhs = self.allocReg();
@@ -1455,6 +1466,7 @@ pub const Compiler = struct {
             const idx = try self.addConst(.{ .string = name });
             if (a.op == .assign) {
                 try self.compileExprInto(dst, a.value);
+                if (isAnonFnLike(a.value)) _ = try self.emit(.{ .op = .set_fn_name, .a = dst, .b = idx });
             } else {
                 _ = try self.emit(.{ .op = .get_global, .a = dst, .b = idx });
                 const rhs = self.allocReg();
@@ -1633,7 +1645,7 @@ pub const Compiler = struct {
                     const fnode = prop.value orelse return self.fail("malformed accessor", pos);
                     if (fnode.kind != .function) return self.fail("malformed accessor", pos);
                     const f = fnode.kind.function;
-                    const name = if (!prop.computed and prop.key.kind == .ident) prop.key.kind.ident else "";
+                    const name = try self.functionNameFor(prop);
                     const child = try self.compileFunction(name, f.params, f.body, false, false, false, false, &.{}, self.fs);
                     const child_idx: u32 = @intCast(self.fs.children.items.len);
                     try self.fs.children.append(self.gpa, child);
@@ -1657,6 +1669,11 @@ pub const Compiler = struct {
                 const name_idx = try self.propNameConst(prop.key);
                 const valreg = self.allocReg();
                 try self.compileExprInto(valreg, value);
+                // A method, or an anonymous function/arrow/class value, takes
+                // the property name (NamedEvaluation / MethodDefinition).
+                if (prop.kind == .method or isAnonFnLike(value)) {
+                    _ = try self.emit(.{ .op = .set_fn_name, .a = valreg, .b = name_idx });
+                }
                 _ = try self.emit(.{ .op = .set_prop, .a = dst, .b = name_idx, .c = valreg });
                 self.freeTo(valreg);
             }
@@ -1673,6 +1690,34 @@ pub const Compiler = struct {
             else => return self.fail("unsupported property key", key.start),
         };
         return self.addConst(.{ .string = name });
+    }
+
+    /// True for expressions that produce an anonymous function object eligible
+    /// for NamedEvaluation: `function(){}`, `() => …`, `class {}`.
+    fn isAnonFnLike(node: *Node) bool {
+        return switch (node.kind) {
+            .function => |f| f.name == null,
+            .class => |c| c.name == null,
+            else => false,
+        };
+    }
+
+    /// The `.name` a class/object member's function should carry: the static
+    /// key text, with a `get `/`set ` prefix for accessors. Computed keys and
+    /// symbols yield "" (NamedEvaluation would set those at run time).
+    fn functionNameFor(self: *Compiler, prop: ast.Property) CompileError![]const u8 {
+        if (prop.computed) return "";
+        const base: []const u8 = switch (prop.key.kind) {
+            .ident => |n| n,
+            .string => |raw| try self.cookString(raw),
+            .number => |num| num.raw,
+            else => return "",
+        };
+        return switch (prop.kind) {
+            .get => try std.fmt.allocPrint(self.arena, "get {s}", .{base}),
+            .set => try std.fmt.allocPrint(self.arena, "set {s}", .{base}),
+            else => base,
+        };
     }
 
     fn compileConditional(self: *Compiler, dst: u32, c: anytype) CompileError!void {
@@ -2002,7 +2047,7 @@ pub const Compiler = struct {
             if (fnode.kind != .function) return self.fail("malformed class member", m.start);
             const f = fnode.kind.function;
 
-            const member_name = if (!prop.computed and prop.key.kind == .ident) prop.key.kind.ident else "";
+            const member_name = try self.functionNameFor(prop);
             const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, false, true, &.{}, self.fs);
             const child_idx: u32 = @intCast(self.fs.children.items.len);
             try self.fs.children.append(self.gpa, child);

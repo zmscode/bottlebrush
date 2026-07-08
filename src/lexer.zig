@@ -42,18 +42,23 @@ pub const Lexer = struct {
         const i = self.pos + offset;
         return if (i < self.source.len) self.source[i] else 0;
     }
+
     fn peek(self: *const Lexer) u8 {
         return self.at(0);
     }
+
     fn peek1(self: *const Lexer) u8 {
         return self.at(1);
     }
+
     fn peek2(self: *const Lexer) u8 {
         return self.at(2);
     }
+
     fn eof(self: *const Lexer) bool {
         return self.pos >= self.source.len;
     }
+
     fn bump(self: *Lexer) void {
         self.pos += 1;
     }
@@ -598,6 +603,7 @@ pub const Lexer = struct {
         self.bump();
         return self.make(kind, start, line);
     }
+
     fn double(self: *Lexer, kind: Kind, start: u32, line: u32) Token {
         self.bump();
         self.bump();
@@ -610,18 +616,23 @@ pub const Lexer = struct {
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
+
 fn isHexDigit(c: u8) bool {
     return isDigit(c) or (c | 0x20 >= 'a' and c | 0x20 <= 'f');
 }
+
 fn isOctalDigit(c: u8) bool {
     return c >= '0' and c <= '7';
 }
+
 fn isBinaryDigit(c: u8) bool {
     return c == '0' or c == '1';
 }
+
 fn isIdentStart(c: u8) bool {
     return (c | 0x20 >= 'a' and c | 0x20 <= 'z') or c == '_' or c == '$';
 }
+
 fn isIdentPart(c: u8) bool {
     return isIdentStart(c) or isDigit(c);
 }

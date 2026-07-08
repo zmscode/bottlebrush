@@ -186,8 +186,8 @@ pub fn nativeCollectionClear(ctx: *anyopaque, this: Value, args: []const Value) 
 
 // ---- WeakMap / WeakSet / WeakRef --------------------------------------------
 
-fn requireObjectKey(vm: *Vm, v: Value) Error!void {
-    if (!v.isObject()) return vm.throwTypeError("weak collection keys must be objects");
+fn requireWeakKey(vm: *Vm, v: Value) Error!void {
+    if (!vm.canBeHeldWeakly(v)) return vm.throwTypeError("Invalid value used as weak collection key");
 }
 
 pub fn nativeWeakMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -209,7 +209,7 @@ pub fn nativeWeakMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
             defer vm.unprotect();
             const k = try vm.getProperty(entry, "0");
             const val = try vm.getProperty(entry, "1");
-            try requireObjectKey(vm, k);
+            try requireWeakKey(vm, k);
             if (mapFind(map, k)) |idx| {
                 map.elements.items[idx + 1] = val;
             } else {
@@ -224,7 +224,7 @@ pub fn nativeWeakMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
 pub fn nativeWeakMapGet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const map = try thisCollection(vm, this, .weak_map);
-    if (!argAt(args, 0).isObject()) return Value.undefined_value;
+    if (!vm.canBeHeldWeakly(argAt(args, 0))) return Value.undefined_value;
     if (mapFind(map, args[0])) |i| return map.elements.items[i + 1];
     return Value.undefined_value;
 }
@@ -232,7 +232,7 @@ pub fn nativeWeakMapGet(ctx: *anyopaque, this: Value, args: []const Value) Error
 pub fn nativeWeakMapSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const map = try thisCollection(vm, this, .weak_map);
-    try requireObjectKey(vm, argAt(args, 0));
+    try requireWeakKey(vm, argAt(args, 0));
     if (mapFind(map, args[0])) |i| {
         map.elements.items[i + 1] = argAt(args, 1);
     } else {
@@ -245,14 +245,14 @@ pub fn nativeWeakMapSet(ctx: *anyopaque, this: Value, args: []const Value) Error
 pub fn nativeWeakMapHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const map = try thisCollection(vm, this, .weak_map);
-    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    if (!vm.canBeHeldWeakly(argAt(args, 0))) return Value.fromBool(false);
     return Value.fromBool(mapFind(map, args[0]) != null);
 }
 
 pub fn nativeWeakMapDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const map = try thisCollection(vm, this, .weak_map);
-    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    if (!vm.canBeHeldWeakly(argAt(args, 0))) return Value.fromBool(false);
     if (mapFind(map, args[0])) |i| {
         _ = map.elements.orderedRemove(i + 1);
         _ = map.elements.orderedRemove(i);
@@ -275,7 +275,7 @@ pub fn nativeWeakSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
             const r = try vm.iteratorNext(iter);
             if (toBoolean(try vm.getProperty(r, "done"))) break;
             const v = try vm.getProperty(r, "value");
-            try requireObjectKey(vm, v);
+            try requireWeakKey(vm, v);
             if (setFind(set, v) == null) try set.elements.append(vm.gpa, v);
         }
     }
@@ -285,7 +285,7 @@ pub fn nativeWeakSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
 pub fn nativeWeakSetAdd(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const set = try thisCollection(vm, this, .weak_set);
-    try requireObjectKey(vm, argAt(args, 0));
+    try requireWeakKey(vm, argAt(args, 0));
     if (setFind(set, args[0]) == null) try set.elements.append(vm.gpa, args[0]);
     return this;
 }
@@ -293,14 +293,14 @@ pub fn nativeWeakSetAdd(ctx: *anyopaque, this: Value, args: []const Value) Error
 pub fn nativeWeakSetHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const set = try thisCollection(vm, this, .weak_set);
-    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    if (!vm.canBeHeldWeakly(argAt(args, 0))) return Value.fromBool(false);
     return Value.fromBool(setFind(set, args[0]) != null);
 }
 
 pub fn nativeWeakSetDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     const set = try thisCollection(vm, this, .weak_set);
-    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    if (!vm.canBeHeldWeakly(argAt(args, 0))) return Value.fromBool(false);
     if (setFind(set, args[0])) |i| {
         _ = set.elements.orderedRemove(i);
         return Value.fromBool(true);
@@ -311,8 +311,8 @@ pub fn nativeWeakSetDelete(ctx: *anyopaque, this: Value, args: []const Value) Er
 pub fn nativeWeakRef(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     if (!this.isObject()) return vm.throwTypeError("constructor WeakRef requires 'new'");
-    try requireObjectKey(vm, argAt(args, 0));
-    this.asObject().weak_target = args[0].asObject();
+    try requireWeakKey(vm, argAt(args, 0));
+    this.asObject().weak_target = argAt(args, 0);
     return this;
 }
 
@@ -320,6 +320,8 @@ pub fn nativeWeakRefDeref(ctx: *anyopaque, this: Value, args: []const Value) Err
     _ = args;
     const vm = castVm(ctx);
     if (!this.isObject()) return vm.throwTypeError("WeakRef.prototype.deref called on non-object");
-    if (this.asObject().weak_target) |t| return Value.fromObject(t);
+    if (this.asObject().weak_target) |t| {
+        if (!t.isHole()) return t; // `.hole` means the referent was collected
+    }
     return Value.undefined_value;
 }

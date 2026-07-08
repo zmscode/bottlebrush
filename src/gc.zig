@@ -157,8 +157,9 @@ pub const Object = struct {
     /// (bit i => index i aliases env slot i; capped at 64 parameters).
     args_env: ?*Environment = null,
     args_map: u64 = 0,
-    /// WeakRef exotic: the referent (held weakly; cleared when it dies).
-    weak_target: ?*Object = null,
+    /// WeakRef exotic: the referent (an object or non-registered symbol, held
+    /// weakly; set to `.hole` once dead — deref then returns undefined).
+    weak_target: ?Value = null,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -427,7 +428,9 @@ pub const Heap = struct {
                 else => {},
             }
             if (o.weak_target) |t| {
-                if (!t.gc.marked) o.weak_target = null;
+                if (t.cellHeader()) |h| {
+                    if (!h.marked) o.weak_target = Value.hole_value; // referent died
+                }
             }
         }
 

@@ -717,3 +717,90 @@ test "RegExp u/v modes" {
         \\return (threw && new RegExp("\\q").test("q")) ? 1 : 0;
     ));
 }
+
+test "symbols as weak keys" {
+    // Non-registered symbols can be held weakly.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var wm = new WeakMap();
+        \\var s = Symbol("k");
+        \\wm.set(s, 42);
+        \\return (wm.get(s) === 42 && wm.has(s)) ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var ws = new WeakSet();
+        \\var s = Symbol();
+        \\ws.add(s);
+        \\return (ws.has(s) && new WeakRef(s).deref() === s) ? 1 : 0;
+    ));
+    // Registered symbols (Symbol.for) cannot.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var wm = new WeakMap();
+        \\try { wm.set(Symbol.for("x"), 1); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // Primitives still throw.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var ws = new WeakSet();
+        \\try { ws.add("str"); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+}
+
+test "Reflect completion" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\var ok = Reflect.defineProperty(o, "x", { value: 5, configurable: false });
+        \\var d = Reflect.getOwnPropertyDescriptor(o, "x");
+        \\return (ok === true && d.value === 5 && d.configurable === false) ? 1 : 0;
+    ));
+    // defineProperty returns false (not throw) on a rejected redefine.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\Reflect.defineProperty(o, "x", { value: 1, configurable: false, writable: false });
+        \\return Reflect.defineProperty(o, "x", { value: 2 }) === false ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var proto = { tag: 1 };
+        \\var o = {};
+        \\return (Reflect.setPrototypeOf(o, proto) === true && Reflect.getPrototypeOf(o) === proto) ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\var before = Reflect.isExtensible(o);
+        \\Reflect.preventExtensions(o);
+        \\return (before === true && Reflect.isExtensible(o) === false) ? 1 : 0;
+    ));
+    // deleteProperty honors non-configurable (returns false).
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\Object.defineProperty(o, "p", { value: 1, configurable: false });
+        \\return Reflect.deleteProperty(o, "p") === false ? 1 : 0;
+    ));
+}
+
+test "function and method .name" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { method() {}, get x() {}, set x(v) {} };
+        \\var d = Object.getOwnPropertyDescriptor(o, "x");
+        \\return (o.method.name === "method" && d.get.name === "get x" && d.set.name === "set x") ? 1 : 0;
+    ));
+    // NamedEvaluation: anonymous fn / arrow / class assigned to a binding.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var f = function () {};
+        \\var g = () => {};
+        \\const C = class {};
+        \\var h; h = function () {};
+        \\return (f.name === "f" && g.name === "g" && C.name === "C" && h.name === "h") ? 1 : 0;
+    ));
+    // A named function expression keeps its own name.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var f = function original() {};
+        \\return f.name === "original" ? 1 : 0;
+    ));
+    // .name is non-writable, configurable.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function foo() {}
+        \\var d = Object.getOwnPropertyDescriptor(foo, "name");
+        \\return (d.writable === false && d.configurable === true && d.enumerable === false) ? 1 : 0;
+    ));
+}

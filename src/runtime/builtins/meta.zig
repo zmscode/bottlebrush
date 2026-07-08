@@ -10,6 +10,7 @@ const Vm = interpreter.Vm;
 const Error = interpreter.Error;
 
 const support_mod = @import("../support.zig");
+const object_mod = @import("object.zig");
 const argAt = support_mod.argAt;
 const castVm = support_mod.castVm;
 const isConstructorValue = support_mod.isConstructorValue;
@@ -184,8 +185,8 @@ pub fn nativeReflectDelete(ctx: *anyopaque, this: Value, args: []const Value) Er
     if (!target.isObject()) return vm.throwTypeError("Reflect.deleteProperty called on non-object");
     const key = try vm.toPropertyKey(argAt(args, 1));
     defer vm.gpa.free(key);
-    if (target.asObject().properties.fetchOrderedRemove(key)) |kv| vm.gpa.free(kv.key);
-    return Value.fromBool(true);
+    // Honors non-configurable + proxy traps, reports [[Delete]]'s boolean.
+    return Value.fromBool(try vm.deleteProperty(target, key));
 }
 
 pub fn nativeReflectGetProto(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -247,4 +248,73 @@ pub fn nativeReflectConstruct(ctx: *anyopaque, this: Value, args: []const Value)
     const list = try vm.argListFromArray(args_arr);
     defer vm.gpa.free(list);
     return vm.constructValue(target, list);
+}
+
+/// Reflect.defineProperty(target, key, desc) -> boolean. Unlike
+/// Object.defineProperty (which throws on a rejected define), Reflect reports
+/// the [[DefineOwnProperty]] failure as `false`; a malformed descriptor or
+/// non-object target still throws.
+pub fn nativeReflectDefineProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.defineProperty called on non-object");
+    const desc = argAt(args, 2);
+    if (!desc.isObject()) return vm.throwTypeError("property descriptor must be an object");
+    const key = try vm.toPropertyKey(argAt(args, 1));
+    defer vm.gpa.free(key);
+    object_mod.applyDescriptor(vm, target.asObject(), key, desc) catch |e| switch (e) {
+        error.JsThrow => {
+            // A rejected define surfaces as `false`, not a throw.
+            vm.pending_exception = null;
+            return Value.fromBool(false);
+        },
+        else => return e,
+    };
+    return Value.fromBool(true);
+}
+
+pub fn nativeReflectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.getOwnPropertyDescriptor called on non-object");
+    return object_mod.nativeObjectGetOwnPropertyDescriptor(ctx, this, args);
+}
+
+pub fn nativeReflectSetProto(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.setPrototypeOf called on non-object");
+    const proto = argAt(args, 1);
+    if (!proto.isObject() and !proto.isNull()) return vm.throwTypeError("prototype must be an object or null");
+    object_mod.setPrototypeChecked(vm, target.asObject(), proto) catch |e| switch (e) {
+        error.JsThrow => {
+            vm.pending_exception = null;
+            return Value.fromBool(false);
+        },
+        else => return e,
+    };
+    return Value.fromBool(true);
+}
+
+pub fn nativeReflectIsExtensible(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.isExtensible called on non-object");
+    return object_mod.nativeObjectIsExtensible(ctx, this, args);
+}
+
+pub fn nativeReflectPreventExtensions(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (!target.isObject()) return vm.throwTypeError("Reflect.preventExtensions called on non-object");
+    _ = object_mod.nativeObjectPreventExtensions(ctx, this, args) catch |e| switch (e) {
+        error.JsThrow => {
+            vm.pending_exception = null;
+            return Value.fromBool(false);
+        },
+        else => return e,
+    };
+    return Value.fromBool(true);
 }

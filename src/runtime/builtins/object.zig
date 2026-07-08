@@ -602,7 +602,7 @@ pub fn nativeObjectToLocaleString(ctx: *anyopaque, this: Value, args: []const Va
 }
 
 /// OrdinarySetPrototypeOf with the spec's cycle check.
-fn setPrototypeChecked(vm: *Vm, obj: *gc.Object, proto_v: Value) Error!void {
+pub fn setPrototypeChecked(vm: *Vm, obj: *gc.Object, proto_v: Value) Error!void {
     const new_proto: ?*gc.Object = if (proto_v.isNull()) null else if (proto_v.isObject()) proto_v.asObject() else return vm.throwTypeError("prototype must be an object or null");
     // Proxy: dispatch to the setPrototypeOf trap (falsy result throws).
     if (try proxyParts(vm, obj)) |p| {
