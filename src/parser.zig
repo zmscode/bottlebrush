@@ -905,11 +905,15 @@ pub const Parser = struct {
                 return self.node(start, self.prev_end, .{ .private_name = name });
             },
             else => {
-                // Identifier or keyword used as a property name.
+                // Identifier or keyword used as a property name. A key spelled
+                // with escapes (`{ finally: x }`) uses its decoded name;
+                // reserved words are fine as property keys.
                 if (self.cur.kind == .identifier or self.cur.kind.isKeyword()) {
-                    const name = self.cur.lexeme(self.source);
+                    const tok = self.cur;
+                    const name = self.canonicalName(tok);
+                    const owned = if (tok.escaped) try self.arena.dupe(u8, name) else name;
                     self.advance();
-                    return self.node(start, self.prev_end, .{ .ident = name });
+                    return self.node(start, self.prev_end, .{ .ident = owned });
                 }
                 return self.fail("invalid property key");
             },
@@ -1241,9 +1245,11 @@ pub const Parser = struct {
             return self.node(start, self.prev_end, .{ .private_name = name });
         }
         if (self.at(.identifier) or self.cur.kind.isKeyword()) {
-            const name = self.cur.lexeme(self.source);
+            const tok = self.cur;
+            const name = self.canonicalName(tok);
+            const owned = if (tok.escaped) try self.arena.dupe(u8, name) else name;
             self.advance();
-            return self.node(start, self.prev_end, .{ .ident = name });
+            return self.node(start, self.prev_end, .{ .ident = owned });
         }
         return self.fail("expected property name");
     }

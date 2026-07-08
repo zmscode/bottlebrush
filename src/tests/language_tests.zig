@@ -738,3 +738,18 @@ test "derived default constructor installs parent elements; constructor-name err
         }
     }
 }
+
+test "escaped property keys decode to canonical names" {
+    // Destructuring with an escaped key reads the decoded property.
+    try std.testing.expectEqual(@as(f64, 42), try evalNumber(
+        "var x; ({ \\u0066inally: x } = { finally: 42 }); return x;",
+    ));
+    // Escaped member access resolves to the canonical property.
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber(
+        "var o = { class: 3 }; return o.\\u0063lass;",
+    ));
+    // Escaped key in an object literal defines the canonical property.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        "var o = { \\u0063lass: 9 }; return o[\"class\"] === 9 ? 1 : 0;",
+    ));
+}
