@@ -73,7 +73,7 @@ pub const PropertyDescriptor = struct {
 /// later addition.
 pub const PropertyMap = std.StringArrayHashMapUnmanaged(PropertyDescriptor);
 
-pub const Collection = enum { none, map, set };
+pub const Collection = enum { none, map, set, weak_map, weak_set };
 
 /// Typed-array element kinds.
 pub const TAKind = enum { i8, u8, u8c, i16, u16, i32, u32, f32, f64 };
@@ -140,6 +140,8 @@ pub const Object = struct {
     /// Proxy exotic: when set, fundamental operations dispatch to trap functions
     /// on `proxy_handler`, with `proxy_target` as the underlying object.
     proxy_target: ?*Object = null,
+    /// Revoked proxies keep their identity but every operation throws.
+    proxy_revoked: bool = false,
     proxy_handler: ?*Object = null,
     /// Generator activation state (heap-owned); null for non-generators.
     generator: ?*GeneratorState = null,
@@ -155,6 +157,8 @@ pub const Object = struct {
     /// (bit i => index i aliases env slot i; capped at 64 parameters).
     args_env: ?*Environment = null,
     args_map: u64 = 0,
+    /// WeakRef exotic: the referent (held weakly; cleared when it dies).
+    weak_target: ?*Object = null,
 
     pub fn trace(self: *Object, t: *Tracer) void {
         if (self.prototype) |p| t.mark(&p.gc);
@@ -165,7 +169,11 @@ pub const Object = struct {
             if (entry.value_ptr.get) |g| g.mark(t);
             if (entry.value_ptr.set) |s| s.mark(t);
         }
-        for (self.elements.items) |v| v.mark(t);
+        // Weak collections hold their entries weakly: the collector's
+        // ephemeron pass (Heap.collect) decides what survives.
+        if (self.collection != .weak_map and self.collection != .weak_set) {
+            for (self.elements.items) |v| v.mark(t);
+        }
         if (self.dictionary_mode) {
             var dit = self.array_dict.valueIterator();
             while (dit.next()) |v| v.mark(t);
@@ -265,10 +273,19 @@ pub const Symbol = struct {
 pub const BigInt = struct {
     pub const gc_kind: Kind = .bigint;
     gc: GcHeader,
-    /// Placeholder magnitude; Phase 4 replaces this with a real bignum.
-    value: i64 = 0,
+    /// Arbitrary-precision magnitude (std.math.big little-endian limbs; owned).
+    limbs: []std.math.big.Limb = &.{},
+    positive: bool = true,
 
     pub fn trace(_: *BigInt, _: *Tracer) void {}
+
+    pub fn toConst(self: *const BigInt) std.math.big.int.Const {
+        if (self.limbs.len == 0) {
+            // Zero: a Const must have at least one limb.
+            return .{ .limbs = &[_]std.math.big.Limb{0}, .positive = true };
+        }
+        return .{ .limbs = self.limbs, .positive = self.positive };
+    }
 };
 
 // ---- Tracer ----------------------------------------------------------------
@@ -351,6 +368,69 @@ pub const Heap = struct {
         var tracer = Tracer{ .heap = self };
         root_provider.markRoots(&tracer);
 
+        // Ephemeron fixpoint: a WeakMap entry's value is reachable only while
+        // its key is. Marking a value can make further keys reachable, so
+        // iterate until stable.
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var it = self.all;
+            while (it) |header| : (it = header.next) {
+                if (!header.marked or header.kind != .object) continue;
+                const o = cellFromHeader(Object, header);
+                if (o.collection != .weak_map) continue;
+                var i: usize = 0;
+                while (i + 1 < o.elements.items.len) : (i += 2) {
+                    const kh = o.elements.items[i].cellHeader() orelse continue;
+                    if (!kh.marked) continue;
+                    if (o.elements.items[i + 1].cellHeader()) |vh| {
+                        if (!vh.marked) {
+                            tracer.mark(vh);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear dead weak entries and WeakRef targets on survivors (their key
+        // pointers dangle once the sweep frees the cells).
+        var it = self.all;
+        while (it) |header| : (it = header.next) {
+            if (!header.marked or header.kind != .object) continue;
+            const o = cellFromHeader(Object, header);
+            switch (o.collection) {
+                .weak_map => {
+                    var i: usize = 0;
+                    while (i + 1 < o.elements.items.len) {
+                        const kh = o.elements.items[i].cellHeader();
+                        if (kh != null and !kh.?.marked) {
+                            // Remove the pair, preserving order.
+                            _ = o.elements.orderedRemove(i + 1);
+                            _ = o.elements.orderedRemove(i);
+                        } else {
+                            i += 2;
+                        }
+                    }
+                },
+                .weak_set => {
+                    var i: usize = 0;
+                    while (i < o.elements.items.len) {
+                        const kh = o.elements.items[i].cellHeader();
+                        if (kh != null and !kh.?.marked) {
+                            _ = o.elements.orderedRemove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                },
+                else => {},
+            }
+            if (o.weak_target) |t| {
+                if (!t.gc.marked) o.weak_target = null;
+            }
+        }
+
         // Sweep: walk the intrusive list, freeing unmarked cells and clearing
         // mark bits on survivors.
         var freed: usize = 0;
@@ -386,7 +466,11 @@ pub const Heap = struct {
                 if (s.description) |d| self.gpa.free(d);
                 self.gpa.destroy(s);
             },
-            .bigint => self.gpa.destroy(cellFromHeader(BigInt, header)),
+            .bigint => {
+                const bi = cellFromHeader(BigInt, header);
+                if (bi.limbs.len > 0) self.gpa.free(bi.limbs);
+                self.gpa.destroy(bi);
+            },
             .environment => {
                 const e = cellFromHeader(Environment, header);
                 e.deinitCell(self.gpa);

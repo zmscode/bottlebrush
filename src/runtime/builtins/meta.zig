@@ -105,6 +105,49 @@ pub fn nativeProxy(ctx: *anyopaque, this: Value, args: []const Value) Error!Valu
     return this;
 }
 
+/// Proxy.revocable(target, handler) -> { proxy, revoke }. The revoke function
+/// reaches its proxy through the bound-function machinery (bound_this).
+pub fn nativeProxyRevocable(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    const handler = argAt(args, 1);
+    if (!target.isObject() or !handler.isObject()) {
+        return vm.throwTypeError("Cannot create proxy with a non-object as target or handler");
+    }
+    const proxy = try vm.newObject(vm.object_proto);
+    try vm.protect(Value.fromObject(proxy));
+    defer vm.unprotect();
+    proxy.proxy_target = target.asObject();
+    proxy.proxy_handler = handler.asObject();
+    proxy.callable = target.asObject().callable;
+
+    const inner = try vm.makeNative("revoke", nativeProxyRevoke, 0);
+    try vm.protect(Value.fromObject(inner));
+    defer vm.unprotect();
+    const revoke = try vm.makeNative("revoke", nativeProxyRevoke, 0);
+    try vm.protect(Value.fromObject(revoke));
+    defer vm.unprotect();
+    revoke.bound_target = Value.fromObject(inner);
+    revoke.bound_this = Value.fromObject(proxy);
+
+    const result = try vm.newObject(vm.object_proto);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    try vm.defineData(result, "proxy", Value.fromObject(proxy), true, true, true);
+    try vm.defineData(result, "revoke", Value.fromObject(revoke), true, true, true);
+    return Value.fromObject(result);
+}
+
+pub fn nativeProxyRevoke(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = args;
+    if (this.isObject() and this.asObject().proxy_target != null) {
+        this.asObject().proxy_revoked = true;
+    }
+    return Value.undefined_value;
+}
+
 pub fn nativeReflectGet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = this;
     const vm = castVm(ctx);

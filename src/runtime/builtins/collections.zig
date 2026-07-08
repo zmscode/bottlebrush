@@ -182,3 +182,107 @@ pub fn nativeCollectionClear(ctx: *anyopaque, this: Value, args: []const Value) 
     if (this.isObject()) this.asObject().elements.clearRetainingCapacity();
     return Value.undefined_value;
 }
+
+// ---- WeakMap / WeakSet / WeakRef --------------------------------------------
+
+fn requireObjectKey(vm: *Vm, v: Value) Error!void {
+    if (!v.isObject()) return vm.throwTypeError("weak collection keys must be objects");
+}
+
+pub fn nativeWeakMap(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("constructor WeakMap requires 'new'");
+    this.asObject().collection = .weak_map;
+    return this;
+}
+
+pub fn nativeWeakMapGet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .weak_map);
+    if (!argAt(args, 0).isObject()) return Value.undefined_value;
+    if (mapFind(map, args[0])) |i| return map.elements.items[i + 1];
+    return Value.undefined_value;
+}
+
+pub fn nativeWeakMapSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .weak_map);
+    try requireObjectKey(vm, argAt(args, 0));
+    if (mapFind(map, args[0])) |i| {
+        map.elements.items[i + 1] = argAt(args, 1);
+    } else {
+        try map.elements.append(vm.gpa, args[0]);
+        try map.elements.append(vm.gpa, argAt(args, 1));
+    }
+    return this;
+}
+
+pub fn nativeWeakMapHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .weak_map);
+    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    return Value.fromBool(mapFind(map, args[0]) != null);
+}
+
+pub fn nativeWeakMapDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const map = try thisCollection(vm, this, .weak_map);
+    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    if (mapFind(map, args[0])) |i| {
+        _ = map.elements.orderedRemove(i + 1);
+        _ = map.elements.orderedRemove(i);
+        return Value.fromBool(true);
+    }
+    return Value.fromBool(false);
+}
+
+pub fn nativeWeakSet(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("constructor WeakSet requires 'new'");
+    this.asObject().collection = .weak_set;
+    return this;
+}
+
+pub fn nativeWeakSetAdd(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .weak_set);
+    try requireObjectKey(vm, argAt(args, 0));
+    if (setFind(set, args[0]) == null) try set.elements.append(vm.gpa, args[0]);
+    return this;
+}
+
+pub fn nativeWeakSetHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .weak_set);
+    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    return Value.fromBool(setFind(set, args[0]) != null);
+}
+
+pub fn nativeWeakSetDelete(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const set = try thisCollection(vm, this, .weak_set);
+    if (!argAt(args, 0).isObject()) return Value.fromBool(false);
+    if (setFind(set, args[0])) |i| {
+        _ = set.elements.orderedRemove(i);
+        return Value.fromBool(true);
+    }
+    return Value.fromBool(false);
+}
+
+pub fn nativeWeakRef(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("constructor WeakRef requires 'new'");
+    try requireObjectKey(vm, argAt(args, 0));
+    this.asObject().weak_target = args[0].asObject();
+    return this;
+}
+
+pub fn nativeWeakRefDeref(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (!this.isObject()) return vm.throwTypeError("WeakRef.prototype.deref called on non-object");
+    if (this.asObject().weak_target) |t| return Value.fromObject(t);
+    return Value.undefined_value;
+}

@@ -330,3 +330,169 @@ test "mapped arguments" {
         \\return k(1);
     ));
 }
+
+test "BigInt" {
+    // Literals, typeof, arithmetic beyond 2^53.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return typeof 1n === \"bigint\" ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return (9007199254740993n + 1n) === 9007199254740994n ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return (2n ** 64n).toString() === \"18446744073709551616\" ? 1 : 0;"));
+    // Mixed arithmetic throws; comparisons and loose equality do not.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var threw = false;
+        \\try { 1n + 1; } catch (e) { threw = e instanceof TypeError; }
+        \\return (threw && 1n == 1 && 1n === 1n && !(1n === 1) && 2n > 1 && 1n < 2) ? 1 : 0;
+    ));
+    // Division truncates; modulo; division by zero throws RangeError.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var threw = false;
+        \\try { 1n / 0n; } catch (e) { threw = e instanceof RangeError; }
+        \\return (7n / 2n === 3n && -7n / 2n === -3n && 7n % 2n === 1n && threw) ? 1 : 0;
+    ));
+    // Bitwise, shifts, negate, bit-not.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return ((12n & 10n) === 8n && (12n | 3n) === 15n && (12n ^ 10n) === 6n &&
+        \\        (1n << 100n) === 1267650600228229401496703205376n &&
+        \\        (256n >> 4n) === 16n && -5n === -(5n) && ~5n === -6n) ? 1 : 0;
+    ));
+    // BigInt() conversions.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var bad = false;
+        \\try { BigInt(1.5); } catch (e) { bad = e instanceof RangeError; }
+        \\return (BigInt(42) === 42n && BigInt("0x10") === 16n && BigInt("  7  ") === 7n &&
+        \\        BigInt(true) === 1n && bad) ? 1 : 0;
+    ));
+    // toString radix, String(), asIntN/asUintN.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return ((255n).toString(16) === "ff" && String(-10n) === "-10" &&
+        \\        BigInt.asIntN(8, 255n) === -1n && BigInt.asUintN(8, 257n) === 1n &&
+        \\        BigInt.asIntN(8, -129n) === 127n) ? 1 : 0;
+    ));
+    // Booleans, JSON, Number() explicit conversion.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var jthrew = false;
+        \\try { JSON.stringify({ x: 1n }); } catch (e) { jthrew = e instanceof TypeError; }
+        \\return ((0n ? 1 : 0) === 0 && (1n ? 1 : 0) === 1 && Number(5n) === 5 && jthrew) ? 1 : 0;
+    ));
+}
+
+test "WeakMap / WeakSet / WeakRef basics" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var wm = new WeakMap();
+        \\var k1 = {}, k2 = {};
+        \\wm.set(k1, "one").set(k2, 2);
+        \\var deleted = wm.delete(k2);
+        \\return (wm.get(k1) === "one" && wm.has(k1) && deleted && !wm.has(k2) &&
+        \\        wm.get(k2) === undefined && !wm.has("prim")) ? 1 : 0;
+    ));
+    // Non-object keys throw on insert.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var wm = new WeakMap();
+        \\try { wm.set(1, "x"); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var ws = new WeakSet();
+        \\var o = {};
+        \\ws.add(o);
+        \\var had = ws.has(o);
+        \\ws.delete(o);
+        \\return (had && !ws.has(o)) ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var target = { alive: true };
+        \\var ref = new WeakRef(target);
+        \\return (ref.deref() === target) ? 1 : 0;
+    ));
+}
+
+test "Proxy traps and invariants" {
+    // deleteProperty, getPrototypeOf, setPrototypeOf, ownKeys, defineProperty,
+    // getOwnPropertyDescriptor, isExtensible/preventExtensions traps.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var deleted = [];
+        \\var p = new Proxy({ a: 1, b: 2 }, {
+        \\  deleteProperty: function (t, k) { deleted.push(k); delete t[k]; return true; },
+        \\  ownKeys: function (t) { return ["x", "y"]; },
+        \\});
+        \\delete p.a;
+        \\var keys = Object.keys(p);
+        \\return (deleted[0] === "a" && keys.length === 2 && keys[0] === "x" && keys[1] === "y") ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var fakeProto = { marker: true };
+        \\var p = new Proxy({}, { getPrototypeOf: function () { return fakeProto; } });
+        \\return Object.getPrototypeOf(p) === fakeProto ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var defined = null;
+        \\var p = new Proxy({}, {
+        \\  defineProperty: function (t, k, d) { defined = k; Object.defineProperty(t, k, d); return true; },
+        \\  getOwnPropertyDescriptor: function (t, k) { return { value: 99, writable: true, enumerable: true, configurable: true }; },
+        \\});
+        \\Object.defineProperty(p, "q", { value: 5 });
+        \\var d = Object.getOwnPropertyDescriptor(p, "anything");
+        \\return (defined === "q" && d.value === 99) ? 1 : 0;
+    ));
+    // get invariant: non-configurable non-writable target prop pins the value.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var t = {};
+        \\Object.defineProperty(t, "locked", { value: 1 });
+        \\var p = new Proxy(t, { get: function () { return 2; } });
+        \\try { p.locked; return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // has invariant: cannot hide a non-configurable own property.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var t = {};
+        \\Object.defineProperty(t, "hidden", { value: 1 });
+        \\var p = new Proxy(t, { has: function () { return false; } });
+        \\try { "hidden" in p; return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // set trap refusal throws in strict mode.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\"use strict";
+        \\var p = new Proxy({}, { set: function () { return false; } });
+        \\try { p.x = 1; return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // isExtensible must agree with the target.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var p = new Proxy({}, { isExtensible: function () { return false; } });
+        \\try { Object.isExtensible(p); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+}
+
+test "Proxy.revocable" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var r = Proxy.revocable({ v: 7 }, {});
+        \\var before = r.proxy.v;
+        \\r.revoke();
+        \\try { r.proxy.v; return 0; }
+        \\catch (e) { return (before === 7 && e instanceof TypeError) ? 1 : 2; }
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var r = Proxy.revocable({}, {});
+        \\r.revoke();
+        \\r.revoke(); // idempotent
+        \\try { "x" in r.proxy; return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+}
+
+test "$262 host object" {
+    var vm = helpers.Vm.init(helpers.gpa);
+    defer vm.deinit();
+    try vm.installHost262();
+    // Note: `var` inside evalScript stays in the eval program's env (known
+    // indirect-eval scoping gap), so the script communicates via an implicit
+    // global assignment.
+    const v = try eval(&vm,
+        \\var g = $262.global;
+        \\$262.evalScript("fromEval = 41;");
+        \\$262.gc();
+        \\return (g === globalThis && fromEval === 41 && typeof $262.detachArrayBuffer === "function") ? 1 : 0;
+    );
+    try std.testing.expectEqual(@as(f64, 1), v.asNumber());
+}

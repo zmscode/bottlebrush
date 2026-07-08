@@ -127,11 +127,34 @@ pub fn nativeIsPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Er
     return Value.fromBool(false);
 }
 
+/// If `o` is a live proxy, returns its target+handler; throws when revoked.
+pub fn proxyParts(vm: *Vm, o: *gc.Object) Error!?struct { target: *gc.Object, handler: *gc.Object } {
+    const t = o.proxy_target orelse return null;
+    if (o.proxy_revoked) return vm.throwTypeError("cannot perform operation on a revoked proxy");
+    return .{ .target = t, .handler = o.proxy_handler.? };
+}
+
+/// Fetch a trap function from a proxy handler, or null to forward.
+fn proxyTrap(vm: *Vm, handler: *gc.Object, name: []const u8) Error!?Value {
+    const trap = try vm.getProperty(Value.fromObject(handler), name);
+    if (isCallable(trap)) return trap;
+    if (!trap.isUndefined() and !trap.isNull()) return vm.throwTypeError("proxy trap is not a function");
+    return null;
+}
+
 pub fn nativeObjectGetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     _ = this;
     const v = argAt(args, 0);
     if (!v.isObject()) return vm.throwTypeError("Object.getPrototypeOf called on non-object");
+    if (try proxyParts(vm, v.asObject())) |p| {
+        if (try proxyTrap(vm, p.handler, "getPrototypeOf")) |trap| {
+            const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{Value.fromObject(p.target)});
+            if (!r.isObject() and !r.isNull()) return vm.throwTypeError("proxy getPrototypeOf must return an object or null");
+            return r;
+        }
+        return nativeObjectGetPrototypeOf(ctx, Value.undefined_value, &.{Value.fromObject(p.target)});
+    }
     return if (v.asObject().prototype) |p| Value.fromObject(p) else Value.null_value;
 }
 
@@ -147,6 +170,18 @@ pub fn nativeObjectCreate(ctx: *anyopaque, this: Value, args: []const Value) Err
 /// (shared by Object.defineProperty / Object.defineProperties).
 pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value) Error!void {
     if (!desc_v.isObject()) return vm.throwTypeError("property descriptor must be an object");
+    // Proxy: dispatch to the defineProperty trap (falsy result throws).
+    if (try proxyParts(vm, obj)) |p| {
+        if (try proxyTrap(vm, p.handler, "defineProperty")) |trap| {
+            const ks = try vm.makeString(key);
+            try vm.protect(ks);
+            defer vm.unprotect();
+            const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{ Value.fromObject(p.target), ks, desc_v });
+            if (!toBoolean(r)) return vm.throwTypeError("proxy defineProperty trap returned falsy");
+            return;
+        }
+        return applyDescriptor(vm, p.target, key, desc_v);
+    }
     const d = desc_v.asObject();
 
     // Which fields the descriptor actually mentions (partial descriptors merge).
@@ -283,17 +318,42 @@ pub fn nativeObjectDefineProperties(ctx: *anyopaque, this: Value, args: []const 
 }
 
 pub fn nativeObjectPreventExtensions(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
+    const vm = castVm(ctx);
     _ = this;
     const v = argAt(args, 0);
-    if (v.isObject()) v.asObject().extensible = false;
+    if (v.isObject()) {
+        if (try proxyParts(vm, v.asObject())) |p| {
+            if (try proxyTrap(vm, p.handler, "preventExtensions")) |trap| {
+                const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{Value.fromObject(p.target)});
+                if (!toBoolean(r)) return vm.throwTypeError("proxy preventExtensions trap returned falsy");
+                return v;
+            }
+            p.target.extensible = false;
+            return v;
+        }
+        v.asObject().extensible = false;
+    }
     return v; // ES2015: non-objects pass through
 }
 
 pub fn nativeObjectIsExtensible(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
-    _ = ctx;
+    const vm = castVm(ctx);
     _ = this;
     const v = argAt(args, 0);
+    if (v.isObject()) {
+        if (try proxyParts(vm, v.asObject())) |p| {
+            if (try proxyTrap(vm, p.handler, "isExtensible")) |trap| {
+                const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{Value.fromObject(p.target)});
+                const answer = toBoolean(r);
+                // Invariant: must agree with the target.
+                if (answer != p.target.extensible) {
+                    return vm.throwTypeError("proxy isExtensible must match the target's extensibility");
+                }
+                return Value.fromBool(answer);
+            }
+            return Value.fromBool(p.target.extensible);
+        }
+    }
     return Value.fromBool(v.isObject() and v.asObject().extensible);
 }
 
@@ -378,6 +438,20 @@ pub fn nativeObjectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: 
     }
     // Array exotic own properties: indices and `length` don't live in the map.
     const o = obj_v.asObject();
+    // Proxy: dispatch to the getOwnPropertyDescriptor trap.
+    if (try proxyParts(vm, o)) |p| {
+        if (try proxyTrap(vm, p.handler, "getOwnPropertyDescriptor")) |trap| {
+            const ks = try vm.makeString(key);
+            try vm.protect(ks);
+            defer vm.unprotect();
+            const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{ Value.fromObject(p.target), ks });
+            if (!r.isObject() and !r.isUndefined()) {
+                return vm.throwTypeError("proxy getOwnPropertyDescriptor must return an object or undefined");
+            }
+            return r;
+        }
+        return nativeObjectGetOwnPropertyDescriptor(ctx, Value.undefined_value, &.{ Value.fromObject(p.target), argAt(args, 1) });
+    }
     // String wrapper: indexed own properties read the boxed [[StringData]].
     if (o.properties.get(prim_key)) |d| {
         if (d.value.isString()) {
@@ -530,6 +604,15 @@ pub fn nativeObjectToLocaleString(ctx: *anyopaque, this: Value, args: []const Va
 /// OrdinarySetPrototypeOf with the spec's cycle check.
 fn setPrototypeChecked(vm: *Vm, obj: *gc.Object, proto_v: Value) Error!void {
     const new_proto: ?*gc.Object = if (proto_v.isNull()) null else if (proto_v.isObject()) proto_v.asObject() else return vm.throwTypeError("prototype must be an object or null");
+    // Proxy: dispatch to the setPrototypeOf trap (falsy result throws).
+    if (try proxyParts(vm, obj)) |p| {
+        if (try proxyTrap(vm, p.handler, "setPrototypeOf")) |trap| {
+            const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{ Value.fromObject(p.target), proto_v });
+            if (!toBoolean(r)) return vm.throwTypeError("proxy setPrototypeOf trap returned falsy");
+            return;
+        }
+        return setPrototypeChecked(vm, p.target, proto_v);
+    }
     if (!obj.extensible) return vm.throwTypeError("cannot set prototype of a non-extensible object");
     // Reject prototype cycles.
     var p = new_proto;

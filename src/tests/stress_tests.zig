@@ -112,3 +112,24 @@ test "objects under GC stress" {
     );
     try testing.expectEqual(@as(f64, 6), v.asNumber());
 }
+
+test "weak collections drop dead entries under GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    // The literal passed to set() is unreachable once set() returns; under
+    // stress the very next allocation collects it, so the entry must vanish
+    // while the still-referenced key survives.
+    const v = try eval(&vm,
+        \\var wm = new WeakMap();
+        \\var kept = {};
+        \\wm.set(kept, { big: "value" });
+        \\wm.set({}, "doomed");
+        \\var wr = new WeakRef({});
+        \\var x = [];
+        \\for (var i = 0; i < 50; i++) { x.push({ n: i }); }
+        \\return (wm.has(kept) && wm.get(kept).big === "value" &&
+        \\        wr.deref() === undefined) ? 1 : 0;
+    );
+    try testing.expectEqual(@as(f64, 1), v.asNumber());
+}

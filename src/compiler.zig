@@ -1177,6 +1177,14 @@ pub const Compiler = struct {
     fn compileExprInto(self: *Compiler, dst: u32, node: *Node) CompileError!void {
         switch (node.kind) {
             .number => |n| {
+                if (n.bigint) {
+                    // Strip the trailing `n`; the VM parses the digits at
+                    // constant-materialization time (arbitrary precision).
+                    const digits = if (std.mem.endsWith(u8, n.raw, "n")) n.raw[0 .. n.raw.len - 1] else n.raw;
+                    const idx = try self.addConst(.{ .bigint = digits });
+                    _ = try self.emit(.{ .op = .load_const, .a = dst, .b = idx });
+                    return;
+                }
                 const val = parseNumber(n.raw) catch return self.fail("invalid number", node.start);
                 const idx = try self.addConst(.{ .number = val });
                 _ = try self.emit(.{ .op = .load_const, .a = dst, .b = idx });

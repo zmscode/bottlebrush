@@ -39,6 +39,7 @@ const readTypedElement = support_mod.readTypedElement;
 const regexp_flags_key = support_mod.regexp_flags_key;
 const regexp_source_key = support_mod.regexp_source_key;
 const sameTypeStrictEq = support_mod.sameTypeStrictEq;
+const sameValue = support_mod.sameValue;
 const stringToNumber = support_mod.stringToNumber;
 const toBoolean = support_mod.toBoolean;
 const utf16ToUtf8Alloc = support_mod.utf16ToUtf8Alloc;
@@ -152,6 +153,7 @@ pub const Vm = struct {
     symbol_split_key: []const u8 = &.{},
     iterator_proto: ?*gc.Object = null,
     generator_proto: ?*gc.Object = null,
+    bigint_proto: ?*gc.Object = null,
 
     const SymbolReg = struct { key: []u8, sym: *gc.Symbol };
 
@@ -211,6 +213,7 @@ pub const Vm = struct {
         if (self.symbol_iterator) |s| s.mark(tracer);
         if (self.iterator_proto) |o| tracer.mark(&o.gc);
         if (self.generator_proto) |o| tracer.mark(&o.gc);
+        if (self.bigint_proto) |o| tracer.mark(&o.gc);
         for (self.symbol_registry.items) |r| tracer.mark(&r.sym.gc);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
@@ -267,6 +270,52 @@ pub const Vm = struct {
         self.heap.stress = false;
         defer self.heap.stress = saved_stress;
         try realm.installBuiltins(self);
+    }
+
+    /// Test262 host hooks: define `$262` on the global. Called by the
+    /// conformance runner only — normal realms never see it.
+    pub fn installHost262(self: *Vm) Error!void {
+        try self.bootstrap();
+        const host = try self.newObject(self.object_proto);
+        try self.protect(Value.fromObject(host));
+        defer self.unprotect();
+        try self.defineData(host, "global", Value.fromObject(self.global_object.?), true, false, true);
+        try self.defineMethod(host, "evalScript", nativeHostEvalScript, 1);
+        try self.defineMethod(host, "gc", nativeHostGc, 0);
+        try self.defineMethod(host, "detachArrayBuffer", nativeHostDetachArrayBuffer, 1);
+        try self.defineData(self.global_object.?, "$262", Value.fromObject(host), true, false, true);
+    }
+
+    fn nativeHostEvalScript(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        _ = this;
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        const sv = try vm.toStringVal(if (args.len > 0) args[0] else Value.undefined_value);
+        try vm.protect(sv);
+        defer vm.unprotect();
+        const utf8 = try utf16ToUtf8Alloc(vm.gpa, sv.asString().units);
+        defer vm.gpa.free(utf8);
+        return vm.evalSource(utf8);
+    }
+
+    fn nativeHostGc(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        _ = this;
+        _ = args;
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        _ = vm.heap.collect(vm);
+        return Value.undefined_value;
+    }
+
+    fn nativeHostDetachArrayBuffer(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        _ = this;
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        if (args.len > 0 and args[0].isObject()) {
+            const o = args[0].asObject();
+            if (o.buffer_data) |data| {
+                vm.gpa.free(data);
+                o.buffer_data = null;
+            }
+        }
+        return Value.undefined_value;
     }
 
     pub fn makeNative(self: *Vm, name: []const u8, func: gc.NativeFn, length: u32) Error!*gc.Object {
@@ -611,21 +660,21 @@ pub const Vm = struct {
             },
 
             .add => regs[inst.a] = try self.opAdd(regs[inst.b], regs[inst.c]),
-            .sub => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) - try self.toNumber(regs[inst.c])),
-            .mul => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) * try self.toNumber(regs[inst.c])),
-            .div => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) / try self.toNumber(regs[inst.c])),
-            .mod => regs[inst.a] = Value.fromNumber(jsMod(try self.toNumber(regs[inst.b]), try self.toNumber(regs[inst.c]))),
-            .exp => regs[inst.a] = Value.fromNumber(jsPow(try self.toNumber(regs[inst.b]), try self.toNumber(regs[inst.c]))),
-            .neg => regs[inst.a] = Value.fromNumber(-(try self.toNumber(regs[inst.b]))),
+            .sub => regs[inst.a] = try self.numericBinop(.sub, regs[inst.b], regs[inst.c]),
+            .mul => regs[inst.a] = try self.numericBinop(.mul, regs[inst.b], regs[inst.c]),
+            .div => regs[inst.a] = try self.numericBinop(.div, regs[inst.b], regs[inst.c]),
+            .mod => regs[inst.a] = try self.numericBinop(.mod, regs[inst.b], regs[inst.c]),
+            .exp => regs[inst.a] = try self.numericBinop(.exp, regs[inst.b], regs[inst.c]),
+            .neg => regs[inst.a] = try self.opNegate(regs[inst.b]),
             .to_number => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b])),
 
-            .bit_and => regs[inst.a] = Value.fromNumber(@floatFromInt(try self.toInt32(regs[inst.b]) & try self.toInt32(regs[inst.c]))),
-            .bit_or => regs[inst.a] = Value.fromNumber(@floatFromInt(try self.toInt32(regs[inst.b]) | try self.toInt32(regs[inst.c]))),
-            .bit_xor => regs[inst.a] = Value.fromNumber(@floatFromInt(try self.toInt32(regs[inst.b]) ^ try self.toInt32(regs[inst.c]))),
-            .shl => regs[inst.a] = Value.fromNumber(@floatFromInt(jsShl(try self.toInt32(regs[inst.b]), try self.toUint32(regs[inst.c])))),
-            .shr => regs[inst.a] = Value.fromNumber(@floatFromInt(jsShr(try self.toInt32(regs[inst.b]), try self.toUint32(regs[inst.c])))),
-            .ushr => regs[inst.a] = Value.fromNumber(@floatFromInt(jsUshr(try self.toInt32(regs[inst.b]), try self.toUint32(regs[inst.c])))),
-            .bit_not => regs[inst.a] = Value.fromNumber(@floatFromInt(~(try self.toInt32(regs[inst.b])))),
+            .bit_and => regs[inst.a] = try self.numericBinop(.bit_and, regs[inst.b], regs[inst.c]),
+            .bit_or => regs[inst.a] = try self.numericBinop(.bit_or, regs[inst.b], regs[inst.c]),
+            .bit_xor => regs[inst.a] = try self.numericBinop(.bit_xor, regs[inst.b], regs[inst.c]),
+            .shl => regs[inst.a] = try self.numericBinop(.shl, regs[inst.b], regs[inst.c]),
+            .shr => regs[inst.a] = try self.numericBinop(.shr, regs[inst.b], regs[inst.c]),
+            .ushr => regs[inst.a] = try self.numericBinop(.ushr, regs[inst.b], regs[inst.c]),
+            .bit_not => regs[inst.a] = try self.opBitNot(regs[inst.b]),
 
             .eq => regs[inst.a] = Value.fromBool(try self.looseEquals(regs[inst.b], regs[inst.c])),
             .ne => regs[inst.a] = Value.fromBool(!(try self.looseEquals(regs[inst.b], regs[inst.c]))),
@@ -684,14 +733,14 @@ pub const Vm = struct {
                 try self.setPropertyMode(regs[inst.a], key, regs[inst.c], code.is_strict);
             },
             .delete_prop => {
-                const ok = self.deleteProperty(regs[inst.b], code.constants[inst.c].string);
+                const ok = try self.deleteProperty(regs[inst.b], code.constants[inst.c].string);
                 if (code.is_strict and !ok) return self.throwTypeError("cannot delete non-configurable property");
                 regs[inst.a] = Value.fromBool(ok);
             },
             .delete_elem => {
                 const key = try self.toPropertyKey(regs[inst.c]);
                 defer self.gpa.free(key);
-                const ok = self.deleteProperty(regs[inst.b], key);
+                const ok = try self.deleteProperty(regs[inst.b], key);
                 if (code.is_strict and !ok) return self.throwTypeError("cannot delete non-configurable property");
                 regs[inst.a] = Value.fromBool(ok);
             },
@@ -784,6 +833,7 @@ pub const Vm = struct {
         // Callable proxy: dispatch to the `apply` trap, else forward to target.
         if (callee.isObject()) {
             if (callee.asObject().proxy_target) |target| {
+                if (callee.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
                 const handler = callee.asObject().proxy_handler.?;
                 const trap = try self.getProperty(Value.fromObject(handler), "apply");
                 if (isCallable(trap)) {
@@ -885,6 +935,7 @@ pub const Vm = struct {
         // Constructor proxy: dispatch to the `construct` trap, else forward.
         if (callee.isObject()) {
             if (callee.asObject().proxy_target) |target| {
+                if (callee.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
                 const handler = callee.asObject().proxy_handler.?;
                 const trap = try self.getProperty(Value.fromObject(handler), "construct");
                 if (isCallable(trap)) {
@@ -1397,10 +1448,21 @@ pub const Vm = struct {
     pub fn getProperty(self: *Vm, base: Value, key: []const u8) Error!Value {
         if (base.isObject()) {
             if (base.asObject().proxy_target) |target| {
+                if (base.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
                 const handler = base.asObject().proxy_handler.?;
                 const trap = try self.getProperty(Value.fromObject(handler), "get");
                 if (isCallable(trap)) {
-                    return self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), base });
+                    const result = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), base });
+                    // Invariant: a non-configurable non-writable data property
+                    // of the target pins the trap's answer.
+                    if (target.properties.get(key)) |desc| {
+                        if (!desc.configurable and !desc.is_accessor and !desc.writable and
+                            !sameValue(result, desc.value))
+                        {
+                            return self.throwTypeError("proxy get must report the same value for a non-configurable, non-writable property");
+                        }
+                    }
+                    return result;
                 }
                 return self.getProperty(Value.fromObject(target), key);
             }
@@ -1421,6 +1483,7 @@ pub const Vm = struct {
             if (base.isNumber()) return self.getFromProto(self.number_proto, base, key);
             if (base.isBoolean()) return self.getFromProto(self.boolean_proto, base, key);
             if (base.isSymbol()) return self.getFromProto(self.symbol_proto, base, key);
+            if (base.isBigInt()) return self.getFromProto(self.bigint_proto, base, key);
             return Value.undefined_value;
         }
         // Mapped `arguments` exotic: mapped indices alias the parameter slots.
@@ -1502,11 +1565,14 @@ pub const Vm = struct {
     fn setPropertyInner(self: *Vm, base: Value, key: []const u8, value: Value) Error!bool {
         if (base.isObject()) {
             if (base.asObject().proxy_target) |target| {
+                if (base.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
                 const handler = base.asObject().proxy_handler.?;
                 const trap = try self.getProperty(Value.fromObject(handler), "set");
                 if (isCallable(trap)) {
-                    _ = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), value, base });
-                    return true;
+                    const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), value, base });
+                    // A falsy trap result means the write was refused (strict
+                    // mode callers turn that into a TypeError).
+                    return toBoolean(r);
                 }
                 return self.setPropertyInner(Value.fromObject(target), key, value);
             }
@@ -1587,9 +1653,29 @@ pub const Vm = struct {
 
     /// [[Delete]]: remove an own property. Returns false only when the property
     /// exists and is non-configurable (per the spec), true otherwise.
-    pub fn deleteProperty(self: *Vm, base: Value, key: []const u8) bool {
+    pub fn deleteProperty(self: *Vm, base: Value, key: []const u8) Error!bool {
         if (!base.isObject()) return true;
         const o = base.asObject();
+        // Proxy: dispatch to the deleteProperty trap, with the
+        // non-configurable invariant.
+        if (o.proxy_target) |target| {
+            if (o.proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
+            const handler = o.proxy_handler.?;
+            const trap = try self.getProperty(Value.fromObject(handler), "deleteProperty");
+            if (isCallable(trap)) {
+                const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key) });
+                const answer = toBoolean(r);
+                if (answer) {
+                    if (target.properties.get(key)) |desc| {
+                        if (!desc.configurable) {
+                            return self.throwTypeError("proxy deleteProperty cannot report a non-configurable property as deleted");
+                        }
+                    }
+                }
+                return answer;
+            }
+            return self.deleteProperty(Value.fromObject(target), key);
+        }
         // Deleting a mapped arguments index severs the parameter alias.
         if (mappedArgIndex(o, key)) |i| {
             o.args_map &= ~(@as(u64, 1) << @intCast(i));
@@ -1666,11 +1752,22 @@ pub const Vm = struct {
         const k = try self.toPropertyKey(key);
         defer self.gpa.free(k);
         if (obj.asObject().proxy_target) |target| {
+            if (obj.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
             const handler = obj.asObject().proxy_handler.?;
             const trap = try self.getProperty(Value.fromObject(handler), "has");
             if (isCallable(trap)) {
                 const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(k) });
-                return toBoolean(r);
+                const answer = toBoolean(r);
+                // Invariant: `has` may not hide a non-configurable own
+                // property of the target.
+                if (!answer) {
+                    if (target.properties.get(k)) |desc| {
+                        if (!desc.configurable) {
+                            return self.throwTypeError("proxy has must report a non-configurable own property as present");
+                        }
+                    }
+                }
+                return answer;
             }
             return self.hasProperty(target, k);
         }
@@ -1681,6 +1778,7 @@ pub const Vm = struct {
         if (v.isString()) {
             return utf16ToUtf8Alloc(self.gpa, v.asString().units);
         }
+        if (v.isBigInt()) return self.bigintToStringAlloc(v.asBigInt(), 10);
         if (v.isSymbol()) {
             // Encode a symbol as a NUL-prefixed internal key (by identity), so
             // symbol-keyed properties reuse the string map but stay out of
@@ -1750,10 +1848,8 @@ pub const Vm = struct {
                 return v;
             },
             .bigint => |digits| {
-                self.maybeStress();
-                const b = try self.heap.create(gc.BigInt);
-                b.value = std.fmt.parseInt(i64, digits, 10) catch 0;
-                return Value.fromBigInt(b);
+                return (try self.parseBigIntDigits(digits)) orelse
+                    self.throwSyntaxError("invalid BigInt literal");
             },
         }
     }
@@ -1829,7 +1925,206 @@ pub const Vm = struct {
             defer self.unprotect();
             return self.concat(lsv.asString().units, rsv.asString().units);
         }
+        if (lp.isBigInt() or rp.isBigInt()) {
+            if (!lp.isBigInt() or !rp.isBigInt()) {
+                return self.throwTypeError("cannot mix BigInt and other types, use explicit conversions");
+            }
+            return self.bigintBinop(.add, lp.asBigInt(), rp.asBigInt());
+        }
         return Value.fromNumber((try self.toNumber(lp)) + (try self.toNumber(rp)));
+    }
+
+    // ---- BigInt arithmetic ---------------------------------------------------
+
+    pub const NumOp = enum { add, sub, mul, div, mod, exp, bit_and, bit_or, bit_xor, shl, shr, ushr };
+
+    /// Allocate a BigInt heap cell holding a copy of `c` (zero -> empty limbs).
+    pub fn makeBigIntConst(self: *Vm, c: std.math.big.int.Const) Error!Value {
+        self.maybeStress();
+        const cell = try self.heap.create(gc.BigInt);
+        if (!c.eqlZero()) {
+            cell.limbs = try self.gpa.dupe(std.math.big.Limb, c.limbs);
+            cell.positive = c.positive;
+        }
+        return Value.fromBigInt(cell);
+    }
+
+    /// Consume a Managed (deinits it) into a heap BigInt value.
+    fn makeBigIntManaged(self: *Vm, m: *std.math.big.int.Managed) Error!Value {
+        defer m.deinit();
+        return self.makeBigIntConst(m.toConst());
+    }
+
+    /// Parse BigInt literal/StringToBigInt text (0x/0o/0b prefixes, no sign
+    /// for literals; StringToBigInt callers pre-trim and pass signs through).
+    pub fn parseBigIntDigits(self: *Vm, digits: []const u8) Error!?Value {
+        var s = digits;
+        var negative = false;
+        if (s.len > 0 and (s[0] == '+' or s[0] == '-')) {
+            negative = s[0] == '-';
+            s = s[1..];
+        }
+        var base: u8 = 10;
+        if (s.len > 2 and s[0] == '0') {
+            switch (s[1]) {
+                'x', 'X' => {
+                    base = 16;
+                    s = s[2..];
+                },
+                'o', 'O' => {
+                    base = 8;
+                    s = s[2..];
+                },
+                'b', 'B' => {
+                    base = 2;
+                    s = s[2..];
+                },
+                else => {},
+            }
+        }
+        if (s.len == 0) return null;
+        var m = std.math.big.int.Managed.init(self.gpa) catch return error.OutOfMemory;
+        m.setString(base, s) catch |e| switch (e) {
+            error.OutOfMemory => {
+                m.deinit();
+                return error.OutOfMemory;
+            },
+            else => {
+                m.deinit();
+                return null;
+            },
+        };
+        if (negative) m.negate();
+        return try self.makeBigIntManaged(&m);
+    }
+
+    /// Numeric binary operator with BigInt dispatch: both-BigInt operands use
+    /// arbitrary-precision arithmetic, both-Number uses f64, mixing throws.
+    fn numericBinop(self: *Vm, comptime op: NumOp, lv: Value, rv: Value) Error!Value {
+        const lp = try self.toPrimitiveHint(lv, .number);
+        try self.protect(lp);
+        defer self.unprotect();
+        const rp = try self.toPrimitiveHint(rv, .number);
+        try self.protect(rp);
+        defer self.unprotect();
+        if (lp.isBigInt() or rp.isBigInt()) {
+            if (!lp.isBigInt() or !rp.isBigInt()) {
+                return self.throwTypeError("cannot mix BigInt and other types, use explicit conversions");
+            }
+            return self.bigintBinop(op, lp.asBigInt(), rp.asBigInt());
+        }
+        return switch (op) {
+            .add => Value.fromNumber((try self.toNumber(lp)) + (try self.toNumber(rp))),
+            .sub => Value.fromNumber((try self.toNumber(lp)) - (try self.toNumber(rp))),
+            .mul => Value.fromNumber((try self.toNumber(lp)) * (try self.toNumber(rp))),
+            .div => Value.fromNumber((try self.toNumber(lp)) / (try self.toNumber(rp))),
+            .mod => Value.fromNumber(jsMod(try self.toNumber(lp), try self.toNumber(rp))),
+            .exp => Value.fromNumber(jsPow(try self.toNumber(lp), try self.toNumber(rp))),
+            .bit_and => Value.fromNumber(@floatFromInt((try self.toInt32(lp)) & (try self.toInt32(rp)))),
+            .bit_or => Value.fromNumber(@floatFromInt((try self.toInt32(lp)) | (try self.toInt32(rp)))),
+            .bit_xor => Value.fromNumber(@floatFromInt((try self.toInt32(lp)) ^ (try self.toInt32(rp)))),
+            .shl => Value.fromNumber(@floatFromInt(jsShl(try self.toInt32(lp), try self.toUint32(rp)))),
+            .shr => Value.fromNumber(@floatFromInt(jsShr(try self.toInt32(lp), try self.toUint32(rp)))),
+            .ushr => Value.fromNumber(@floatFromInt(jsUshr(try self.toInt32(lp), try self.toUint32(rp)))),
+        };
+    }
+
+    fn bigintShiftCount(self: *Vm, b: std.math.big.int.Const) Error!usize {
+        // Cap shifts to keep pathological programs from OOMing the heap.
+        const max_shift: usize = 1 << 26;
+        if (b.limbs.len > 1) return self.throwRangeError("BigInt shift count too large");
+        const n: usize = @intCast(b.limbs[0]);
+        if (n > max_shift) return self.throwRangeError("BigInt shift count too large");
+        return n;
+    }
+
+    fn bigintBinop(self: *Vm, op: NumOp, a: *gc.BigInt, b: *gc.BigInt) Error!Value {
+        const Managed = std.math.big.int.Managed;
+        const ac = a.toConst();
+        const bcst = b.toConst();
+        var ma = Managed.init(self.gpa) catch return error.OutOfMemory;
+        defer ma.deinit();
+        ma.copy(ac) catch return error.OutOfMemory;
+        var mb = Managed.init(self.gpa) catch return error.OutOfMemory;
+        defer mb.deinit();
+        mb.copy(bcst) catch return error.OutOfMemory;
+        var r = Managed.init(self.gpa) catch return error.OutOfMemory;
+        errdefer r.deinit();
+
+        switch (op) {
+            .add => r.add(&ma, &mb) catch return error.OutOfMemory,
+            .sub => r.sub(&ma, &mb) catch return error.OutOfMemory,
+            .mul => r.mul(&ma, &mb) catch return error.OutOfMemory,
+            .div, .mod => {
+                if (bcst.eqlZero()) return self.throwRangeError("division by zero");
+                var rem = Managed.init(self.gpa) catch return error.OutOfMemory;
+                defer rem.deinit();
+                r.divTrunc(&rem, &ma, &mb) catch return error.OutOfMemory;
+                if (op == .mod) r.swap(&rem);
+            },
+            .exp => {
+                if (!bcst.positive and !bcst.eqlZero()) return self.throwRangeError("BigInt exponent must be non-negative");
+                if (bcst.limbs.len > 1 or bcst.limbs[0] > std.math.maxInt(u32)) {
+                    return self.throwRangeError("BigInt exponent too large");
+                }
+                const e: u32 = @intCast(bcst.limbs[0]);
+                r.pow(&ma, e) catch return error.OutOfMemory;
+            },
+            .bit_and => r.bitAnd(&ma, &mb) catch return error.OutOfMemory,
+            .bit_or => r.bitOr(&ma, &mb) catch return error.OutOfMemory,
+            .bit_xor => r.bitXor(&ma, &mb) catch return error.OutOfMemory,
+            .shl, .shr => {
+                // A negative count shifts the other way.
+                const left = (op == .shl) == bcst.positive;
+                var abs_bc = bcst;
+                abs_bc.positive = true;
+                const n = try self.bigintShiftCount(abs_bc);
+                if (left) {
+                    r.shiftLeft(&ma, n) catch return error.OutOfMemory;
+                } else {
+                    r.shiftRight(&ma, n) catch return error.OutOfMemory;
+                }
+            },
+            .ushr => return self.throwTypeError("BigInts have no unsigned right shift"),
+        }
+        return self.makeBigIntManaged(&r);
+    }
+
+    fn opNegate(self: *Vm, v: Value) Error!Value {
+        const p = try self.toPrimitiveHint(v, .number);
+        if (p.isBigInt()) {
+            var c = p.asBigInt().toConst();
+            c.positive = !c.positive or c.eqlZero();
+            return self.makeBigIntConst(c);
+        }
+        return Value.fromNumber(-(try self.toNumber(p)));
+    }
+
+    fn opBitNot(self: *Vm, v: Value) Error!Value {
+        const p = try self.toPrimitiveHint(v, .number);
+        if (p.isBigInt()) {
+            // ~a == -(a + 1)
+            const Managed = std.math.big.int.Managed;
+            var ma = Managed.init(self.gpa) catch return error.OutOfMemory;
+            defer ma.deinit();
+            ma.copy(p.asBigInt().toConst()) catch return error.OutOfMemory;
+            var one = Managed.initSet(self.gpa, 1) catch return error.OutOfMemory;
+            defer one.deinit();
+            var r = Managed.init(self.gpa) catch return error.OutOfMemory;
+            r.add(&ma, &one) catch {
+                r.deinit();
+                return error.OutOfMemory;
+            };
+            r.negate();
+            return self.makeBigIntManaged(&r);
+        }
+        return Value.fromNumber(@floatFromInt(~(try self.toInt32(p))));
+    }
+
+    /// Lossy Number(bigint) conversion (round-to-nearest f64).
+    pub fn bigintToF64(b: *const gc.BigInt) f64 {
+        const res = b.toConst().toFloat(f64, .nearest_even);
+        return res[0];
     }
 
     pub fn concat(self: *Vm, a: []const u16, b: []const u16) Error!Value {
@@ -1847,9 +2142,19 @@ pub const Vm = struct {
     pub fn toStringVal(self: *Vm, v: Value) Error!Value {
         const p = if (v.isObject()) try self.toPrimitiveHint(v, .string) else v;
         if (p.isString()) return p;
+        if (p.isBigInt()) {
+            const s = try self.bigintToStringAlloc(p.asBigInt(), 10);
+            defer self.gpa.free(s);
+            return self.makeString(s);
+        }
         var buf: [64]u8 = undefined;
         const utf8 = self.primitiveToUtf8(p, &buf) catch "?";
         return self.makeString(utf8);
+    }
+
+    /// Decimal (or radix) text of a BigInt; caller frees.
+    pub fn bigintToStringAlloc(self: *Vm, b: *const gc.BigInt, base: u8) Error![]u8 {
+        return b.toConst().toStringAlloc(self.gpa, base, .lower) catch return error.OutOfMemory;
     }
 
     pub fn primitiveToUtf8(self: *Vm, v: Value, buf: []u8) ![]const u8 {
@@ -1859,7 +2164,14 @@ pub const Vm = struct {
             .null => "null",
             .boolean => |b| if (b) "true" else "false",
             .number => |n| numberToString(n, buf),
-            .bigint => |b| try std.fmt.bufPrint(buf, "{d}", .{b.value}),
+            // Fixed-buffer callers only; big values overflow -> error ("?").
+            .bigint => |b| blk: {
+                var scratch: [128]std.math.big.Limb = undefined;
+                const c = b.toConst();
+                if (c.limbs.len > 8) break :blk error.NoSpaceLeft;
+                const len = c.toString(buf, 10, .lower, &scratch);
+                break :blk buf[0..len];
+            },
             .object => "[object Object]",
             .symbol => "Symbol()",
             .string => "", // handled by caller
@@ -1896,11 +2208,40 @@ pub const Vm = struct {
         }
         // null == undefined.
         if (a.isNullish() and b.isNullish()) return true;
-        // number/string coercion; boolean coerces to number; others -> number.
         if (a.isNullish() or b.isNullish()) return false;
+        // BigInt vs anything else: mathematical equality.
+        if (a.isBigInt() or b.isBigInt()) {
+            const bi = if (a.isBigInt()) a.asBigInt() else b.asBigInt();
+            const other = if (a.isBigInt()) b else a;
+            return self.bigintLooseEq(bi, other);
+        }
+        // number/string coercion; boolean coerces to number; others -> number.
         const an = try self.toNumber(a);
         const bn = try self.toNumber(b);
         return an == bn;
+    }
+
+    /// BigInt == non-BigInt (spec 7.2.13 steps 6-9): strings go through
+    /// StringToBigInt; numbers/booleans compare mathematically; objects
+    /// re-enter loose equality after ToPrimitive.
+    fn bigintLooseEq(self: *Vm, bi: *gc.BigInt, other: Value) Error!bool {
+        if (other.isString()) {
+            const utf8 = try utf16ToUtf8Alloc(self.gpa, other.asString().units);
+            defer self.gpa.free(utf8);
+            const trimmed = std.mem.trim(u8, utf8, " \t\n\r");
+            if (trimmed.len == 0) return bi.toConst().eqlZero();
+            const parsed = (try self.parseBigIntDigits(trimmed)) orelse return false;
+            return bi.toConst().order(parsed.asBigInt().toConst()) == .eq;
+        }
+        if (other.isObject()) {
+            const p = try self.toPrimitive(other);
+            return self.looseEquals(Value.fromBigInt(bi), p);
+        }
+        const n: f64 = if (other.isBoolean()) (if (other.asBool()) 1 else 0) else if (other.isNumber()) other.asNumber() else return false;
+        if (!std.math.isFinite(n) or n != std.math.trunc(n)) return false;
+        // A BigInt not exactly representable as f64 cannot equal any f64.
+        const conv = bi.toConst().toFloat(f64, .nearest_even);
+        return conv[1] == .exact and conv[0] == n;
     }
 
     const Cmp = enum { lt, le, gt, ge };
@@ -1913,6 +2254,22 @@ pub const Vm = struct {
                 .le => order <= 0,
                 .gt => order > 0,
                 .ge => order >= 0,
+            };
+        }
+        if (a.isBigInt() or b.isBigInt()) {
+            const ord: std.math.Order = blk: {
+                if (a.isBigInt() and b.isBigInt()) break :blk a.asBigInt().toConst().order(b.asBigInt().toConst());
+                // Mixed: compare through f64 (lossy above 2^53; adequate).
+                const af: f64 = if (a.isBigInt()) bigintToF64(a.asBigInt()) else try self.toNumber(a);
+                const bf: f64 = if (b.isBigInt()) bigintToF64(b.asBigInt()) else try self.toNumber(b);
+                if (std.math.isNan(af) or std.math.isNan(bf)) return false;
+                break :blk std.math.order(af, bf);
+            };
+            return switch (op) {
+                .lt => ord == .lt,
+                .le => ord != .gt,
+                .gt => ord == .gt,
+                .ge => ord != .lt,
             };
         }
         const an = try self.toNumber(a);

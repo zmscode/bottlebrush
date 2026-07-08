@@ -37,7 +37,12 @@ executed)**, 110/110 unit tests, corpus wall time ~0.5 s.
    delete-failure TypeError, uncoerced `this`; sloppy nullish `this` now
    correctly coerces to globalThis). The harness runs the spec dual-run
    (sloppy + strict per non-flagged file) — and the score *rose* under it.
-6. **`$262` host object** absent (createRealm/evalScript/detachArrayBuffer/gc).
+6. ~~**`$262` host object**~~ **FIXED 2026-07-09**: `Vm.installHost262`
+   (runner realms only) provides `global`, `evalScript` (same-realm,
+   indirect-eval scoping), `gc` (forced collection), and
+   `detachArrayBuffer` (typed-element reads/writes guard the detached
+   state). `createRealm` needs per-realm intrinsics — `cross-realm`
+   feature tests skip via the denylist instead.
 7. ~~**Destructuring**~~ **FIXED 2026-07-08**: array/object patterns lower
    everywhere — declarations, parameters (incl. whole-pattern defaults),
    assignment expressions (incl. member targets), for-of/for-in heads, catch
@@ -73,9 +78,31 @@ executed)**, 110/110 unit tests, corpus wall time ~0.5 s.
     @@match/@@replace/@@search/@@split and the String methods dispatch
     through them (object patterns only, per spec — primitives never
     consult the symbol). Runner denylist no longer skips Symbol features.
-12. **BigInt is an i64 stub** — no bignum, no `asIntN`, no mixed-type errors.
-13. **WeakMap/WeakSet** — need GC ephemeron support.
-14. **Proxy invariants** — 5 of 13 traps dispatch; no invariant checks.
+12. ~~**BigInt is an i64 stub**~~ **FIXED 2026-07-09**: real arbitrary
+    precision via std.math.big (limbs on the gc.BigInt cell). Literals
+    (incl. 0x/0o/0b), full arithmetic (`/` and `%` truncate, `**`,
+    division-by-zero RangeError), bitwise ops, signed shifts (negative
+    counts reverse direction), `~`/unary `-`, mixed-type TypeErrors,
+    loose == across Number/String/boolean (exactness-aware), relational
+    compares, `BigInt()`/`asIntN`/`asUintN`, `toString(radix)`,
+    @@toStringTag, explicit `Number(bigint)`, JSON TypeError. BigInt off
+    the runner denylist.
+13. ~~**WeakMap/WeakSet**~~ **FIXED 2026-07-09**: GC ephemeron semantics —
+    weak collections skip strong-marking their entries; `Heap.collect`
+    runs a mark fixpoint (values live only while keys live) and clears
+    dead entries on survivors before the sweep. WeakMap
+    get/set/has/delete, WeakSet add/has/delete, WeakRef deref (cleared
+    when the referent dies). Verified under GC stress.
+14. ~~**Proxy invariants**~~ **MOSTLY FIXED 2026-07-09**: 13 trap sites
+    dispatch (added deleteProperty, defineProperty,
+    getOwnPropertyDescriptor, ownKeys, getPrototypeOf, setPrototypeOf,
+    isExtensible, preventExtensions to the existing 5), with the
+    essential invariants: get pins non-configurable non-writable values,
+    has can't hide non-configurable props, deleteProperty can't claim
+    them deleted, isExtensible must match the target, falsy
+    set/defineProperty/preventExtensions/setPrototypeOf results throw.
+    Proxy.revocable + revoked-proxy TypeErrors everywhere. Deep ownKeys
+    invariant checks remain simplified.
 15. **Regex `u`/`v` modes** — flags accepted but matching is code-unit based;
     no `\p{…}`.
 16. **No file runner / REPL** — `main.zig` still runs a fixed demo.

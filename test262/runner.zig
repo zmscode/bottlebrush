@@ -35,10 +35,9 @@ const Runner = struct {
 
     /// Features the engine doesn't implement; tests requiring them SKIP.
     const unsupported_features = [_][]const u8{
-        "Math.sumPrecise", "generators", "async-iteration",
-        "TypedArray",      "BigInt",     "Proxy",
-        "Reflect",         "WeakRef",    "tail-call-optimization",
-        "Float16Array",
+        "Math.sumPrecise",        "generators",  "async-iteration",
+        "TypedArray",             "cross-realm", "Float16Array",
+        "tail-call-optimization",
     };
 
     fn unsupportedFeature(meta: frontmatter.Meta) ?[]const u8 {
@@ -142,6 +141,7 @@ const Runner = struct {
 
         var vm = bottlebrush.Vm.init(self.gpa);
         defer vm.deinit();
+        vm.installHost262() catch return .skip;
         _ = vm.run(&program) catch |e| switch (e) {
             error.JsThrow => {
                 const name = vm.pendingErrorName(self.gpa);

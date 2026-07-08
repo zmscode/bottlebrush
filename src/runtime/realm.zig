@@ -59,6 +59,17 @@ const nativeMapSet = collections_mod.nativeMapSet;
 const nativeMapSize = collections_mod.nativeMapSize;
 const nativeSet = collections_mod.nativeSet;
 const nativeSetAdd = collections_mod.nativeSetAdd;
+const nativeWeakMap = collections_mod.nativeWeakMap;
+const nativeWeakMapGet = collections_mod.nativeWeakMapGet;
+const nativeWeakMapSet = collections_mod.nativeWeakMapSet;
+const nativeWeakMapHas = collections_mod.nativeWeakMapHas;
+const nativeWeakMapDelete = collections_mod.nativeWeakMapDelete;
+const nativeWeakSet = collections_mod.nativeWeakSet;
+const nativeWeakSetAdd = collections_mod.nativeWeakSetAdd;
+const nativeWeakSetHas = collections_mod.nativeWeakSetHas;
+const nativeWeakSetDelete = collections_mod.nativeWeakSetDelete;
+const nativeWeakRef = collections_mod.nativeWeakRef;
+const nativeWeakRefDeref = collections_mod.nativeWeakRefDeref;
 const nativeSetDelete = collections_mod.nativeSetDelete;
 const nativeSetForEach = collections_mod.nativeSetForEach;
 const nativeSetHas = collections_mod.nativeSetHas;
@@ -167,6 +178,7 @@ const opTanh = math_mod.opTanh;
 
 const meta_mod = @import("builtins/meta.zig");
 const nativeProxy = meta_mod.nativeProxy;
+const nativeProxyRevocable = meta_mod.nativeProxyRevocable;
 const nativeReflectApply = meta_mod.nativeReflectApply;
 const nativeReflectConstruct = meta_mod.nativeReflectConstruct;
 const nativeReflectDelete = meta_mod.nativeReflectDelete;
@@ -247,6 +259,12 @@ const nativeStringSubstr = string_mod.nativeStringSubstr;
 const nativeStringTrimStart = string_mod.nativeStringTrimStart;
 const nativeStringTrimEnd = string_mod.nativeStringTrimEnd;
 const nativeStringReplaceAll = string_mod.nativeStringReplaceAll;
+const bigint_mod = @import("builtins/bigint.zig");
+const nativeBigInt = bigint_mod.nativeBigInt;
+const nativeBigIntToString = bigint_mod.nativeBigIntToString;
+const nativeBigIntValueOf = bigint_mod.nativeBigIntValueOf;
+const nativeBigIntAsIntN = bigint_mod.nativeBigIntAsIntN;
+const nativeBigIntAsUintN = bigint_mod.nativeBigIntAsUintN;
 const nativeRegExpSymbolMatch = string_mod.nativeRegExpSymbolMatch;
 const nativeRegExpSymbolReplace = string_mod.nativeRegExpSymbolReplace;
 const nativeRegExpSymbolSearch = string_mod.nativeRegExpSymbolSearch;
@@ -596,6 +614,33 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineData(set_proto, "constructor", Value.fromObject(set_ctor), true, false, true);
     try vm.defineData(global, "Set", Value.fromObject(set_ctor), true, false, true);
 
+    // ---- WeakMap / WeakSet / WeakRef (GC ephemeron semantics) ----
+    const weakmap_proto = try vm.newObject(vm.object_proto);
+    try vm.defineMethod(weakmap_proto, "get", nativeWeakMapGet, 1);
+    try vm.defineMethod(weakmap_proto, "set", nativeWeakMapSet, 2);
+    try vm.defineMethod(weakmap_proto, "has", nativeWeakMapHas, 1);
+    try vm.defineMethod(weakmap_proto, "delete", nativeWeakMapDelete, 1);
+    const weakmap_ctor = asCtor(try vm.makeNative("WeakMap", nativeWeakMap, 0));
+    try vm.defineData(weakmap_ctor, "prototype", Value.fromObject(weakmap_proto), false, false, false);
+    try vm.defineData(weakmap_proto, "constructor", Value.fromObject(weakmap_ctor), true, false, true);
+    try vm.defineData(global, "WeakMap", Value.fromObject(weakmap_ctor), true, false, true);
+
+    const weakset_proto = try vm.newObject(vm.object_proto);
+    try vm.defineMethod(weakset_proto, "add", nativeWeakSetAdd, 1);
+    try vm.defineMethod(weakset_proto, "has", nativeWeakSetHas, 1);
+    try vm.defineMethod(weakset_proto, "delete", nativeWeakSetDelete, 1);
+    const weakset_ctor = asCtor(try vm.makeNative("WeakSet", nativeWeakSet, 0));
+    try vm.defineData(weakset_ctor, "prototype", Value.fromObject(weakset_proto), false, false, false);
+    try vm.defineData(weakset_proto, "constructor", Value.fromObject(weakset_ctor), true, false, true);
+    try vm.defineData(global, "WeakSet", Value.fromObject(weakset_ctor), true, false, true);
+
+    const weakref_proto = try vm.newObject(vm.object_proto);
+    try vm.defineMethod(weakref_proto, "deref", nativeWeakRefDeref, 0);
+    const weakref_ctor = asCtor(try vm.makeNative("WeakRef", nativeWeakRef, 1));
+    try vm.defineData(weakref_ctor, "prototype", Value.fromObject(weakref_proto), false, false, false);
+    try vm.defineData(weakref_proto, "constructor", Value.fromObject(weakref_ctor), true, false, true);
+    try vm.defineData(global, "WeakRef", Value.fromObject(weakref_ctor), true, false, true);
+
     // ---- Date ----
     const date_proto = try vm.newObject(vm.object_proto);
     vm.date_proto = date_proto;
@@ -765,8 +810,25 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(vm.regexp_proto.?, vm.symbol_split_key, nativeRegExpSymbolSplit, 2);
     try vm.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 
+    // ---- BigInt ----
+    const bigint_proto = try vm.newObject(vm.object_proto);
+    vm.bigint_proto = bigint_proto;
+    const bigint_ctor = try vm.makeNative("BigInt", nativeBigInt, 1);
+    try vm.defineData(bigint_ctor, "prototype", Value.fromObject(bigint_proto), false, false, false);
+    try vm.defineData(bigint_proto, "constructor", Value.fromObject(bigint_ctor), true, false, true);
+    try vm.defineMethod(bigint_proto, "toString", nativeBigIntToString, 0);
+    try vm.defineMethod(bigint_proto, "toLocaleString", nativeBigIntToString, 0);
+    try vm.defineMethod(bigint_proto, "valueOf", nativeBigIntValueOf, 0);
+    try vm.defineMethod(bigint_ctor, "asIntN", nativeBigIntAsIntN, 2);
+    try vm.defineMethod(bigint_ctor, "asUintN", nativeBigIntAsUintN, 2);
+    if (vm.symbol_to_string_tag_key.len != 0) {
+        try vm.defineData(bigint_proto, vm.symbol_to_string_tag_key, try vm.makeString("BigInt"), false, false, true);
+    }
+    try vm.defineData(global, "BigInt", Value.fromObject(bigint_ctor), true, false, true);
+
     // ---- Proxy + Reflect ----
     const proxy_ctor = asCtor(try vm.makeNative("Proxy", nativeProxy, 2));
+    try vm.defineMethod(proxy_ctor, "revocable", nativeProxyRevocable, 2);
     try vm.defineData(global, "Proxy", Value.fromObject(proxy_ctor), true, false, true);
 
     const reflect = try vm.newObject(vm.object_proto);

@@ -21,7 +21,13 @@ const toBoolean = support_mod.toBoolean;
 
 pub fn nativeNumber(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
-    const n: f64 = if (args.len == 0) 0 else try vm.toNumber(args[0]);
+    // Explicit Number(bigint) converts (lossy); implicit coercion still throws.
+    const n: f64 = if (args.len == 0)
+        0
+    else if (args[0].isBigInt())
+        Vm.bigintToF64(args[0].asBigInt())
+    else
+        try vm.toNumber(args[0]);
     if (this.isObject() and this.asObject().prototype == vm.number_proto) {
         try vm.defineData(this.asObject(), prim_key, Value.fromNumber(n), false, false, false);
     }

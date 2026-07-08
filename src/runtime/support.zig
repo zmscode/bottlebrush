@@ -28,7 +28,7 @@ pub fn sameTypeStrictEq(a: Value, b: Value) bool {
         .boolean => |x| b.isBoolean() and x == b.asBool(),
         .number => |x| b.isNumber() and x == b.asNumber(), // NaN != NaN, +0 == -0
         .string => |x| b.isString() and std.mem.eql(u16, x.units, b.asString().units),
-        .bigint => |x| b.isBigInt() and x.value == b.asBigInt().value,
+        .bigint => |x| b.isBigInt() and x.toConst().order(b.asBigInt().toConst()) == .eq,
         .symbol => |x| b.isSymbol() and x == b.asSymbol(),
         .object => |x| b.isObject() and x == b.asObject(),
         .hole => unreachable,
@@ -41,7 +41,7 @@ pub fn toBoolean(v: Value) bool {
         .boolean => |b| b,
         .number => |n| n != 0 and !std.math.isNan(n),
         .string => |s| s.units.len != 0,
-        .bigint => |b| b.value != 0,
+        .bigint => |b| !b.toConst().eqlZero(),
         .symbol, .object => true,
         .hole => unreachable,
     };
@@ -287,8 +287,29 @@ pub fn orderedOwnKeys(vm: *Vm, obj: *gc.Object, enumerable_only: bool, out: *std
     }
 }
 
+/// The proxy `ownKeys` trap result (string keys), or false to forward.
+fn proxyOwnKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!bool {
+    const target = obj.proxy_target orelse return false;
+    if (obj.proxy_revoked) return vm.throwTypeError("cannot perform operation on a revoked proxy");
+    const handler = obj.proxy_handler.?;
+    const trap = try vm.getProperty(Value.fromObject(handler), "ownKeys");
+    if (!isCallable(trap)) return false;
+    const r = try vm.callValue(trap, Value.fromObject(handler), &.{Value.fromObject(target)});
+    if (!r.isObject() or !r.asObject().is_array) {
+        return vm.throwTypeError("proxy ownKeys must return an array");
+    }
+    const arr = r.asObject();
+    var i: u32 = 0;
+    while (i < arr.array_length) : (i += 1) {
+        const kv = Vm.arrayGetOwn(arr, i) orelse continue;
+        if (kv.isString()) try out.append(vm.gpa, try utf16ToUtf8Alloc(vm.gpa, kv.asString().units));
+    }
+    return true;
+}
+
 /// Own enumerable string keys in spec order (Object.keys/values/entries).
 pub fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
+    if (try proxyOwnKeys(vm, obj, out)) return;
     return orderedOwnKeys(vm, obj, true, out);
 }
 
@@ -317,6 +338,7 @@ pub fn primitiveOwnKeysResult(vm: *Vm, v: Value, include_length: bool) Error!?Va
 /// All own string-keyed property names (enumerable and not), skipping symbol
 /// and internal-slot keys. Array indices and `length` are included for arrays.
 pub fn ownPropertyNames(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
+    if (try proxyOwnKeys(vm, obj, out)) return;
     try orderedOwnKeys(vm, obj, false, out);
     if (obj.is_array) try out.append(vm.gpa, try vm.gpa.dupe(u8, "length"));
 }
@@ -387,7 +409,8 @@ pub fn thisCollection(vm: *Vm, this: Value, kind: gc.Collection) Error!*gc.Objec
 }
 
 pub fn readTypedElement(ta: gc.TypedArrayView, i: u32) Value {
-    const bytes = ta.buffer.buffer_data.?;
+    // Detached buffer ($262.detachArrayBuffer): element reads see undefined.
+    const bytes = ta.buffer.buffer_data orelse return Value.undefined_value;
     const off = ta.offset + i * gc.bytesPerElement(ta.kind);
     const n: f64 = switch (ta.kind) {
         .i8 => @floatFromInt(@as(i8, @bitCast(bytes[off]))),
@@ -409,7 +432,8 @@ pub fn clampToU8(n: f64) u8 {
 }
 
 pub fn writeTypedElement(ta: gc.TypedArrayView, i: u32, n: f64) void {
-    const bytes = ta.buffer.buffer_data.?;
+    // Detached buffer: writes are silently dropped.
+    const bytes = ta.buffer.buffer_data orelse return;
     const off = ta.offset + i * gc.bytesPerElement(ta.kind);
     const bits: u32 = @bitCast(doubleToInt32(n)); // ToInt32/ToUint32 bit pattern
     switch (ta.kind) {
