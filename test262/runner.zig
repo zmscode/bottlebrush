@@ -57,7 +57,7 @@ const Runner = struct {
     fn classify(self: *Runner, source: []const u8, meta: frontmatter.Meta) report.Outcome {
         self.fail_reason_len = 0; // clear any prior test's reason
         if (unsupportedFeature(meta)) |f| {
-            if (trace_skips) std.debug.print("SKIP feature:{s}\n", .{f});
+            self.setReason("feature:{s}", .{f});
             return .skip;
         }
         if (meta.negative) |neg| {
@@ -65,7 +65,7 @@ const Runner = struct {
                 .parse => return self.scoreParseNegative(source, meta),
                 .resolution, .runtime => {
                     if (meta.flags.is_async or meta.flags.module) {
-                        if (trace_skips) std.debug.print("SKIP async-or-module\n", .{});
+                        self.setReason("async-or-module", .{});
                         return .skip;
                     }
                     // Expect a throw whose constructor name matches.
@@ -75,7 +75,7 @@ const Runner = struct {
         }
         // Features the engine doesn't support yet.
         if (meta.flags.is_async or meta.flags.module) {
-            if (trace_skips) std.debug.print("SKIP async-or-module\n", .{});
+            self.setReason("async-or-module", .{});
             return .skip;
         }
         return self.runTest(source, meta, null);
@@ -128,25 +128,31 @@ const Runner = struct {
     /// that must be thrown; for a positive test it is null.
     fn runVariant(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8, strict: bool) report.Outcome {
         const combined = self.buildSourceStrict(source, meta, strict) catch {
-            if (trace_skips) std.debug.print("SKIP missing-include\n", .{});
+            self.setReason("missing-include", .{});
             return .skip;
         };
         defer self.gpa.free(combined);
 
-        const pr = parser.parse(self.gpa, combined, .script) catch return .skip;
+        const pr = parser.parse(self.gpa, combined, .script) catch {
+            self.setReason("parse-oom", .{});
+            return .skip;
+        };
         var ast_tree = switch (pr) {
             .syntax_error => |d| {
-                if (trace_skips) std.debug.print("SKIP parse-gap: {s}\n", .{d.message});
+                self.setReason("parse-gap: {s}", .{d.message});
                 return .skip;
             },
             .ok => |a| a,
         };
         defer ast_tree.deinit();
 
-        const cr = compiler.compile(self.gpa, ast_tree.root, combined) catch return .skip;
+        const cr = compiler.compile(self.gpa, ast_tree.root, combined) catch {
+            self.setReason("compile-oom", .{});
+            return .skip;
+        };
         var program = switch (cr) {
             .compile_error => |d| {
-                if (trace_skips) std.debug.print("SKIP compile-gap: {s}\n", .{d.message});
+                self.setReason("compile-gap: {s}", .{d.message});
                 return .skip;
             },
             .ok => |p| p,
@@ -174,27 +180,23 @@ const Runner = struct {
                 // rather than count it as a conformance failure.
                 if (name) |n| {
                     if (std.mem.eql(u8, n, "ReferenceError")) {
-                        if (trace_skips) {
-                            const msg = vm.pendingErrorMessage(self.gpa);
-                            defer if (msg) |m| self.gpa.free(m);
-                            std.debug.print("SKIP reference-error: {s}\n", .{msg orelse "?"});
-                        }
+                        const msg = vm.pendingErrorMessage(self.gpa);
+                        defer if (msg) |m| self.gpa.free(m);
+                        self.setReason("reference-error: {s}", .{msg orelse "?"});
                         return .skip;
                     }
                 }
-                if (trace_files) {
-                    const msg = vm.pendingErrorMessage(self.gpa);
-                    defer if (msg) |m| self.gpa.free(m);
-                    self.setReason("threw {s}: {s}", .{ name orelse "?", msg orelse "?" });
-                }
+                const msg = vm.pendingErrorMessage(self.gpa);
+                defer if (msg) |m| self.gpa.free(m);
+                self.setReason("threw {s}: {s}", .{ name orelse "?", msg orelse "?" });
                 return .fail;
             },
             error.Timeout => {
-                if (trace_skips or trace_files) std.debug.print("SKIP timeout (step budget)\n", .{});
+                self.setReason("timeout", .{});
                 return .skip; // exceeded the instruction budget
             },
             else => {
-                if (trace_skips) std.debug.print("SKIP engine-limit\n", .{});
+                self.setReason("engine-limit", .{});
                 return .skip; // OOM / engine limit
             },
         };
@@ -287,9 +289,11 @@ fn workerMain(w: *Worker) void {
         defer meta.deinit(gpa);
 
         const outcome = runner.classify(source, meta);
-        if (trace_files and outcome == .fail) {
-            const reason = if (runner.fail_reason_len > 0) runner.fail_reason[0..runner.fail_reason_len] else "assertion mismatch";
-            std.debug.print("FAILCASE\t{s}\t{s}\n", .{ rel, reason });
+        if (trace_files and (outcome == .fail or outcome == .skip)) {
+            const tag = if (outcome == .fail) "FAILCASE" else "SKIPCASE";
+            const default: []const u8 = if (outcome == .fail) "assertion mismatch" else "unclassified";
+            const reason = if (runner.fail_reason_len > 0) runner.fail_reason[0..runner.fail_reason_len] else default;
+            std.debug.print("{s}\t{s}\t{s}\n", .{ tag, rel, reason });
         }
         w.board.record(outcome);
     }
