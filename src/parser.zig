@@ -551,12 +551,111 @@ pub const Parser = struct {
             try members.append(self.arena, try self.parseClassMember());
         }
         try self.expect(.r_brace);
+        try self.checkDuplicatePrivateNames(members.items);
         const class: ast.Class = .{
             .name = name,
             .super_class = super_class,
             .members = try members.toOwnedSlice(self.arena),
         };
         return self.node(start, self.prev_end, if (is_expr) .{ .class = class } else .{ .class_decl = class });
+    }
+
+    fn hexDigit(c: u8) ?u32 {
+        return switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => null,
+        };
+    }
+
+    /// Reject NotEscapeSequence forms in an untagged template's cooked text:
+    /// truncated `\x`/`\u`, out-of-range `\u{…}`, and legacy octal escapes.
+    fn validateTemplateEscapes(self: *Parser, tmpl: *Node) ParseError!void {
+        if (tmpl.kind != .template) return;
+        for (tmpl.kind.template.quasis) |q| {
+            var i: usize = 0;
+            while (i < q.len) {
+                if (q[i] != '\\') {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                if (i >= q.len) break;
+                const c = q[i];
+                switch (c) {
+                    'x' => {
+                        if (i + 2 >= q.len or hexDigit(q[i + 1]) == null or hexDigit(q[i + 2]) == null) {
+                            return self.fail("invalid hexadecimal escape in template");
+                        }
+                        i += 3;
+                    },
+                    'u' => {
+                        if (i + 1 < q.len and q[i + 1] == '{') {
+                            var j = i + 2;
+                            var val: u32 = 0;
+                            var n: usize = 0;
+                            while (j < q.len and q[j] != '}') : (j += 1) {
+                                const d = hexDigit(q[j]) orelse return self.fail("invalid Unicode escape in template");
+                                val = val * 16 + d;
+                                n += 1;
+                                if (val > 0x10FFFF) return self.fail("undefined Unicode code-point in template");
+                            }
+                            if (j >= q.len or n == 0) return self.fail("invalid Unicode escape in template");
+                            i = j + 1;
+                        } else {
+                            if (i + 4 >= q.len) return self.fail("invalid Unicode escape in template");
+                            var k: usize = 1;
+                            while (k <= 4) : (k += 1) {
+                                if (hexDigit(q[i + k]) == null) return self.fail("invalid Unicode escape in template");
+                            }
+                            i += 5;
+                        }
+                    },
+                    '0' => {
+                        // `\0` is NUL, but `\0` followed by a digit is legacy octal.
+                        if (i + 1 < q.len and q[i + 1] >= '0' and q[i + 1] <= '9') {
+                            return self.fail("octal escape sequences are not allowed in template literals");
+                        }
+                        i += 1;
+                    },
+                    '1'...'9' => return self.fail("octal escape sequences are not allowed in template literals"),
+                    else => i += 1,
+                }
+            }
+        }
+    }
+
+    /// Early error: a private name may be declared only once in a class body,
+    /// except a single getter paired with a single setter of the same
+    /// static-ness.
+    fn checkDuplicatePrivateNames(self: *Parser, members: []const *Node) ParseError!void {
+        // Track, per private name, an accumulated signature. Bits: field/method
+        // (0x1), getter (0x2), setter (0x4); static getter/setter use 0x8/0x10.
+        var seen: std.StringHashMapUnmanaged(u8) = .empty;
+        defer seen.deinit(self.arena);
+        for (members) |m| {
+            if (m.kind != .property) continue;
+            const prop = m.kind.property;
+            if (prop.key.kind != .private_name) continue;
+            const name = prop.key.kind.private_name;
+            const bit: u8 = switch (prop.kind) {
+                .get => if (prop.is_static) 0x8 else 0x2,
+                .set => if (prop.is_static) 0x10 else 0x4,
+                else => 0x1, // field or method
+            };
+            const gop = try seen.getOrPut(self.arena, name);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = bit;
+                continue;
+            }
+            const prev = gop.value_ptr.*;
+            // The only legal repeat is a matching-static getter+setter pair.
+            const legal_pair = (prev == 0x2 and bit == 0x4) or (prev == 0x4 and bit == 0x2) or
+                (prev == 0x8 and bit == 0x10) or (prev == 0x10 and bit == 0x8);
+            if (!legal_pair) return self.fail("duplicate private name in class body");
+            gop.value_ptr.* = prev | bit;
+        }
     }
 
     fn parseClassMember(self: *Parser) ParseError!*Node {
@@ -1107,7 +1206,13 @@ pub const Parser = struct {
                 self.advance();
                 return self.node(start, self.prev_end, .{ .regex = raw });
             },
-            .template_no_sub, .template_head => return self.parseTemplate(),
+            .template_no_sub, .template_head => {
+                // Untagged: invalid escape sequences are early errors (tagged
+                // templates tolerate them, so that path skips this check).
+                const tmpl = try self.parseTemplate();
+                try self.validateTemplateEscapes(tmpl);
+                return tmpl;
+            },
             .kw_true => {
                 self.advance();
                 return self.node(start, self.prev_end, .{ .bool_literal = true });

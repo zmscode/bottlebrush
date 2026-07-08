@@ -594,6 +594,12 @@ test "early errors: delete private and field-init super/arguments" {
         "class C { x = super(); }",
         "class C { x = () => arguments; }",
         "class C { x = y ? arguments : 0; }",
+        "class C { #x; #x; }",
+        "class C { #x(){} #x(){} }",
+        "class C { get #x(){} get #x(){} }",
+        "var s = `\\x0`;",
+        "var s = `\\u{110000}`;",
+        "var s = `\\7`;",
     };
     for (bad) |src| {
         var pr = try parser.parse(testing.allocator, src, .script);
@@ -612,6 +618,9 @@ test "early errors: delete private and field-init super/arguments" {
         "class C { x = function () { return arguments; }; }",
         "class D {} class C extends D { x = 1; constructor() { super(); } }",
         "class C { m() { delete this.x; } }",
+        "class C { get #x(){} set #x(v){} m(){ return this.#x; } }",
+        "var s = `\\u{1F600}ok`;",
+        "var s = String.raw`\\x0`;",
     };
     for (ok) |src| {
         var pr = try parser.parse(testing.allocator, src, .script);
