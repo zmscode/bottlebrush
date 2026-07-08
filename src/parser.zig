@@ -560,6 +560,17 @@ pub const Parser = struct {
         return self.node(start, self.prev_end, if (is_expr) .{ .class = class } else .{ .class_decl = class });
     }
 
+    /// True when a non-computed property key's literal name equals `want`
+    /// (identifier or single/double-quoted string with no escapes).
+    fn staticKeyNameEquals(self: *Parser, key: *Node, want: []const u8) bool {
+        _ = self;
+        return switch (key.kind) {
+            .ident => |n| std.mem.eql(u8, n, want),
+            .string => |raw| raw.len >= 2 and std.mem.eql(u8, raw[1 .. raw.len - 1], want),
+            else => false,
+        };
+    }
+
     fn hexDigit(c: u8) ?u32 {
         return switch (c) {
             '0'...'9' => c - '0',
@@ -696,6 +707,11 @@ pub const Parser = struct {
         var computed = false;
         var is_private = false;
         const key = try self.parsePropertyKey(&computed, &is_private);
+
+        // Early error: a static class member may not be named `prototype`.
+        if (is_static and !computed and self.staticKeyNameEquals(key, "prototype")) {
+            return self.fail("a static class member may not be named 'prototype'");
+        }
 
         if (self.at(.l_paren)) {
             // Method (or get/set/constructor).
@@ -1350,6 +1366,16 @@ pub const Parser = struct {
             if (!self.eat(.comma)) break;
         }
         try self.expect(.r_brace);
+        // Early error: more than one `__proto__: value` data property (the
+        // proto-setter form; shorthand/method/computed __proto__ don't count).
+        var proto_setters: u32 = 0;
+        for (props.items) |p| {
+            if (p.kind != .property) continue;
+            const prop = p.kind.property;
+            if (prop.kind != .init or prop.computed or prop.shorthand) continue;
+            if (self.staticKeyNameEquals(prop.key, "__proto__")) proto_setters += 1;
+        }
+        if (proto_setters > 1) return self.fail("duplicate __proto__ property in object literal");
         return self.node(start, self.prev_end, .{ .object_literal = try props.toOwnedSlice(self.arena) });
     }
 

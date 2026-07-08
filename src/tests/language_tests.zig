@@ -641,6 +641,9 @@ test "strict-mode reserved binding names" {
         "\"use strict\"; let package = 1;",
         "\"use strict\"; function f(arguments) {}",
         "\"use strict\"; var [implements] = [1];",
+        "class C { static prototype() {} }",
+        "class C { static prototype = 1; }",
+        "var o = { __proto__: 1, __proto__: 2 };",
     };
     for (bad) |src| {
         var pr = try parser.parse(std.testing.allocator, src, .script);
