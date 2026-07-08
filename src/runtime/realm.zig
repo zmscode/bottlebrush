@@ -13,6 +13,27 @@ const Error = interpreter.Error;
 const asCtor = Vm.asCtor;
 
 const array_mod = @import("builtins/array.zig");
+const nativeArrayAt = array_mod.nativeArrayAt;
+const nativeArrayShift = array_mod.nativeArrayShift;
+const nativeArrayUnshift = array_mod.nativeArrayUnshift;
+const nativeArrayReverse = array_mod.nativeArrayReverse;
+const nativeArrayFill = array_mod.nativeArrayFill;
+const nativeArrayLastIndexOf = array_mod.nativeArrayLastIndexOf;
+const nativeArraySome = array_mod.nativeArraySome;
+const nativeArrayEvery = array_mod.nativeArrayEvery;
+const nativeArrayFind = array_mod.nativeArrayFind;
+const nativeArrayFindIndex = array_mod.nativeArrayFindIndex;
+const nativeArrayFindLast = array_mod.nativeArrayFindLast;
+const nativeArrayFindLastIndex = array_mod.nativeArrayFindLastIndex;
+const nativeArrayReduce = array_mod.nativeArrayReduce;
+const nativeArrayReduceRight = array_mod.nativeArrayReduceRight;
+const nativeArraySplice = array_mod.nativeArraySplice;
+const nativeArraySort = array_mod.nativeArraySort;
+const nativeArrayCopyWithin = array_mod.nativeArrayCopyWithin;
+const nativeArrayFlat = array_mod.nativeArrayFlat;
+const nativeArrayFlatMap = array_mod.nativeArrayFlatMap;
+const nativeArrayOf = array_mod.nativeArrayOf;
+const nativeArrayFrom = array_mod.nativeArrayFrom;
 const nativeArray = array_mod.nativeArray;
 const nativeArrayConcat = array_mod.nativeArrayConcat;
 const nativeArrayFilter = array_mod.nativeArrayFilter;
@@ -26,6 +47,7 @@ const nativeArrayPop = array_mod.nativeArrayPop;
 const nativeArrayPush = array_mod.nativeArrayPush;
 const nativeArraySlice = array_mod.nativeArraySlice;
 const nativeArrayToString = array_mod.nativeArrayToString;
+
 const collections_mod = @import("builtins/collections.zig");
 const nativeCollectionClear = collections_mod.nativeCollectionClear;
 const nativeMap = collections_mod.nativeMap;
@@ -41,6 +63,7 @@ const nativeSetDelete = collections_mod.nativeSetDelete;
 const nativeSetForEach = collections_mod.nativeSetForEach;
 const nativeSetHas = collections_mod.nativeSetHas;
 const nativeSetSize = collections_mod.nativeSetSize;
+
 const date_mod = @import("builtins/date.zig");
 const nativeDate = date_mod.nativeDate;
 const nativeDateGetDate = date_mod.nativeDateGetDate;
@@ -68,9 +91,11 @@ const nativeDateToISOString = date_mod.nativeDateToISOString;
 const nativeDateToTimeString = date_mod.nativeDateToTimeString;
 const nativeDateToUTCString = date_mod.nativeDateToUTCString;
 const nativeDateUTC = date_mod.nativeDateUTC;
+
 const errors_mod = @import("builtins/errors.zig");
 const nativeError = errors_mod.nativeError;
 const nativeErrorToString = errors_mod.nativeErrorToString;
+
 const function_mod = @import("builtins/function.zig");
 const nativeEval = function_mod.nativeEval;
 const nativeFunctionApply = function_mod.nativeFunctionApply;
@@ -78,6 +103,7 @@ const nativeFunctionBind = function_mod.nativeFunctionBind;
 const nativeFunctionCall = function_mod.nativeFunctionCall;
 const nativeFunctionCtor = function_mod.nativeFunctionCtor;
 const nativeFunctionToString = function_mod.nativeFunctionToString;
+
 const global_mod = @import("builtins/global.zig");
 const nativeDecodeURIComponent = global_mod.nativeDecodeURIComponent;
 const nativeEncodeURI = global_mod.nativeEncodeURI;
@@ -86,6 +112,7 @@ const nativeIsFinite = global_mod.nativeIsFinite;
 const nativeIsNaN = global_mod.nativeIsNaN;
 const nativeParseFloat = global_mod.nativeParseFloat;
 const nativeParseInt = global_mod.nativeParseInt;
+
 const iterator_mod = @import("builtins/iterator.zig");
 const nativeGeneratorNext = iterator_mod.nativeGeneratorNext;
 const nativeGeneratorReturn = iterator_mod.nativeGeneratorReturn;
@@ -95,9 +122,11 @@ const nativeIterableEntries = iterator_mod.nativeIterableEntries;
 const nativeIterableKeys = iterator_mod.nativeIterableKeys;
 const nativeIterableValues = iterator_mod.nativeIterableValues;
 const nativeIteratorNext = iterator_mod.nativeIteratorNext;
+
 const json_mod = @import("builtins/json.zig");
 const nativeJSONParse = json_mod.nativeJSONParse;
 const nativeJSONStringify = json_mod.nativeJSONStringify;
+
 const math_mod = @import("builtins/math.zig");
 const mathUnaryFn = math_mod.mathUnaryFn;
 const nativeMathAbs = math_mod.nativeMathAbs;
@@ -135,6 +164,7 @@ const opSin = math_mod.opSin;
 const opSinh = math_mod.opSinh;
 const opTan = math_mod.opTan;
 const opTanh = math_mod.opTanh;
+
 const meta_mod = @import("builtins/meta.zig");
 const nativeProxy = meta_mod.nativeProxy;
 const nativeReflectApply = meta_mod.nativeReflectApply;
@@ -151,6 +181,7 @@ const nativeSymbolFor = meta_mod.nativeSymbolFor;
 const nativeSymbolKeyFor = meta_mod.nativeSymbolKeyFor;
 const nativeSymbolToString = meta_mod.nativeSymbolToString;
 const nativeSymbolValueOf = meta_mod.nativeSymbolValueOf;
+
 const number_mod = @import("builtins/number.zig");
 const nativeBoolean = number_mod.nativeBoolean;
 const nativeBooleanToString = number_mod.nativeBooleanToString;
@@ -164,8 +195,17 @@ const nativeNumberToFixed = number_mod.nativeNumberToFixed;
 const nativeNumberToPrecision = number_mod.nativeNumberToPrecision;
 const nativeNumberToString = number_mod.nativeNumberToString;
 const nativeNumberValueOf = number_mod.nativeNumberValueOf;
+
 const object_mod = @import("builtins/object.zig");
 const nativeHasOwnProperty = object_mod.nativeHasOwnProperty;
+const nativeObjectSetPrototypeOf = object_mod.nativeObjectSetPrototypeOf;
+const nativeProtoGetter = object_mod.nativeProtoGetter;
+const nativeProtoSetter = object_mod.nativeProtoSetter;
+const nativeObjectAssign = object_mod.nativeObjectAssign;
+const nativeObjectIs = object_mod.nativeObjectIs;
+const nativeObjectHasOwn = object_mod.nativeObjectHasOwn;
+const nativeObjectFromEntries = object_mod.nativeObjectFromEntries;
+const nativeObjectGetOwnPropertyDescriptors = object_mod.nativeObjectGetOwnPropertyDescriptors;
 const nativeIsPrototypeOf = object_mod.nativeIsPrototypeOf;
 const nativeObject = object_mod.nativeObject;
 const nativeObjectCreate = object_mod.nativeObjectCreate;
@@ -187,6 +227,7 @@ const nativeObjectToString = object_mod.nativeObjectToString;
 const nativeObjectValueOf = object_mod.nativeObjectValueOf;
 const nativeObjectValues = object_mod.nativeObjectValues;
 const nativePropertyIsEnumerable = object_mod.nativePropertyIsEnumerable;
+
 const regexp_mod = @import("builtins/regexp.zig");
 const nativeRegExp = regexp_mod.nativeRegExp;
 const nativeRegExpExec = regexp_mod.nativeRegExpExec;
@@ -195,7 +236,17 @@ const nativeRegExpGetSource = regexp_mod.nativeRegExpGetSource;
 const nativeRegExpTest = regexp_mod.nativeRegExpTest;
 const nativeRegExpToString = regexp_mod.nativeRegExpToString;
 const regexpFlagGetter = regexp_mod.regexpFlagGetter;
+
 const string_mod = @import("builtins/string.zig");
+const nativeStringAt = string_mod.nativeStringAt;
+const nativeStringPadStart = string_mod.nativeStringPadStart;
+const nativeStringPadEnd = string_mod.nativeStringPadEnd;
+const nativeStringCodePointAt = string_mod.nativeStringCodePointAt;
+const nativeStringFromCodePoint = string_mod.nativeStringFromCodePoint;
+const nativeStringSubstr = string_mod.nativeStringSubstr;
+const nativeStringTrimStart = string_mod.nativeStringTrimStart;
+const nativeStringTrimEnd = string_mod.nativeStringTrimEnd;
+const nativeStringReplaceAll = string_mod.nativeStringReplaceAll;
 const nativeString = string_mod.nativeString;
 const nativeStringCharAt = string_mod.nativeStringCharAt;
 const nativeStringCharCodeAt = string_mod.nativeStringCharCodeAt;
@@ -218,6 +269,7 @@ const nativeStringToLowerCase = string_mod.nativeStringToLowerCase;
 const nativeStringToString = string_mod.nativeStringToString;
 const nativeStringToUpperCase = string_mod.nativeStringToUpperCase;
 const nativeStringTrim = string_mod.nativeStringTrim;
+
 const typedarray_mod = @import("builtins/typedarray.zig");
 const dataViewGet = typedarray_mod.dataViewGet;
 const dataViewSet = typedarray_mod.dataViewSet;
@@ -268,6 +320,7 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(vm.object_proto.?, "isPrototypeOf", nativeIsPrototypeOf, 1);
     try vm.defineMethod(vm.object_proto.?, "propertyIsEnumerable", nativePropertyIsEnumerable, 1);
     try vm.defineMethod(vm.object_proto.?, "toLocaleString", nativeObjectToLocaleString, 0);
+    try vm.defineAccessor(vm.object_proto.?, "__proto__", nativeProtoGetter, nativeProtoSetter);
 
     const object_ctor = asCtor(try vm.makeNative("Object", nativeObject, 1));
     try vm.defineData(object_ctor, "prototype", Value.fromObject(vm.object_proto.?), false, false, false);
@@ -280,6 +333,12 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(object_ctor, "defineProperty", nativeObjectDefineProperty, 3);
     try vm.defineMethod(object_ctor, "getOwnPropertyDescriptor", nativeObjectGetOwnPropertyDescriptor, 2);
     try vm.defineMethod(object_ctor, "getOwnPropertyNames", nativeObjectGetOwnPropertyNames, 1);
+    try vm.defineMethod(object_ctor, "setPrototypeOf", nativeObjectSetPrototypeOf, 2);
+    try vm.defineMethod(object_ctor, "assign", nativeObjectAssign, 2);
+    try vm.defineMethod(object_ctor, "is", nativeObjectIs, 2);
+    try vm.defineMethod(object_ctor, "hasOwn", nativeObjectHasOwn, 2);
+    try vm.defineMethod(object_ctor, "fromEntries", nativeObjectFromEntries, 1);
+    try vm.defineMethod(object_ctor, "getOwnPropertyDescriptors", nativeObjectGetOwnPropertyDescriptors, 1);
     try vm.defineMethod(object_ctor, "defineProperties", nativeObjectDefineProperties, 2);
     try vm.defineMethod(object_ctor, "freeze", nativeObjectFreeze, 1);
     try vm.defineMethod(object_ctor, "isFrozen", nativeObjectIsFrozen, 1);
@@ -322,6 +381,25 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(array_proto, "forEach", nativeArrayForEach, 1);
     try vm.defineMethod(array_proto, "map", nativeArrayMap, 1);
     try vm.defineMethod(array_proto, "filter", nativeArrayFilter, 1);
+    try vm.defineMethod(array_proto, "at", nativeArrayAt, 1);
+    try vm.defineMethod(array_proto, "shift", nativeArrayShift, 0);
+    try vm.defineMethod(array_proto, "unshift", nativeArrayUnshift, 1);
+    try vm.defineMethod(array_proto, "reverse", nativeArrayReverse, 0);
+    try vm.defineMethod(array_proto, "fill", nativeArrayFill, 1);
+    try vm.defineMethod(array_proto, "lastIndexOf", nativeArrayLastIndexOf, 1);
+    try vm.defineMethod(array_proto, "some", nativeArraySome, 1);
+    try vm.defineMethod(array_proto, "every", nativeArrayEvery, 1);
+    try vm.defineMethod(array_proto, "find", nativeArrayFind, 1);
+    try vm.defineMethod(array_proto, "findIndex", nativeArrayFindIndex, 1);
+    try vm.defineMethod(array_proto, "findLast", nativeArrayFindLast, 1);
+    try vm.defineMethod(array_proto, "findLastIndex", nativeArrayFindLastIndex, 1);
+    try vm.defineMethod(array_proto, "reduce", nativeArrayReduce, 1);
+    try vm.defineMethod(array_proto, "reduceRight", nativeArrayReduceRight, 1);
+    try vm.defineMethod(array_proto, "splice", nativeArraySplice, 2);
+    try vm.defineMethod(array_proto, "sort", nativeArraySort, 1);
+    try vm.defineMethod(array_proto, "copyWithin", nativeArrayCopyWithin, 2);
+    try vm.defineMethod(array_proto, "flat", nativeArrayFlat, 0);
+    try vm.defineMethod(array_proto, "flatMap", nativeArrayFlatMap, 1);
     try vm.defineMethod(array_proto, "values", nativeIterableValues, 0);
     try vm.defineMethod(array_proto, "keys", nativeIterableKeys, 0);
     try vm.defineMethod(array_proto, "entries", nativeIterableEntries, 0);
@@ -331,6 +409,8 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineData(array_ctor, "prototype", Value.fromObject(array_proto), false, false, false);
     try vm.defineData(array_proto, "constructor", Value.fromObject(array_ctor), true, false, true);
     try vm.defineMethod(array_ctor, "isArray", nativeArrayIsArray, 1);
+    try vm.defineMethod(array_ctor, "of", nativeArrayOf, 0);
+    try vm.defineMethod(array_ctor, "from", nativeArrayFrom, 1);
     try vm.defineData(global, "Array", Value.fromObject(array_ctor), true, false, true);
 
     // ---- String (+ prototype methods for primitive strings) ----
@@ -357,6 +437,14 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(string_proto, "localeCompare", nativeStringLocaleCompare, 1);
     try vm.defineMethod(string_proto, "toLocaleLowerCase", nativeStringToLowerCase, 0);
     try vm.defineMethod(string_proto, "toLocaleUpperCase", nativeStringToUpperCase, 0);
+    try vm.defineMethod(string_proto, "at", nativeStringAt, 1);
+    try vm.defineMethod(string_proto, "padStart", nativeStringPadStart, 1);
+    try vm.defineMethod(string_proto, "padEnd", nativeStringPadEnd, 1);
+    try vm.defineMethod(string_proto, "codePointAt", nativeStringCodePointAt, 1);
+    try vm.defineMethod(string_proto, "substr", nativeStringSubstr, 2);
+    try vm.defineMethod(string_proto, "trimStart", nativeStringTrimStart, 0);
+    try vm.defineMethod(string_proto, "trimEnd", nativeStringTrimEnd, 0);
+    try vm.defineMethod(string_proto, "replaceAll", nativeStringReplaceAll, 2);
     try vm.defineData(string_proto, vm.symbol_iterator_key, Value.fromObject(try vm.makeNative("[Symbol.iterator]", nativeIterableValues, 0)), true, false, true);
     try vm.defineMethod(string_proto, "toString", nativeStringToString, 0);
     try vm.defineMethod(string_proto, "valueOf", nativeStringToString, 0);
@@ -364,6 +452,7 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineData(string_ctor, "prototype", Value.fromObject(string_proto), false, false, false);
     try vm.defineData(string_proto, "constructor", Value.fromObject(string_ctor), true, false, true);
     try vm.defineMethod(string_ctor, "fromCharCode", nativeStringFromCharCode, 1);
+    try vm.defineMethod(string_ctor, "fromCodePoint", nativeStringFromCodePoint, 1);
     try vm.defineData(global, "String", Value.fromObject(string_ctor), true, false, true);
 
     // ---- Number (+ prototype) / Boolean ----
@@ -646,6 +735,14 @@ pub fn installBuiltins(vm: *Vm) Error!void {
         else
             try vm.makeSymbol("Symbol." ++ name);
         try vm.defineData(symbol_ctor, name, sym, false, false, false);
+        // Capture the encoded keys of the symbols the engine consults.
+        if (comptime std.mem.eql(u8, name, "toPrimitive")) {
+            vm.symbol_to_primitive_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "toStringTag")) {
+            vm.symbol_to_string_tag_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "hasInstance")) {
+            vm.symbol_has_instance_key = try vm.toPropertyKey(sym);
+        }
     }
     try vm.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 

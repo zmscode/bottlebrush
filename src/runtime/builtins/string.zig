@@ -13,6 +13,7 @@ const Error = interpreter.Error;
 const regexp_mod = @import("regexp.zig");
 const nativeRegExpExec = regexp_mod.nativeRegExpExec;
 const support_mod = @import("../support.zig");
+const toIntegerOrInfinity = support_mod.toIntegerOrInfinity;
 const argAt = support_mod.argAt;
 const castVm = support_mod.castVm;
 const clampIndex = support_mod.clampIndex;
@@ -610,4 +611,187 @@ pub fn nativeStringFromCharCode(ctx: *anyopaque, this: Value, args: []const Valu
         out[i] = @truncate(@as(u32, @intFromFloat(@mod(n, 65536))));
     }
     return vm.makeStringFromUtf16(out);
+}
+
+pub fn nativeStringAt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    var k = try toIntegerOrInfinity(vm, argAt(args, 0));
+    if (k < 0) k += @floatFromInt(units.len);
+    if (k < 0 or k >= @as(f64, @floatFromInt(units.len))) return Value.undefined_value;
+    const i: usize = @intFromFloat(k);
+    return vm.makeStringFromUtf16(units[i .. i + 1]);
+}
+
+fn stringPad(vm: *Vm, this: Value, args: []const Value, at_start: bool) Error!Value {
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    const target_f = try toIntegerOrInfinity(vm, argAt(args, 0));
+    if (target_f <= @as(f64, @floatFromInt(units.len))) return sv;
+    if (target_f > 1e7) return vm.throwRangeError("pad length too large");
+    const target: usize = @intFromFloat(target_f);
+
+    var fill_units: []const u16 = &[_]u16{' '};
+    var fill_owned: ?Value = null;
+    if (!argAt(args, 1).isUndefined()) {
+        const fs = try vm.toStringVal(args[1]);
+        fill_owned = fs;
+        try vm.protect(fs);
+        fill_units = fs.asString().units;
+    }
+    defer if (fill_owned != null) vm.unprotect();
+    if (fill_units.len == 0) return sv;
+
+    var buf: std.ArrayList(u16) = .empty;
+    defer buf.deinit(vm.gpa);
+    const pad_len = target - units.len;
+    if (!at_start) try buf.appendSlice(vm.gpa, units);
+    var i: usize = 0;
+    while (i < pad_len) : (i += 1) {
+        try vm.checkBudget();
+        try buf.append(vm.gpa, fill_units[i % fill_units.len]);
+    }
+    if (at_start) try buf.appendSlice(vm.gpa, units);
+    return vm.makeStringFromUtf16(buf.items);
+}
+
+pub fn nativeStringPadStart(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return stringPad(castVm(ctx), this, args, true);
+}
+pub fn nativeStringPadEnd(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    return stringPad(castVm(ctx), this, args, false);
+}
+
+pub fn nativeStringCodePointAt(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    const n = try toIntegerOrInfinity(vm, argAt(args, 0));
+    if (n < 0 or n >= @as(f64, @floatFromInt(units.len))) return Value.undefined_value;
+    const i: usize = @intFromFloat(n);
+    const first = units[i];
+    if (first >= 0xd800 and first <= 0xdbff and i + 1 < units.len) {
+        const second = units[i + 1];
+        if (second >= 0xdc00 and second <= 0xdfff) {
+            const cp = 0x10000 + (@as(u32, first - 0xd800) << 10) + (second - 0xdc00);
+            return Value.fromNumber(@floatFromInt(cp));
+        }
+    }
+    return Value.fromNumber(@floatFromInt(first));
+}
+
+pub fn nativeStringFromCodePoint(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    var buf: std.ArrayList(u16) = .empty;
+    defer buf.deinit(vm.gpa);
+    for (args) |a| {
+        const n = try vm.toNumber(a);
+        if (std.math.isNan(n) or n < 0 or n > 0x10FFFF or n != std.math.trunc(n)) {
+            return vm.throwRangeError("invalid code point");
+        }
+        const cp: u32 = @intFromFloat(n);
+        if (cp <= 0xffff) {
+            try buf.append(vm.gpa, @intCast(cp));
+        } else {
+            const c = cp - 0x10000;
+            try buf.append(vm.gpa, @intCast(0xd800 + (c >> 10)));
+            try buf.append(vm.gpa, @intCast(0xdc00 + (c & 0x3ff)));
+        }
+    }
+    return vm.makeStringFromUtf16(buf.items);
+}
+
+pub fn nativeStringSubstr(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    const len: i64 = @intCast(units.len);
+    var start: i64 = @intFromFloat(@max(@min(try toIntegerOrInfinity(vm, argAt(args, 0)), 9.0e18), -9.0e18));
+    if (start < 0) start = @max(len + start, 0);
+    if (start >= len) return vm.makeString("");
+    const want: i64 = if (argAt(args, 1).isUndefined())
+        len - start
+    else
+        @intFromFloat(@max(@min(try toIntegerOrInfinity(vm, args[1]), 9.0e18), 0));
+    const count = @min(want, len - start);
+    if (count <= 0) return vm.makeString("");
+    return vm.makeStringFromUtf16(units[@intCast(start)..@intCast(start + count)]);
+}
+
+fn stringTrimSide(vm: *Vm, this: Value, trim_start: bool, trim_end: bool) Error!Value {
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    var units = sv.asString().units;
+    if (trim_start) while (units.len > 0 and isJsSpace(units[0])) {
+        units = units[1..];
+    };
+    if (trim_end) while (units.len > 0 and isJsSpace(units[units.len - 1])) {
+        units = units[0 .. units.len - 1];
+    };
+    return vm.makeStringFromUtf16(units);
+}
+
+pub fn nativeStringTrimStart(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return stringTrimSide(castVm(ctx), this, true, false);
+}
+pub fn nativeStringTrimEnd(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    return stringTrimSide(castVm(ctx), this, false, true);
+}
+
+pub fn nativeStringReplaceAll(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const pat = argAt(args, 0);
+    // A RegExp pattern must be global; delegate to replace (which loops on g).
+    if (pat.isObject() and pat.asObject().regex != null) {
+        if (!pat.asObject().regex.?.flags.global) {
+            return vm.throwTypeError("replaceAll must be called with a global RegExp");
+        }
+        return nativeStringReplace(ctx, this, args);
+    }
+    const sv = try coerceToString(vm, this);
+    try vm.protect(sv);
+    defer vm.unprotect();
+    const units = sv.asString().units;
+    const rep = argAt(args, 1);
+    const rep_is_fn = isCallable(rep);
+    const pat_s = try vm.toStringVal(pat);
+    try vm.protect(pat_s);
+    defer vm.unprotect();
+    const pat_units = pat_s.asString().units;
+
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(vm.gpa);
+    var pos: usize = 0;
+    const no_names: std.StringHashMapUnmanaged(u32) = .empty;
+    while (pos <= units.len) {
+        try vm.checkBudget();
+        const idx = indexOfUtf16(units, pat_units, pos) orelse break;
+        try out.appendSlice(vm.gpa, units[pos..idx]);
+        const span = [_]?bilby.Span{.{ .start = idx, .end = idx + pat_units.len }};
+        if (rep_is_fn) {
+            try appendReplacerCall(vm, &out, rep, units, &span, sv);
+        } else {
+            const rs = try vm.toStringVal(rep);
+            try vm.protect(rs);
+            defer vm.unprotect();
+            try appendSubstitution(vm, &out, rs.asString().units, units, &span, &no_names);
+        }
+        pos = if (pat_units.len == 0) idx + 1 else idx + pat_units.len;
+        if (pat_units.len == 0 and idx < units.len) try out.appendSlice(vm.gpa, units[idx .. idx + 1]);
+    }
+    if (pos <= units.len) try out.appendSlice(vm.gpa, units[pos..]);
+    return vm.makeStringFromUtf16(out.items);
 }

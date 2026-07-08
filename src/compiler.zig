@@ -48,6 +48,7 @@ const FnState = struct {
     name: []const u8,
     is_generator: bool = false,
     is_arrow: bool = false,
+    is_strict: bool = false,
     num_params: u32 = 0,
     fn_length: u32 = 0,
     arguments_slot: ?u32 = null,
@@ -199,7 +200,18 @@ pub const Compiler = struct {
     fn hoistTarget(self: *Compiler, target: *Node) CompileError!void {
         switch (target.kind) {
             .ident => |name| _ = try self.declare(name),
-            else => {}, // destructuring var hoisting deferred
+            .assignment_pattern => |ap| try self.hoistTarget(ap.left),
+            .rest_element => |inner| try self.hoistTarget(inner),
+            .array_pattern => |elems| for (elems) |maybe| {
+                if (maybe) |e| try self.hoistTarget(e);
+            },
+            .object_pattern => |props| for (props) |pr| {
+                if (pr.kind == .property) {
+                    if (pr.kind.property.value) |pv| try self.hoistTarget(pv);
+                }
+                if (pr.kind == .rest_element) try self.hoistTarget(pr.kind.rest_element);
+            },
+            else => {},
         }
     }
 
@@ -216,6 +228,12 @@ pub const Compiler = struct {
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
         var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_arrow = is_arrow };
+        // Strict mode is inherited from the enclosing function and switched on
+        // by a "use strict" directive in this body's prologue.
+        if (parent_fs) |pf| fs.is_strict = pf.is_strict;
+        if (!is_expression_body and body.kind == .block_stmt and hasUseStrictDirective(body.kind.block_stmt)) {
+            fs.is_strict = true;
+        }
         const prev = self.fs;
         self.fs = &fs;
         defer self.fs = prev;
@@ -226,7 +244,7 @@ pub const Compiler = struct {
         // Parameters occupy the first env slots. `fn_length` counts only the
         // ones before the first default/rest parameter (the `length` property).
         var counting_length = true;
-        for (params) |p| {
+        for (params, 0..) |p, pidx| {
             switch (p.kind) {
                 .ident => |pn| {
                     _ = try self.declare(pn);
@@ -236,7 +254,16 @@ pub const Compiler = struct {
                     counting_length = false;
                     if (ap.left.kind == .ident) {
                         _ = try self.declare(ap.left.kind.ident);
-                    } else return self.fail("destructuring params unsupported", p.start);
+                    } else {
+                        // Pattern param with default: raw argument lives in a
+                        // uniquely named synthetic slot; the pattern binds after
+                        // defaults are applied.
+                        _ = try self.declare(try std.fmt.allocPrint(self.arena, "\x00param{d}", .{pidx}));
+                    }
+                },
+                .array_pattern, .object_pattern => {
+                    if (counting_length) fs.fn_length += 1;
+                    _ = try self.declare(try std.fmt.allocPrint(self.arena, "\x00param{d}", .{pidx}));
                 },
                 .rest_element => return self.fail("rest params unsupported", p.start),
                 else => return self.fail("pattern params unsupported", p.start),
@@ -260,6 +287,21 @@ pub const Compiler = struct {
             _ = try self.emit(.{ .op = .set_var, .a = 0, .b = @intCast(slot), .c = dflt });
             self.patchTarget(jskip, self.here());
             self.freeTo(cur);
+        }
+
+        // Destructured parameters: bind the pattern from the raw argument slot.
+        for (params, 0..) |p, slot| {
+            const pattern: ?*Node = switch (p.kind) {
+                .array_pattern, .object_pattern => p,
+                .assignment_pattern => |ap2| if (ap2.left.kind != .ident) ap2.left else null,
+                else => null,
+            };
+            if (pattern) |pt| {
+                const v = self.allocReg();
+                _ = try self.emit(.{ .op = .get_var, .a = v, .b = 0, .c = @intCast(slot) });
+                try self.compilePatternBind(pt, v, .decl_lexical);
+                self.freeTo(v);
+            }
         }
 
         // Ordinary (non-arrow) functions get an implicit `arguments` binding,
@@ -318,6 +360,7 @@ pub const Compiler = struct {
             .num_env_slots = fs.env_slot_count,
             .is_generator = fs.is_generator,
             .is_arrow = fs.is_arrow,
+            .is_strict = fs.is_strict,
             .fn_length = fs.fn_length,
             .arguments_slot = fs.arguments_slot,
             .code = try self.arena.dupe(Inst, fs.code.items),
@@ -422,11 +465,182 @@ pub const Compiler = struct {
         }
     }
 
+    // ---- destructuring ------------------------------------------------------
+
+    const BindMode = enum { decl_lexical, decl_var, assign };
+
+    fn bindPatternName(self: *Compiler, name: []const u8, src: u32, mode: BindMode) CompileError!void {
+        switch (mode) {
+            .decl_lexical => {
+                const slot = try self.declare(name);
+                _ = try self.emit(.{ .op = .init_var, .a = 0, .b = slot, .c = src });
+            },
+            .decl_var => {
+                const slot = if (self.resolve(name)) |b| (if (b.depth == 0) b.slot else try self.declare(name)) else try self.declare(name);
+                _ = try self.emit(.{ .op = .init_var, .a = 0, .b = slot, .c = src });
+            },
+            .assign => {
+                if (self.resolve(name)) |b| {
+                    _ = try self.emit(.{ .op = .set_var, .a = b.depth, .b = b.slot, .c = src });
+                } else {
+                    const idx = try self.addConst(.{ .string = name });
+                    _ = try self.emit(.{ .op = .set_global, .a = idx, .b = src });
+                }
+            },
+        }
+    }
+
+    /// Store the value in `src` into a member-expression target (`[o.x] = v`).
+    fn storeToMember(self: *Compiler, m_node: *Node, src: u32) CompileError!void {
+        const m = m_node.kind.member;
+        const obj = self.allocReg();
+        try self.compileExprInto(obj, m.object);
+        if (m.computed) {
+            const k = self.allocReg();
+            try self.compileExprInto(k, m.property);
+            _ = try self.emit(.{ .op = .set_elem, .a = obj, .b = k, .c = src });
+        } else {
+            if (m.property.kind != .ident) return self.fail("unsupported member target", m_node.start);
+            const idx = try self.addConst(.{ .string = m.property.kind.ident });
+            _ = try self.emit(.{ .op = .set_prop, .a = obj, .b = idx, .c = src });
+        }
+        self.freeTo(obj);
+    }
+
+    /// Bind `target` to `src`, substituting `dflt` when `src` is undefined.
+    fn bindWithDefault(self: *Compiler, target: *Node, dflt: *Node, src: u32, mode: BindMode) CompileError!void {
+        const v = self.allocReg();
+        _ = try self.emit(.{ .op = .move, .a = v, .b = src });
+        const und = self.allocReg();
+        _ = try self.emit(.{ .op = .load_undefined, .a = und });
+        const cmp = self.allocReg();
+        _ = try self.emit(.{ .op = .strict_eq, .a = cmp, .b = v, .c = und });
+        const jskip = try self.emit(.{ .op = .jump_if_false, .a = cmp });
+        try self.compileExprInto(v, dflt);
+        self.patchTarget(jskip, self.here());
+        self.freeTo(und);
+        try self.compilePatternBind(target, v, mode);
+        self.freeTo(v);
+    }
+
+    fn bindArrayPattern(self: *Compiler, elems: []?*Node, src: u32, mode: BindMode) CompileError!void {
+        // Iterator-protocol based, per spec: works for arrays, strings, Maps,
+        // Sets, generators, and custom iterables alike.
+        const iter = self.allocReg();
+        _ = try self.emit(.{ .op = .iter_init, .a = iter, .b = src });
+        const value_name = try self.addConst(.{ .string = "value" });
+        const done_name = try self.addConst(.{ .string = "done" });
+        for (elems) |maybe| {
+            if (maybe) |el| {
+                if (el.kind == .rest_element or el.kind == .spread) {
+                    const target = if (el.kind == .rest_element) el.kind.rest_element else el.kind.spread;
+                    // Collect the remaining elements into a fresh array.
+                    const arr = self.allocReg();
+                    _ = try self.emit(.{ .op = .new_array, .a = arr, .b = 0 });
+                    const top = self.here();
+                    const res = self.allocReg();
+                    _ = try self.emit(.{ .op = .iter_next, .a = res, .b = iter });
+                    const done = self.allocReg();
+                    _ = try self.emit(.{ .op = .get_prop, .a = done, .b = res, .c = done_name });
+                    const jexit = try self.emit(.{ .op = .jump_if_true, .a = done });
+                    const val = self.allocReg();
+                    _ = try self.emit(.{ .op = .get_prop, .a = val, .b = res, .c = value_name });
+                    _ = try self.emit(.{ .op = .arr_push, .a = arr, .b = val });
+                    _ = try self.emit(.{ .op = .jump, .a = top });
+                    self.patchTarget(jexit, self.here());
+                    self.freeTo(res);
+                    try self.compilePatternBind(target, arr, mode);
+                    self.freeTo(arr);
+                    break;
+                }
+                const res = self.allocReg();
+                _ = try self.emit(.{ .op = .iter_next, .a = res, .b = iter });
+                const val = self.allocReg();
+                _ = try self.emit(.{ .op = .get_prop, .a = val, .b = res, .c = value_name });
+                try self.compilePatternBind(el, val, mode);
+                self.freeTo(res);
+            } else {
+                // Elision: consume one iterator result, bind nothing.
+                const res = self.allocReg();
+                _ = try self.emit(.{ .op = .iter_next, .a = res, .b = iter });
+                self.freeTo(res);
+            }
+        }
+        self.freeTo(iter);
+    }
+
+    fn bindObjectPattern(self: *Compiler, props: []*Node, src: u32, mode: BindMode) CompileError!void {
+        for (props) |p| {
+            switch (p.kind) {
+                .rest_element, .spread => return self.fail("object rest pattern unsupported", p.start),
+                .property => |prop| {
+                    if (prop.kind != .init and prop.kind != .method) return self.fail("invalid destructuring property", p.start);
+                    const val = self.allocReg();
+                    if (prop.computed) {
+                        const k = self.allocReg();
+                        try self.compileExprInto(k, prop.key);
+                        _ = try self.emit(.{ .op = .get_elem, .a = val, .b = src, .c = k });
+                    } else switch (prop.key.kind) {
+                        .ident => |n| {
+                            const idx = try self.addConst(.{ .string = n });
+                            _ = try self.emit(.{ .op = .get_prop, .a = val, .b = src, .c = idx });
+                        },
+                        .string => |raw| {
+                            const cooked = try self.cookString(raw);
+                            const idx = try self.addConst(.{ .string = cooked });
+                            _ = try self.emit(.{ .op = .get_prop, .a = val, .b = src, .c = idx });
+                        },
+                        .number => {
+                            const k = self.allocReg();
+                            try self.compileExprInto(k, prop.key);
+                            _ = try self.emit(.{ .op = .get_elem, .a = val, .b = src, .c = k });
+                        },
+                        else => return self.fail("unsupported destructuring key", p.start),
+                    }
+                    const target_node = prop.value orelse return self.fail("invalid destructuring property", p.start);
+                    try self.compilePatternBind(target_node, val, mode);
+                    self.freeTo(val);
+                },
+                else => return self.fail("invalid destructuring property", p.start),
+            }
+        }
+    }
+
+    /// Bind a destructuring target (binding pattern *or* the literal cover form
+    /// used in assignment expressions) to the value in `src`.
+    fn compilePatternBind(self: *Compiler, pat: *Node, src: u32, mode: BindMode) CompileError!void {
+        switch (pat.kind) {
+            .ident => |name| try self.bindPatternName(name, src, mode),
+            .member => {
+                if (mode != .assign) return self.fail("member expression not allowed in binding pattern", pat.start);
+                try self.storeToMember(pat, src);
+            },
+            .assignment_pattern => |ap| try self.bindWithDefault(ap.left, ap.right, src, mode),
+            .assignment => |a| {
+                // Literal cover form: `[x = 1] = v` parses the default as an
+                // assignment expression.
+                if (a.op != .assign) return self.fail("invalid destructuring default", pat.start);
+                try self.bindWithDefault(a.target, a.value, src, mode);
+            },
+            .array_pattern => |elems| try self.bindArrayPattern(elems, src, mode),
+            .array_literal => |elems| try self.bindArrayPattern(elems, src, mode),
+            .object_pattern => |props| try self.bindObjectPattern(props, src, mode),
+            .object_literal => |props| try self.bindObjectPattern(props, src, mode),
+            else => return self.fail("unsupported destructuring target", pat.start),
+        }
+    }
+
     fn compileVarDecl(self: *Compiler, vd: anytype) CompileError!void {
         const lexical = vd.kind != .keyword_var;
         for (vd.decls) |d| {
             const decl = d.kind.variable_declarator;
-            if (decl.id.kind != .ident) return self.fail("destructuring declarations unsupported", decl.id.start);
+            if (decl.id.kind != .ident) {
+                const init_expr = decl.init orelse return self.fail("destructuring declaration requires an initializer", decl.id.start);
+                const r = try self.compileExprToNew(init_expr);
+                try self.compilePatternBind(decl.id, r, if (lexical) BindMode.decl_lexical else BindMode.decl_var);
+                self.freeTo(r);
+                continue;
+            }
             const name = decl.id.kind.ident;
             const slot = if (vd.kind == .keyword_var)
                 self.resolve(name).?.slot // already hoisted
@@ -445,6 +659,19 @@ pub const Compiler = struct {
                 self.freeTo(r);
             }
         }
+    }
+
+    /// True when a statement list's directive prologue (leading string-literal
+    /// expression statements) contains "use strict".
+    fn hasUseStrictDirective(stmts: []*Node) bool {
+        for (stmts) |stmt| {
+            if (stmt.kind != .expression_stmt) return false;
+            const e = stmt.kind.expression_stmt;
+            if (e.kind != .string) return false;
+            const raw = e.kind.string;
+            if (std.mem.eql(u8, raw, "\"use strict\"") or std.mem.eql(u8, raw, "'use strict'")) return true;
+        }
+        return false;
     }
 
     /// Pre-declare a statement list's `let`/`const` bindings and mark their
@@ -682,13 +909,17 @@ pub const Compiler = struct {
     const ForTarget = union(enum) {
         local: Binding,
         global: u32, // name const index
+        pattern: struct { node: *Node, mode: BindMode },
     };
 
     fn forHeadTarget(self: *Compiler, left: *Node) CompileError!ForTarget {
         switch (left.kind) {
             .var_decl => |vd| {
                 const id = vd.decls[0].kind.variable_declarator.id;
-                if (id.kind != .ident) return self.fail("destructuring for-of target unsupported", id.start);
+                if (id.kind != .ident) {
+                    const mode: BindMode = if (vd.kind == .keyword_var) .decl_var else .decl_lexical;
+                    return .{ .pattern = .{ .node = id, .mode = mode } };
+                }
                 const name = id.kind.ident;
                 const slot = if (vd.kind == .keyword_var) (self.resolve(name) orelse unreachable).slot else try self.declare(name);
                 return .{ .local = .{ .depth = 0, .slot = slot } };
@@ -696,6 +927,9 @@ pub const Compiler = struct {
             .ident => |name| {
                 if (self.resolve(name)) |bind| return .{ .local = bind };
                 return .{ .global = try self.addConst(.{ .string = name }) };
+            },
+            .array_literal, .object_literal, .array_pattern, .object_pattern => {
+                return .{ .pattern = .{ .node = left, .mode = .assign } };
             },
             else => return self.fail("for-of target unsupported", left.start),
         }
@@ -705,6 +939,7 @@ pub const Compiler = struct {
         switch (target) {
             .local => |b| _ = try self.emit(.{ .op = .set_var, .a = b.depth, .b = b.slot, .c = src }),
             .global => |idx| _ = try self.emit(.{ .op = .set_global, .a = idx, .b = src }),
+            .pattern => |pt| try self.compilePatternBind(pt.node, src, pt.mode),
         }
     }
 
@@ -788,7 +1023,9 @@ pub const Compiler = struct {
                 if (p.kind == .ident) {
                     const slot = try self.declare(p.kind.ident);
                     _ = try self.emit(.{ .op = .set_var, .a = 0, .b = slot, .c = catch_reg });
-                } else return self.fail("destructuring catch param unsupported", p.start);
+                } else {
+                    try self.compilePatternBind(p, catch_reg, .decl_lexical);
+                }
             }
             self.freeTo(catch_reg);
             try self.compileStmt(cc.body);
@@ -1022,6 +1259,15 @@ pub const Compiler = struct {
     fn compileAssignment(self: *Compiler, dst: u32, a: anytype, pos: u32) CompileError!void {
         if (a.target.kind == .member) {
             return self.compileMemberStore(dst, a, pos);
+        }
+        switch (a.target.kind) {
+            .array_literal, .object_literal, .array_pattern, .object_pattern => {
+                if (a.op != .assign) return self.fail("destructuring requires plain assignment", pos);
+                try self.compileExprInto(dst, a.value);
+                try self.compilePatternBind(a.target, dst, .assign);
+                return;
+            },
+            else => {},
         }
         if (a.target.kind != .ident) return self.fail("assignment target must be an identifier or member", pos);
         const name = a.target.kind.ident;
@@ -1566,7 +1812,7 @@ test "compiles control flow and functions" {
 }
 
 test "reports unsupported constructs" {
-    const src = "var [a, b] = arr;"; // destructuring declarations not yet supported
+    const src = "class C {}"; // classes do not compile yet
     const parser = @import("parser.zig");
     var pr = try parser.parse(testing.allocator, src, .script);
     switch (pr) {

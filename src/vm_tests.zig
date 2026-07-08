@@ -1151,3 +1151,210 @@ test "defineProperty enforces non-configurable invariants" {
         \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
     ));
 }
+
+test "Object statics batch" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var proto = { greet: function () { return 1; } };
+        \\var o = {};
+        \\Object.setPrototypeOf(o, proto);
+        \\return o.greet();
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\try { Object.setPrototypeOf(o, o); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("var p = {}; var o = Object.create(p); return o.__proto__ === p ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\var t = Object.assign({ a: 1 }, { b: 2 }, { c: 3 });
+        \\return t.a + t.b + t.c;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return Object.is(NaN, NaN) && !Object.is(0, -0) && Object.is(1, 1) ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return Object.hasOwn({ x: 1 }, 'x') && !Object.hasOwn({}, 'x') ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber("return Object.fromEntries([['a', 1], ['b', 2]]).a + 2;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var ds = Object.getOwnPropertyDescriptors({ p: 5 });
+        \\return (ds.p.value === 5 && ds.p.writable === true) ? 1 : 0;
+    ));
+}
+
+test "Array method tail" {
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber("return [1,2,3].at(-1);"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("var a=[1,2,3]; return a.shift() === 1 && a.length === 2 && a[0] === 2 ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("var a=[3]; a.unshift(1,2); return (a.join(',')==='1,2,3') ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [1,2,3].reverse().join(',') === '3,2,1' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [1,2,3,4].fill(0,1,3).join(',') === '1,0,0,4' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber("return [1,2,1,2].lastIndexOf(2);"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [1,2,3].some(function(x){return x>2;}) && ![1,2].some(function(x){return x>2;}) ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [2,4].every(function(x){return x%2===0;}) ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 4), try evalNumber("return [1,4,9].find(function(x){return x>3;});"));
+    try std.testing.expectEqual(@as(f64, 2), try evalNumber("return [1,4,9].findLastIndex(function(x){return x>3;});"));
+    try std.testing.expectEqual(@as(f64, 10), try evalNumber("return [1,2,3,4].reduce(function(a,b){return a+b;});"));
+    try std.testing.expectEqual(@as(f64, 20), try evalNumber("return [1,2,3,4].reduceRight(function(a,b){return a+b;}, 10);"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var a = [1,2,3,4,5];
+        \\var removed = a.splice(1, 2, "x");
+        \\return (a.join(',') === '1,x,4,5' && removed.join(',') === '2,3') ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [3,1,2].sort().join(',') === '1,2,3' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [10,9,1].sort().join(',') === '1,10,9' ? 1 : 0;")); // default = string order
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [10,9,1].sort(function(a,b){return a-b;}).join(',') === '1,9,10' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [1,2,3,4,5].copyWithin(0,3).join(',') === '4,5,3,4,5' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [1,[2,[3]]].flat().length === 3 ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [1,[2,[3]]].flat(2).join(',') === '1,2,3' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return [1,2].flatMap(function(x){return [x, x*10];}).join(',') === '1,10,2,20' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return Array.of(1,2,3).join(',') === '1,2,3' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return Array.from('abc').join(',') === 'a,b,c' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return Array.from([1,2], function(x){return x*2;}).join(',') === '2,4' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return Array.from({length: 2, 0: 'a', 1: 'b'}).join(',') === 'a,b' ? 1 : 0;"));
+}
+
+test "String method tail" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return 'abc'.at(-1) === 'c' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return '5'.padStart(3, '0') === '005' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return 'ab'.padEnd(5, 'xy') === 'abxyx' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 97), try evalNumber("return 'abc'.codePointAt(0);"));
+    try std.testing.expectEqual(@as(f64, 128512), try evalNumber("return '😀'.codePointAt(0);"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return String.fromCodePoint(128512).codePointAt(0) === 128512 ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return 'abcdef'.substr(1, 3) === 'bcd' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return '  hi  '.trimStart() === 'hi  ' && '  hi  '.trimEnd() === '  hi' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return 'a-b-c'.replaceAll('-', '+') === 'a+b+c' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("return 'a1b2'.replaceAll(/\\d/g, '#') === 'a#b#' ? 1 : 0;"));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\try { 'x'.replaceAll(/x/, 'y'); return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+}
+
+test "well-known symbol dispatch" {
+    // @@toPrimitive controls coercion, with the hint.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\o[Symbol.toPrimitive] = function (hint) {
+        \\  return hint === "number" ? 42 : "str";
+        \\};
+        \\return (+o === 42 && ("" + o) !== "42") ? 1 : 0;
+    ));
+    // String hint flows through template-ish concatenation via toStringVal.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { toString: function () { return "T"; }, valueOf: function () { return 9; } };
+        \\return (String(o) === "T" && o * 1 === 9) ? 1 : 0;
+    ));
+    // @@toStringTag changes Object.prototype.toString.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = {};
+        \\o[Symbol.toStringTag] = "Custom";
+        \\return Object.prototype.toString.call(o) === "[object Custom]" ? 1 : 0;
+    ));
+    // Builtin tags.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var t = Object.prototype.toString;
+        \\return (t.call([]) === "[object Array]" && t.call(t) === "[object Function]" &&
+        \\        t.call("s") === "[object String]" && t.call(5) === "[object Number]") ? 1 : 0;
+    ));
+    // @@hasInstance overrides instanceof.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var Even = {};
+        \\Even[Symbol.hasInstance] = function (v) { return v % 2 === 0; };
+        \\return (4 instanceof Even) && !(3 instanceof Even) ? 1 : 0;
+    ));
+}
+
+test "destructuring: declarations" {
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber("var [a, b] = [1, 2]; return a + b;"));
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber("let [x, , z] = [1, 9, 2]; return x + z;"));
+    try std.testing.expectEqual(@as(f64, 7), try evalNumber("const { p, q } = { p: 3, q: 4 }; return p + q;"));
+    try std.testing.expectEqual(@as(f64, 5), try evalNumber("var { a: renamed } = { a: 5 }; return renamed;"));
+    try std.testing.expectEqual(@as(f64, 9), try evalNumber("var { missing = 9 } = {}; return missing;"));
+    try std.testing.expectEqual(@as(f64, 6), try evalNumber("var [h = 6] = []; return h;"));
+    // Nested.
+    try std.testing.expectEqual(@as(f64, 12), try evalNumber(
+        \\var { a: [x, y], b: { c } } = { a: [3, 4], b: { c: 5 } };
+        \\return x + y + c;
+    ));
+    // Array rest.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var [first, ...rest] = [1, 2, 3, 4];
+        \\return (first === 1 && rest.length === 3 && rest[2] === 4) ? 1 : 0;
+    ));
+    // Strings destructure via the iterator protocol.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber("var [c1, c2] = 'hi'; return (c1 === 'h' && c2 === 'i') ? 1 : 0;"));
+}
+
+test "destructuring: params, assignment, for-of, catch" {
+    try std.testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\function f([a, b], { c }) { return a + b + c; }
+        \\return f([1, 2], { c: 4 });
+    ));
+    // Pattern param with a whole-pattern default.
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\function g({ n } = { n: 3 }) { return n; }
+        \\return g();
+    ));
+    // Assignment-expression destructuring (existing bindings + member targets).
+    try std.testing.expectEqual(@as(f64, 12), try evalNumber(
+        \\var a, b; var o = {};
+        \\[a, b] = [4, 8];
+        \\({ x: o.stored } = { x: 100 });
+        \\return a + b;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var swap_a = 1, swap_b = 2;
+        \\[swap_a, swap_b] = [swap_b, swap_a];
+        \\return (swap_a === 2 && swap_b === 1) ? 1 : 0;
+    ));
+    // for-of head patterns.
+    try std.testing.expectEqual(@as(f64, 21), try evalNumber(
+        \\var total = 0;
+        \\for (const [k, v] of [[1, 2], [3, 4], [5, 6]]) { total += k + v; }
+        \\return total;
+    ));
+    // catch parameter pattern.
+    try std.testing.expectEqual(@as(f64, 42), try evalNumber(
+        \\try { throw { code: 42 }; }
+        \\catch ({ code }) { return code; }
+    ));
+}
+
+test "strict mode semantics" {
+    // Assignment to an undeclared global throws in strict mode…
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\"use strict";
+        \\try { undeclared_target = 1; return 0; }
+        \\catch (e) { return (e instanceof ReferenceError) ? 1 : 2; }
+    ));
+    // …and still works (creates the global) in sloppy mode.
+    try std.testing.expectEqual(@as(f64, 5), try evalNumber("sloppy_target = 5; return sloppy_target;"));
+    // Writing a read-only property throws in strict mode only.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\"use strict";
+        \\var o = Object.freeze({ p: 1 });
+        \\try { o.p = 2; return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = Object.freeze({ p: 1 });
+        \\o.p = 2; // sloppy: silently ignored
+        \\return o.p;
+    ));
+    // delete of a non-configurable property throws in strict mode.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\"use strict";
+        \\var o = {};
+        \\Object.defineProperty(o, "p", { value: 1 });
+        \\try { delete o.p; return 0; }
+        \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // Strict `this` is not coerced; sloppy nullish `this` becomes globalThis.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function strictThis() { "use strict"; return this === undefined; }
+        \\function sloppyThis() { return this === globalThis; }
+        \\return (strictThis() && sloppyThis()) ? 1 : 0;
+    ));
+    // Strictness is inherited by nested functions.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\"use strict";
+        \\function outer() { function inner() { return this === undefined; } return inner(); }
+        \\return outer() ? 1 : 0;
+    ));
+}

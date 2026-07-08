@@ -142,6 +142,10 @@ pub const Vm = struct {
     symbol_iterator: ?Value = null,
     /// The property-map key encoding @@iterator (owned).
     symbol_iterator_key: []const u8 = &.{},
+    /// Encoded property keys for the well-known symbols the engine consults.
+    symbol_to_primitive_key: []const u8 = &.{},
+    symbol_to_string_tag_key: []const u8 = &.{},
+    symbol_has_instance_key: []const u8 = &.{},
     iterator_proto: ?*gc.Object = null,
     generator_proto: ?*gc.Object = null,
 
@@ -156,6 +160,9 @@ pub const Vm = struct {
         for (self.symbol_registry.items) |r| self.gpa.free(r.key);
         self.symbol_registry.deinit(self.gpa);
         if (self.symbol_iterator_key.len != 0) self.gpa.free(self.symbol_iterator_key);
+        if (self.symbol_to_primitive_key.len != 0) self.gpa.free(self.symbol_to_primitive_key);
+        if (self.symbol_to_string_tag_key.len != 0) self.gpa.free(self.symbol_to_string_tag_key);
+        if (self.symbol_has_instance_key.len != 0) self.gpa.free(self.symbol_has_instance_key);
         // Programs compiled by eval/Function() live as long as the VM: closures
         // created inside them keep pointing at their bytecode arenas.
         for (self.eval_programs.items) |*p| p.deinit();
@@ -288,6 +295,25 @@ pub const Vm = struct {
             .is_accessor = true,
             .get = Value.fromObject(getter_obj),
             .set = null,
+            .enumerable = false,
+            .configurable = true,
+        };
+    }
+
+    /// Define an accessor property with both a native getter and setter.
+    pub fn defineAccessor(self: *Vm, obj: *gc.Object, name: []const u8, getter: gc.NativeFn, setter: gc.NativeFn) Error!void {
+        const getter_obj = try self.makeNative(name, getter, 0);
+        try self.protect(Value.fromObject(getter_obj));
+        defer self.unprotect();
+        const setter_obj = try self.makeNative(name, setter, 1);
+        try self.protect(Value.fromObject(setter_obj));
+        defer self.unprotect();
+        const gop = try obj.properties.getOrPut(self.gpa, name);
+        if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, name);
+        gop.value_ptr.* = .{
+            .is_accessor = true,
+            .get = Value.fromObject(getter_obj),
+            .set = Value.fromObject(setter_obj),
             .enumerable = false,
             .configurable = true,
         };
@@ -567,7 +593,14 @@ pub const Vm = struct {
 
             .get_global => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, false),
             .get_global_typeof => regs[inst.a] = try self.getGlobal(code.constants[inst.b].string, true),
-            .set_global => try self.setProperty(Value.fromObject(self.global_object.?), code.constants[inst.a].string, regs[inst.b]),
+            .set_global => {
+                const gname = code.constants[inst.a].string;
+                // Strict mode: assigning to an undeclared global is a ReferenceError.
+                if (code.is_strict and !self.hasProperty(self.global_object.?, gname)) {
+                    return self.throwReferenceError("assignment to undeclared variable");
+                }
+                try self.setPropertyMode(Value.fromObject(self.global_object.?), gname, regs[inst.b], code.is_strict);
+            },
 
             .add => regs[inst.a] = try self.opAdd(regs[inst.b], regs[inst.c]),
             .sub => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b]) - try self.toNumber(regs[inst.c])),
@@ -625,7 +658,7 @@ pub const Vm = struct {
             .new_array => regs[inst.a] = Value.fromObject(try self.newArray(inst.b)),
             .new_regex => regs[inst.a] = Value.fromObject(try self.makeRegExp(code.constants[inst.b].string, code.constants[inst.c].string)),
             .get_prop => regs[inst.a] = try self.getProperty(regs[inst.b], code.constants[inst.c].string),
-            .set_prop => try self.setProperty(regs[inst.a], code.constants[inst.b].string, regs[inst.c]),
+            .set_prop => try self.setPropertyMode(regs[inst.a], code.constants[inst.b].string, regs[inst.c], code.is_strict),
             .get_elem => {
                 const key = try self.toPropertyKey(regs[inst.c]);
                 defer self.gpa.free(key);
@@ -634,13 +667,19 @@ pub const Vm = struct {
             .set_elem => {
                 const key = try self.toPropertyKey(regs[inst.b]);
                 defer self.gpa.free(key);
-                try self.setProperty(regs[inst.a], key, regs[inst.c]);
+                try self.setPropertyMode(regs[inst.a], key, regs[inst.c], code.is_strict);
             },
-            .delete_prop => regs[inst.a] = Value.fromBool(self.deleteProperty(regs[inst.b], code.constants[inst.c].string)),
+            .delete_prop => {
+                const ok = self.deleteProperty(regs[inst.b], code.constants[inst.c].string);
+                if (code.is_strict and !ok) return self.throwTypeError("cannot delete non-configurable property");
+                regs[inst.a] = Value.fromBool(ok);
+            },
             .delete_elem => {
                 const key = try self.toPropertyKey(regs[inst.c]);
                 defer self.gpa.free(key);
-                regs[inst.a] = Value.fromBool(self.deleteProperty(regs[inst.b], key));
+                const ok = self.deleteProperty(regs[inst.b], key);
+                if (code.is_strict and !ok) return self.throwTypeError("cannot delete non-configurable property");
+                regs[inst.a] = Value.fromBool(ok);
             },
             .load_this => regs[inst.a] = this_value,
             .arr_push => try self.arrayAppend(regs[inst.a].asObject(), regs[inst.b]),
@@ -778,7 +817,12 @@ pub const Vm = struct {
         }
         if (code.arguments_slot) |slot| env.slots[slot] = args_obj.?;
         // Arrows ignore the call receiver: `this` is the creation site's.
-        const effective_this = if (code.is_arrow) (clo.captured_this orelse Value.undefined_value) else this_value;
+        // Sloppy functions coerce a nullish receiver to the global object;
+        // strict functions see it as-is.
+        var effective_this = if (code.is_arrow) (clo.captured_this orelse Value.undefined_value) else this_value;
+        if (!code.is_arrow and !code.is_strict and effective_this.isNullish()) {
+            effective_this = Value.fromObject(self.global_object.?);
+        }
         return self.execute(code, env, effective_this);
     }
 
@@ -1336,21 +1380,35 @@ pub const Vm = struct {
 
     /// [[Set]] on a value: honor setters and writability; create own data
     /// property on the receiver otherwise.
+    /// Sloppy-mode [[Set]]: failures are silently ignored (native callers).
     pub fn setProperty(self: *Vm, base: Value, key: []const u8, value: Value) Error!void {
+        _ = try self.setPropertyInner(base, key, value);
+    }
+
+    /// Mode-aware [[Set]] for compiled code: in strict mode a failed write
+    /// throws TypeError.
+    pub fn setPropertyMode(self: *Vm, base: Value, key: []const u8, value: Value, strict: bool) Error!void {
+        const ok = try self.setPropertyInner(base, key, value);
+        if (strict and !ok) return self.throwTypeError("cannot assign to read-only property");
+    }
+
+    /// [[Set]] core: returns false when the write was refused (non-writable,
+    /// setter-less accessor, non-extensible receiver, primitive receiver).
+    fn setPropertyInner(self: *Vm, base: Value, key: []const u8, value: Value) Error!bool {
         if (base.isObject()) {
             if (base.asObject().proxy_target) |target| {
                 const handler = base.asObject().proxy_handler.?;
                 const trap = try self.getProperty(Value.fromObject(handler), "set");
                 if (isCallable(trap)) {
                     _ = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), value, base });
-                    return;
+                    return true;
                 }
-                return self.setProperty(Value.fromObject(target), key, value);
+                return self.setPropertyInner(Value.fromObject(target), key, value);
             }
         }
         if (!base.isObject()) {
             if (base.isNullish()) return self.throwTypeError("cannot set property of null or undefined");
-            return; // silent no-op on primitives (sloppy)
+            return false; // writes to primitives always fail
         }
         // Array exotic own writes (length + dense elements).
         if (base.asObject().is_array) {
@@ -1358,16 +1416,20 @@ pub const Vm = struct {
             if (std.mem.eql(u8, key, "length")) {
                 const n = try self.toNumber(value);
                 const len: u32 = if (std.math.isNan(n) or n < 0) 0 else if (n > 4294967295) 4294967295 else @intFromFloat(n);
-                return self.setArrayLength(arr, len);
+                try self.setArrayLength(arr, len);
+                return true;
             }
-            if (arrayIndex(key)) |i| return self.setArrayElement(arr, i, value);
+            if (arrayIndex(key)) |i| {
+                try self.setArrayElement(arr, i, value);
+                return true;
+            }
         }
         // TypedArray exotic indexed write (not for DataView).
         if (base.asObject().ta) |ta| {
             if (!base.asObject().is_dataview) {
                 if (arrayIndex(key)) |i| {
                     if (i < ta.length) writeTypedElement(ta, i, try self.toNumber(value));
-                    return;
+                    return true;
                 }
             }
         }
@@ -1377,22 +1439,23 @@ pub const Vm = struct {
         while (obj) |o| {
             if (o.properties.getPtr(key)) |desc| {
                 if (desc.is_accessor) {
-                    const setter = desc.set orelse return; // no setter -> ignore (sloppy)
+                    const setter = desc.set orelse return false; // no setter
                     _ = try self.callValue(setter, base, &.{value});
-                    return;
+                    return true;
                 }
                 if (o == receiver) {
-                    if (!desc.writable) return; // sloppy: ignore
+                    if (!desc.writable) return false;
                     desc.value = value;
-                    return;
+                    return true;
                 }
-                if (!desc.writable) return; // inherited non-writable shadows
+                if (!desc.writable) return false; // inherited non-writable shadows
                 break;
             }
             obj = o.prototype;
         }
-        if (!receiver.extensible) return; // sloppy: silently refuse new props
+        if (!receiver.extensible) return false; // refuse new props
         try self.defineData(receiver, key, value, true, true, true);
+        return true;
     }
 
     /// Look up `key` on a prototype chain, invoking getters with `receiver` as
@@ -1456,7 +1519,20 @@ pub const Vm = struct {
     }
 
     pub fn instanceOf(self: *Vm, lhs: Value, rhs: Value) Error!bool {
-        if (!rhs.isObject() or rhs.asObject().callable == null) {
+        if (!rhs.isObject()) {
+            return self.throwTypeError("right-hand side of 'instanceof' is not an object");
+        }
+        // A callable @@hasInstance takes precedence over OrdinaryHasInstance.
+        if (self.symbol_has_instance_key.len != 0) {
+            const custom = try self.getProperty(rhs, self.symbol_has_instance_key);
+            if (custom.isObject() and custom.asObject().callable != null) {
+                const r = try self.callValue(custom, rhs, &.{lhs});
+                return toBoolean(r);
+            }
+        }
+        // Bound functions delegate to their target.
+        if (rhs.asObject().bound_target) |bt| return self.instanceOf(lhs, bt);
+        if (rhs.asObject().callable == null) {
             return self.throwTypeError("right-hand side of 'instanceof' is not callable");
         }
         const proto_val = try self.getProperty(rhs, "prototype");
@@ -1506,9 +1582,36 @@ pub const Vm = struct {
 
     /// ToPrimitive with a number hint: try valueOf then toString (spec 7.1.1
     /// OrdinaryToPrimitive, number-hint order).
+    pub const PrimitiveHint = enum { default, number, string };
+
     pub fn toPrimitive(self: *Vm, v: Value) Error!Value {
+        return self.toPrimitiveHint(v, .default);
+    }
+
+    pub fn toPrimitiveHint(self: *Vm, v: Value, hint: PrimitiveHint) Error!Value {
         if (!v.isObject()) return v;
-        inline for (.{ "valueOf", "toString" }) |method_name| {
+        // A user-supplied @@toPrimitive takes precedence over OrdinaryToPrimitive.
+        if (self.symbol_to_primitive_key.len != 0) {
+            const exotic = try self.getProperty(v, self.symbol_to_primitive_key);
+            if (exotic.isObject() and exotic.asObject().callable != null) {
+                const hint_str = try self.makeString(switch (hint) {
+                    .default => "default",
+                    .number => "number",
+                    .string => "string",
+                });
+                try self.protect(hint_str);
+                defer self.unprotect();
+                const result = try self.callValue(exotic, v, &.{hint_str});
+                if (!result.isObject()) return result;
+                return self.throwTypeError("@@toPrimitive must return a primitive");
+            }
+        }
+        // OrdinaryToPrimitive: string hint tries toString first.
+        const order: [2][]const u8 = if (hint == .string)
+            .{ "toString", "valueOf" }
+        else
+            .{ "valueOf", "toString" };
+        for (order) |method_name| {
             const method = try self.getProperty(v, method_name);
             if (method.isObject() and method.asObject().callable != null) {
                 const result = try self.callValue(method, v, &.{});
@@ -1581,7 +1684,7 @@ pub const Vm = struct {
             .string => |s| stringToNumber(s.units),
             .bigint => return self.throwTypeError("cannot convert a BigInt to a number"),
             .symbol => return self.throwTypeError("cannot convert a Symbol to a number"),
-            .object => try self.toNumber(try self.toPrimitive(v)),
+            .object => try self.toNumber(try self.toPrimitiveHint(v, .number)),
             .hole => unreachable, // holes never escape array storage
         };
     }
@@ -1628,7 +1731,7 @@ pub const Vm = struct {
     /// ToString as a string `Value` (so callers can root it). Objects go
     /// through ToPrimitive(string) first.
     pub fn toStringVal(self: *Vm, v: Value) Error!Value {
-        const p = if (v.isObject()) try self.toPrimitive(v) else v;
+        const p = if (v.isObject()) try self.toPrimitiveHint(v, .string) else v;
         if (p.isString()) return p;
         var buf: [64]u8 = undefined;
         const utf8 = self.primitiveToUtf8(p, &buf) catch "?";

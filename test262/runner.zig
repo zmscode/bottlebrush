@@ -35,7 +35,7 @@ const Runner = struct {
 
     /// Features the engine doesn't implement; tests requiring them SKIP.
     const unsupported_features = [_][]const u8{
-        "Math.sumPrecise", "Symbol",         "Symbol.iterator", "Symbol.toStringTag",
+        "Math.sumPrecise", "Symbol",          "Symbol.iterator", "Symbol.toStringTag",
         "generators",      "async-iteration", "TypedArray",      "BigInt",
         "Proxy",           "Reflect",         "WeakRef",         "tail-call-optimization",
         "Float16Array",
@@ -89,11 +89,32 @@ const Runner = struct {
         }
     }
 
-    /// Build the combined source, run it in a fresh realm, and score. For a
-    /// negative test, `expected_error` is the constructor name that must be
-    /// thrown; for a positive test it is null (any throw is a failure).
+    /// Run the test in its required mode variants and combine the outcomes
+    /// (spec: a file with neither `onlyStrict` nor `noStrict` runs BOTH sloppy
+    /// and strict; PASS only when every variant passes). fail > skip > pass.
     fn runTest(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8) report.Outcome {
-        const combined = self.buildSource(source, meta) catch {
+        if (meta.flags.raw) return self.runVariant(source, meta, expected_error, false);
+        var worst = report.Outcome.pass;
+        if (!meta.flags.only_strict) {
+            worst = worse(worst, self.runVariant(source, meta, expected_error, false));
+        }
+        if (!meta.flags.no_strict) {
+            worst = worse(worst, self.runVariant(source, meta, expected_error, true));
+        }
+        return worst;
+    }
+
+    fn worse(a: report.Outcome, b: report.Outcome) report.Outcome {
+        if (a == .fail or b == .fail) return .fail;
+        if (a == .skip or b == .skip) return .skip;
+        return .pass;
+    }
+
+    /// Build the combined source for one mode, run it in a fresh realm, and
+    /// score. For a negative test, `expected_error` is the constructor name
+    /// that must be thrown; for a positive test it is null.
+    fn runVariant(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8, strict: bool) report.Outcome {
+        const combined = self.buildSourceStrict(source, meta, strict) catch {
             if (trace_skips) std.debug.print("SKIP missing-include\n", .{});
             return .skip;
         };
@@ -165,13 +186,13 @@ const Runner = struct {
 
     /// Concatenate: [use strict] + sta.js + assert.js + includes + test source.
     /// A `raw` test runs verbatim with no harness.
-    fn buildSource(self: *Runner, source: []const u8, meta: frontmatter.Meta) ![]u8 {
+    fn buildSourceStrict(self: *Runner, source: []const u8, meta: frontmatter.Meta, strict: bool) ![]u8 {
         if (meta.flags.raw) return self.gpa.dupe(u8, source);
 
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(self.gpa);
 
-        if (meta.flags.only_strict) try buf.appendSlice(self.gpa, "\"use strict\";\n");
+        if (strict) try buf.appendSlice(self.gpa, "\"use strict\";\n");
         try buf.appendSlice(self.gpa, self.sta_src);
         try buf.appendSlice(self.gpa, "\n");
         try buf.appendSlice(self.gpa, self.assert_src);

@@ -35,11 +35,50 @@ pub fn nativeObject(ctx: *anyopaque, this: Value, args: []const Value) Error!Val
 pub fn nativeObjectToString(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = args;
     const vm = castVm(ctx);
-    return switch (this) {
-        .undefined => vm.makeString("[object Undefined]"),
-        .null => vm.makeString("[object Null]"),
-        else => vm.makeString("[object Object]"),
+    switch (this) {
+        .undefined => return vm.makeString("[object Undefined]"),
+        .null => return vm.makeString("[object Null]"),
+        else => {},
+    }
+    // A string-valued @@toStringTag overrides the builtin tag.
+    if (this.isObject() and vm.symbol_to_string_tag_key.len != 0) {
+        const tag = try vm.getProperty(this, vm.symbol_to_string_tag_key);
+        if (tag.isString()) {
+            try vm.protect(tag);
+            defer vm.unprotect();
+            var out: std.ArrayList(u16) = .empty;
+            defer out.deinit(vm.gpa);
+            for ("[object ") |c| try out.append(vm.gpa, c);
+            try out.appendSlice(vm.gpa, tag.asString().units);
+            try out.append(vm.gpa, ']');
+            return vm.makeStringFromUtf16(out.items);
+        }
+    }
+    const builtin_tag: []const u8 = blk: {
+        if (this.isString()) break :blk "String";
+        if (this.isNumber()) break :blk "Number";
+        if (this.isBoolean()) break :blk "Boolean";
+        if (!this.isObject()) break :blk "Object";
+        const o = this.asObject();
+        if (o.is_array) break :blk "Array";
+        if (o.callable != null) break :blk "Function";
+        if (o.regex != null) break :blk "RegExp";
+        if (o.properties.contains("\x00DateValue")) break :blk "Date";
+        if (o.properties.contains(prim_key)) {
+            const d = o.properties.get(prim_key).?;
+            if (d.value.isString()) break :blk "String";
+            if (d.value.isNumber()) break :blk "Number";
+            if (d.value.isBoolean()) break :blk "Boolean";
+        }
+        if (o.prototype == vm.error_proto or (o.prototype != null and o.prototype.?.prototype == vm.error_proto)) break :blk "Error";
+        break :blk "Object";
     };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    try out.appendSlice(vm.gpa, "[object ");
+    try out.appendSlice(vm.gpa, builtin_tag);
+    try out.append(vm.gpa, ']');
+    return vm.makeString(out.items);
 }
 
 pub fn nativeObjectValueOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -469,4 +508,152 @@ pub fn nativeObjectToLocaleString(ctx: *anyopaque, this: Value, args: []const Va
     const m = try vm.getProperty(this, "toString");
     if (!isCallable(m)) return vm.throwTypeError("toString is not callable");
     return vm.callValue(m, this, &.{});
+}
+
+/// OrdinarySetPrototypeOf with the spec's cycle check.
+fn setPrototypeChecked(vm: *Vm, obj: *gc.Object, proto_v: Value) Error!void {
+    const new_proto: ?*gc.Object = if (proto_v.isNull()) null else if (proto_v.isObject()) proto_v.asObject() else return vm.throwTypeError("prototype must be an object or null");
+    if (!obj.extensible) return vm.throwTypeError("cannot set prototype of a non-extensible object");
+    // Reject prototype cycles.
+    var p = new_proto;
+    while (p) |cur| {
+        if (cur == obj) return vm.throwTypeError("cyclic prototype chain");
+        p = cur.prototype;
+    }
+    obj.prototype = new_proto;
+}
+
+pub fn nativeObjectSetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (target.isNullish()) return vm.throwTypeError("Object.setPrototypeOf called on null or undefined");
+    if (!target.isObject()) return target; // primitives pass through
+    try setPrototypeChecked(vm, target.asObject(), argAt(args, 1));
+    return target;
+}
+
+pub fn nativeProtoGetter(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = args;
+    const vm = castVm(ctx);
+    if (this.isNullish()) return vm.throwTypeError("cannot read __proto__ of null or undefined");
+    if (!this.isObject()) {
+        // Primitives report their wrapper prototype.
+        if (this.isString()) return if (vm.string_proto) |p| Value.fromObject(p) else Value.null_value;
+        if (this.isNumber()) return if (vm.number_proto) |p| Value.fromObject(p) else Value.null_value;
+        if (this.isBoolean()) return if (vm.boolean_proto) |p| Value.fromObject(p) else Value.null_value;
+        return Value.null_value;
+    }
+    return if (this.asObject().prototype) |p| Value.fromObject(p) else Value.null_value;
+}
+
+pub fn nativeProtoSetter(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    if (!this.isObject()) return Value.undefined_value; // primitives: no-op
+    const v = argAt(args, 0);
+    if (!v.isNull() and !v.isObject()) return Value.undefined_value; // non-object values ignored
+    try setPrototypeChecked(vm, this.asObject(), v);
+    return Value.undefined_value;
+}
+
+pub fn nativeObjectAssign(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (target.isNullish()) return vm.throwTypeError("Object.assign target must be an object");
+    if (!target.isObject()) return target;
+    for (args[1..]) |src| {
+        if (src.isNullish()) continue;
+        if (!src.isObject()) {
+            // Strings contribute their indices; other primitives nothing.
+            if (src.isString()) {
+                const units = src.asString().units;
+                var i: usize = 0;
+                var kb: [16]u8 = undefined;
+                while (i < units.len) : (i += 1) {
+                    const key = std.fmt.bufPrint(&kb, "{d}", .{i}) catch unreachable;
+                    const cv = try vm.makeStringFromUtf16(units[i .. i + 1]);
+                    try vm.setProperty(target, key, cv);
+                }
+            }
+            continue;
+        }
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (keys.items) |k| vm.gpa.free(k);
+            keys.deinit(vm.gpa);
+        }
+        try ownEnumerableKeys(vm, src.asObject(), &keys);
+        for (keys.items) |k| {
+            const v = try vm.getProperty(src, k);
+            try vm.protect(v);
+            defer vm.unprotect();
+            try vm.setProperty(target, k, v);
+        }
+    }
+    return target;
+}
+
+pub fn nativeObjectIs(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = this;
+    return Value.fromBool(sameValue(argAt(args, 0), argAt(args, 1)));
+}
+
+pub fn nativeObjectHasOwn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const target = argAt(args, 0);
+    if (target.isNullish()) return vm.throwTypeError("Object.hasOwn called on null or undefined");
+    // Reuse hasOwnProperty's exotic-aware logic with `this` = target.
+    return nativeHasOwnProperty(ctx, target, args[1..]);
+}
+
+pub fn nativeObjectFromEntries(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = this;
+    const vm = castVm(ctx);
+    const result = try vm.newObject(vm.object_proto);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    const iter = try vm.getIterator(argAt(args, 0));
+    try vm.protect(iter);
+    defer vm.unprotect();
+    while (true) {
+        const r = try vm.iteratorNext(iter);
+        if (toBoolean(try vm.getProperty(r, "done"))) break;
+        const entry = try vm.getProperty(r, "value");
+        if (!entry.isObject()) return vm.throwTypeError("Object.fromEntries entry is not an object");
+        try vm.protect(entry);
+        defer vm.unprotect();
+        const k = try vm.toPropertyKey(try vm.getProperty(entry, "0"));
+        defer vm.gpa.free(k);
+        const v = try vm.getProperty(entry, "1");
+        try vm.defineData(result, k, v, true, true, true);
+    }
+    return Value.fromObject(result);
+}
+
+pub fn nativeObjectGetOwnPropertyDescriptors(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    const vm = castVm(ctx);
+    const obj_v = argAt(args, 0);
+    if (obj_v.isNullish()) return vm.throwTypeError("Object.getOwnPropertyDescriptors called on null or undefined");
+    const result = try vm.newObject(vm.object_proto);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    if (!obj_v.isObject()) return Value.fromObject(result); // primitives: empty (strings elided)
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| vm.gpa.free(k);
+        keys.deinit(vm.gpa);
+    }
+    try ownPropertyNames(vm, obj_v.asObject(), &keys);
+    for (keys.items) |k| {
+        const ks = try vm.makeString(k);
+        try vm.protect(ks);
+        defer vm.unprotect();
+        const desc = try nativeObjectGetOwnPropertyDescriptor(ctx, this, &.{ obj_v, ks });
+        if (desc.isUndefined()) continue;
+        try vm.defineData(result, k, desc, true, true, true);
+    }
+    return Value.fromObject(result);
 }

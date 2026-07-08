@@ -144,6 +144,9 @@ pub const CodeBlock = struct {
     is_generator: bool = false,
     /// Arrow function: has no own `this`/`arguments` and is not `new`-able.
     is_arrow: bool = false,
+    /// Strict-mode code: a "use strict" directive here or in an enclosing
+    /// function. Gates assignment/delete errors and `this` coercion.
+    is_strict: bool = false,
     /// The function's `length` property: parameters before the first default
     /// or rest parameter (may differ from `num_params`).
     fn_length: u32 = 0,

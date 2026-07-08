@@ -31,25 +31,38 @@ executed)**, 110/110 unit tests, corpus wall time ~0.5 s.
    binary forms.
 
 ### Missing subsystems (deliberate, now explicit)
-5. **Strict mode does not exist** — not tracked in parser, compiler, or VM.
-   This also blocks the harness's strict/sloppy dual-run (each non-flagged
-   Test262 file should run twice; we run once, sloppy).
+5. ~~**Strict mode does not exist**~~ **FIXED 2026-07-08**: "use strict"
+   directive threaded compiler→CodeBlock; strict semantics in the VM
+   (undeclared-global assignment ReferenceError, read-only write TypeError,
+   delete-failure TypeError, uncoerced `this`; sloppy nullish `this` now
+   correctly coerces to globalThis). The harness runs the spec dual-run
+   (sloppy + strict per non-flagged file) — and the score *rose* under it.
 6. **`$262` host object** absent (createRealm/evalScript/detachArrayBuffer/gc).
-7. **Destructuring** — parses, compiler rejects everywhere (params, targets).
+7. ~~**Destructuring**~~ **FIXED 2026-07-08**: array/object patterns lower
+   everywhere — declarations, parameters (incl. whole-pattern defaults),
+   assignment expressions (incl. member targets), for-of/for-in heads, catch
+   params; iterator-protocol based; nested; defaults; array rest. Object rest
+   still unsupported.
 8. **Classes and template literals** — parse but do not compile.
 9. **Mapped `arguments`** — plain object; no parameter aliasing, no strict
    variant.
-10. **`[[SetPrototypeOf]]`** — no `Object.setPrototypeOf`, no `__proto__`
-    accessor, no cycle check. Also missing Object statics: `assign`,
-    `fromEntries`, `is`, `hasOwn`, `getOwnPropertyDescriptors`.
-11. **Well-known symbols are inert** — they exist as values but the engine
-    never consults `@@toPrimitive`/`@@toStringTag`/`@@hasInstance`/`@@match`/….
+10. ~~**`[[SetPrototypeOf]]`**~~ **FIXED 2026-07-08**: Object.setPrototypeOf
+    with cycle check + `__proto__` accessor; Object.assign/is/hasOwn/
+    fromEntries/getOwnPropertyDescriptors added.
+11. ~~**Well-known symbols are inert**~~ **PARTLY FIXED 2026-07-08**:
+    @@toPrimitive (with hints), @@toStringTag (plus builtin tags), and
+    @@hasInstance are consulted. @@match/@@replace/@@split/@@search still
+    inert.
 12. **BigInt is an i64 stub** — no bignum, no `asIntN`, no mixed-type errors.
 13. **WeakMap/WeakSet** — need GC ephemeron support.
 14. **Proxy invariants** — 5 of 13 traps dispatch; no invariant checks.
 15. **Regex `u`/`v` modes** — flags accepted but matching is code-unit based;
     no `\p{…}`.
 16. **No file runner / REPL** — `main.zig` still runs a fixed demo.
+
+*(The "also missing but small" Array/String method tail below was also filled
+on 2026-07-08: 21 Array methods + Array.from/of, 9 String methods +
+String.fromCodePoint.)*
 
 ### "Falsely missed" (plan says missing, actually done)
 None the other way — but until today **all 169 boxes read as unticked** while
