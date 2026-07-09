@@ -61,6 +61,11 @@ const FnState = struct {
     arguments_slot: ?u32 = null,
     rest_slot: ?u32 = null,
     rest_from: u32 = 0,
+    /// Derived-class constructor: instance fields and private methods install
+    /// only after `super(...)` returns (not at frame entry), so `this` isn't
+    /// touched before initialization. Empty for base constructors (which
+    /// install in the prologue) and non-constructors.
+    deferred_instance_fields: []const *Node = &.{},
     env_slot_count: u32 = 0,
     reg_top: u32 = 0,
     max_regs: u32 = 0,
@@ -270,9 +275,13 @@ pub const Compiler = struct {
         /// Instance-field members (class constructors only): `this.key = init`
         /// runs in declaration order before the constructor body.
         class_fields: []const *Node,
+        /// Derived-class constructor: defer instance-element installation until
+        /// after `super(...)` returns instead of the prologue.
+        is_derived_ctor: bool,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
         var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_arrow = is_arrow };
+        if (is_derived_ctor) fs.deferred_instance_fields = class_fields;
         // Strict mode is inherited from the enclosing function, forced by the
         // context (class bodies), or switched on by a "use strict" directive.
         if (parent_fs) |pf| fs.is_strict = pf.is_strict;
@@ -386,39 +395,9 @@ pub const Compiler = struct {
             try self.declareLexicals(stmts);
             try self.emitHoistedFunctions(stmts);
             // Instance elements install on `this` before the constructor body
-            // runs. Per spec, private methods/accessors are added first (so
-            // field initializers may call them), then fields in source order.
-            if (class_fields.len > 0) {
-                const thisr = self.allocReg();
-                _ = try self.emit(.{ .op = .load_this, .a = thisr });
-                for (class_fields) |fp| {
-                    const prop = fp.kind.property;
-                    if (prop.kind == .init) continue; // fields: second pass
-                    try self.emitInstancePrivateMember(thisr, prop, fp.start);
-                }
-                for (class_fields) |fp| {
-                    const prop = fp.kind.property;
-                    if (prop.kind != .init) continue; // methods/accessors: first pass
-                    const vreg = self.allocReg();
-                    if (prop.value) |init_expr| {
-                        try self.compileExprInto(vreg, init_expr);
-                    } else {
-                        _ = try self.emit(.{ .op = .load_undefined, .a = vreg });
-                    }
-                    if (isPrivateMember(prop)) {
-                        _ = try self.emit(.{ .op = .def_pfield, .a = thisr, .b = try self.privateKeyConst(prop.key.kind.private_name, fp.start), .c = vreg });
-                    } else if (prop.computed) {
-                        const k = self.allocReg();
-                        try self.compileExprInto(k, prop.key);
-                        _ = try self.emit(.{ .op = .set_elem, .a = thisr, .b = k, .c = vreg });
-                    } else {
-                        const idx = try self.propNameConst(prop.key);
-                        _ = try self.emit(.{ .op = .set_prop, .a = thisr, .b = idx, .c = vreg });
-                    }
-                    self.freeTo(vreg);
-                }
-                self.freeTo(thisr);
-            }
+            // runs — but a derived constructor defers them until `super(...)`
+            // returns (see compileCall), since `this` isn't bound before then.
+            if (!is_derived_ctor) try self.emitInstanceElements(class_fields);
             // Script top: reserve reg 0 as the completion value (seeded
             // undefined), which top-level expression statements update.
             if (parent_fs == null) {
@@ -446,7 +425,7 @@ pub const Compiler = struct {
         for (body) |stmt| {
             if (stmt.kind == .function_decl) {
                 const f = stmt.kind.function_decl;
-                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, false, &.{}, self.fs);
+                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, false, &.{}, false, self.fs);
                 const idx: u32 = @intCast(self.fs.children.items.len);
                 try self.fs.children.append(self.gpa, child);
                 const r = self.allocReg();
@@ -1761,7 +1740,7 @@ pub const Compiler = struct {
                     if (fnode.kind != .function) return self.fail("malformed accessor", pos);
                     const f = fnode.kind.function;
                     const name = try self.functionNameFor(prop);
-                    const child = try self.compileFunction(name, f.params, f.body, false, false, false, false, &.{}, self.fs);
+                    const child = try self.compileFunction(name, f.params, f.body, false, false, false, false, &.{}, false, self.fs);
                     const child_idx: u32 = @intCast(self.fs.children.items.len);
                     try self.fs.children.append(self.gpa, child);
                     const fr = self.allocReg();
@@ -1880,7 +1859,7 @@ pub const Compiler = struct {
         const fnode = prop.value orelse return self.fail("malformed private member", start);
         if (fnode.kind != .function) return self.fail("malformed private member", start);
         const f = fnode.kind.function;
-        const child = try self.compileFunction(try self.functionNameFor(prop), f.params, f.body, false, f.flags.is_generator, false, true, &.{}, self.fs);
+        const child = try self.compileFunction(try self.functionNameFor(prop), f.params, f.body, false, f.flags.is_generator, false, true, &.{}, false, self.fs);
         const child_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, child);
         const fr = self.allocReg();
@@ -1893,6 +1872,43 @@ pub const Compiler = struct {
             else => return self.fail("unsupported private member", start),
         }, .a = thisr, .b = pk, .c = fr });
         self.freeTo(fr);
+    }
+
+    /// Install a constructor's instance elements on `this`: private
+    /// methods/accessors first (so field initializers can call them), then
+    /// public/private fields in source order. Used at the prologue for base
+    /// constructors and just after `super(...)` returns for derived ones.
+    fn emitInstanceElements(self: *Compiler, class_fields: []const *Node) CompileError!void {
+        if (class_fields.len == 0) return;
+        const thisr = self.allocReg();
+        _ = try self.emit(.{ .op = .load_this, .a = thisr });
+        for (class_fields) |fp| {
+            const prop = fp.kind.property;
+            if (prop.kind == .init) continue; // fields: second pass
+            try self.emitInstancePrivateMember(thisr, prop, fp.start);
+        }
+        for (class_fields) |fp| {
+            const prop = fp.kind.property;
+            if (prop.kind != .init) continue; // methods/accessors: first pass
+            const vreg = self.allocReg();
+            if (prop.value) |init_expr| {
+                try self.compileExprInto(vreg, init_expr);
+            } else {
+                _ = try self.emit(.{ .op = .load_undefined, .a = vreg });
+            }
+            if (isPrivateMember(prop)) {
+                _ = try self.emit(.{ .op = .def_pfield, .a = thisr, .b = try self.privateKeyConst(prop.key.kind.private_name, fp.start), .c = vreg });
+            } else if (prop.computed) {
+                const k = self.allocReg();
+                try self.compileExprInto(k, prop.key);
+                _ = try self.emit(.{ .op = .set_elem, .a = thisr, .b = k, .c = vreg });
+            } else {
+                const idx = try self.propNameConst(prop.key);
+                _ = try self.emit(.{ .op = .set_prop, .a = thisr, .b = idx, .c = vreg });
+            }
+            self.freeTo(vreg);
+        }
+        self.freeTo(thisr);
     }
 
     fn compileConditional(self: *Compiler, dst: u32, c: anytype) CompileError!void {
@@ -1991,6 +2007,12 @@ pub const Compiler = struct {
             _ = try self.emit(.{ .op = .call_apply, .a = dst, .b = base });
         }
         self.freeTo(base);
+        // A derived constructor installs its instance elements the moment
+        // `super(...)` returns (so private methods/fields aren't visible until
+        // then — the spec's brand-check-before-super semantics).
+        if (c.callee.kind == .super_expr and self.fs.deferred_instance_fields.len > 0) {
+            try self.emitInstanceElements(self.fs.deferred_instance_fields);
+        }
     }
 
     fn compileYield(self: *Compiler, dst: u32, y: anytype) CompileError!void {
@@ -2175,7 +2197,7 @@ pub const Compiler = struct {
                 std.mem.eql(u8, prop.key.kind.ident, "constructor"))
             {
                 const f = (prop.value orelse return self.fail("malformed constructor", m.start)).kind.function;
-                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, instance_elements.items, self.fs);
+                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, instance_elements.items, cls.super_class != null, self.fs);
                 break;
             }
         }
@@ -2209,7 +2231,7 @@ pub const Compiler = struct {
             }
             const body = try self.arena.create(Node);
             body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = body_stmts } };
-            ctor_block = try self.compileFunction(cls.name orelse "", ctor_params, body, false, false, false, true, instance_elements.items, self.fs);
+            ctor_block = try self.compileFunction(cls.name orelse "", ctor_params, body, false, false, false, true, instance_elements.items, cls.super_class != null, self.fs);
         }
         const ctor_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, ctor_block.?);
@@ -2248,7 +2270,7 @@ pub const Compiler = struct {
                 // constructor (compiled as an expression-body closure).
                 const vreg = self.allocReg();
                 if (prop.value) |init_expr| {
-                    const child = try self.compileFunction("", &.{}, init_expr, true, false, false, true, &.{}, self.fs);
+                    const child = try self.compileFunction("", &.{}, init_expr, true, false, false, true, &.{}, false, self.fs);
                     const child_idx: u32 = @intCast(self.fs.children.items.len);
                     try self.fs.children.append(self.gpa, child);
                     const base = self.allocReg(); // receiver = the constructor
@@ -2278,7 +2300,7 @@ pub const Compiler = struct {
             const f = fnode.kind.function;
 
             const member_name = try self.functionNameFor(prop);
-            const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, false, true, &.{}, self.fs);
+            const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, false, true, &.{}, false, self.fs);
             const child_idx: u32 = @intCast(self.fs.children.items.len);
             try self.fs.children.append(self.gpa, child);
             const fr = self.allocReg();
@@ -2328,6 +2350,7 @@ pub const Compiler = struct {
             f.flags.is_arrow,
             false,
             &.{},
+            false,
             self.fs,
         );
         const idx: u32 = @intCast(self.fs.children.items.len);
@@ -2524,7 +2547,7 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
     const dummy_body = try c.arena.create(Node);
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
-    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, &.{}, null) catch |e| switch (e) {
+    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, &.{}, false, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;

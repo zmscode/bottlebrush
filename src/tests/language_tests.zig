@@ -723,6 +723,23 @@ test "derived default constructor installs parent elements; constructor-name err
         \\var c = new C();
         \\return (c.sup() === "s" && c.acc() === "c") ? 1 : 0;
     ));
+    // A derived class installs its private methods only AFTER super() returns:
+    // the parent constructor, calling an overridden method that touches a
+    // private method, sees `this` without the child's brand yet (TypeError).
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class Base { constructor() { this.f(); } }
+        \\class Derived extends Base {
+        \\  f() { this.#m(); }
+        \\  #m() { return 42; }
+        \\}
+        \\try { new Derived(); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // Fields install after super() too, so plain instantiation still works.
+    try std.testing.expectEqual(@as(f64, 8), try evalNumber(
+        \\class P { constructor() {} }
+        \\class Q extends P { x = 8; }
+        \\return new Q().x;
+    ));
     // constructor-name early errors (parser).
     const parser = @import("bottlebrush").parser;
     const bad = [_][]const u8{
