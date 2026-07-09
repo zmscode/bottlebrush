@@ -497,6 +497,29 @@ test "$262 host object" {
     try std.testing.expectEqual(@as(f64, 1), v.asNumber());
 }
 
+test "async doneprintHandle print-capture contract" {
+    var vm = helpers.Vm.init(helpers.gpa);
+    defer vm.deinit();
+    try vm.installHost262();
+    var cap: std.ArrayList(u8) = .empty;
+    defer cap.deinit(helpers.gpa);
+    vm.print_capture = &cap;
+    // The harness's $DONE prints the completion sentinel that the async runner
+    // scores on; a passing test calls $DONE() with no argument.
+    _ = try eval(&vm,
+        \\function $DONE(e) { print(e ? ("Test262:AsyncTestFailure:" + e) : "Test262:AsyncTestComplete"); }
+        \\$DONE();
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cap.items, "Test262:AsyncTestComplete") != null);
+    // And a failure argument yields the failure sentinel.
+    cap.clearRetainingCapacity();
+    _ = try eval(&vm,
+        \\function $DONE(e) { print(e ? ("Test262:AsyncTestFailure:" + e) : "Test262:AsyncTestComplete"); }
+        \\$DONE("boom");
+    );
+    try std.testing.expect(std.mem.indexOf(u8, cap.items, "Test262:AsyncTestFailure") != null);
+}
+
 test "$262.createRealm builds a genuinely fresh realm" {
     var vm = helpers.Vm.init(helpers.gpa);
     defer vm.deinit();

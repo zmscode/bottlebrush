@@ -72,10 +72,14 @@ const Runner = struct {
                 },
             }
         }
-        // Features the engine doesn't support yet.
-        if (meta.flags.is_async or meta.flags.module) {
-            self.setReason("async-or-module", .{});
+        if (meta.flags.module) {
+            self.setReason("module", .{});
             return .skip;
+        }
+        // Async tests are scored by the doneprintHandle completion sentinel;
+        // ones that can't reach it (no real async execution yet) skip honestly.
+        if (meta.flags.is_async) {
+            return self.runVariant(source, meta, null, meta.flags.only_strict, true);
         }
         return self.runTest(source, meta, null);
     }
@@ -105,13 +109,13 @@ const Runner = struct {
     /// (spec: a file with neither `onlyStrict` nor `noStrict` runs BOTH sloppy
     /// and strict; PASS only when every variant passes). fail > skip > pass.
     fn runTest(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8) report.Outcome {
-        if (meta.flags.raw) return self.runVariant(source, meta, expected_error, false);
+        if (meta.flags.raw) return self.runVariant(source, meta, expected_error, false, false);
         var worst = report.Outcome.pass;
         if (!meta.flags.only_strict) {
-            worst = worse(worst, self.runVariant(source, meta, expected_error, false));
+            worst = worse(worst, self.runVariant(source, meta, expected_error, false, false));
         }
         if (!meta.flags.no_strict) {
-            worst = worse(worst, self.runVariant(source, meta, expected_error, true));
+            worst = worse(worst, self.runVariant(source, meta, expected_error, true, false));
         }
         return worst;
     }
@@ -125,8 +129,8 @@ const Runner = struct {
     /// Build the combined source for one mode, run it in a fresh realm, and
     /// score. For a negative test, `expected_error` is the constructor name
     /// that must be thrown; for a positive test it is null.
-    fn runVariant(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8, strict: bool) report.Outcome {
-        const combined = self.buildSourceStrict(source, meta, strict) catch {
+    fn runVariant(self: *Runner, source: []const u8, meta: frontmatter.Meta, expected_error: ?[]const u8, strict: bool, is_async: bool) report.Outcome {
+        const combined = self.buildSourceStrict(source, meta, strict, is_async) catch {
             self.setReason("missing-include", .{});
             return .skip;
         };
@@ -161,6 +165,16 @@ const Runner = struct {
         var vm = bottlebrush.Vm.init(self.gpa);
         defer vm.deinit();
         vm.installHost262() catch return .skip;
+
+        // Async tests: divert `print` and score by the completion sentinel.
+        var capture: std.ArrayList(u8) = .empty;
+        defer capture.deinit(self.gpa);
+        if (is_async) {
+            vm.print_capture = &capture;
+            _ = vm.run(&program) catch {}; // the sentinel, not the throw, is authoritative
+            return self.scoreAsync(&capture);
+        }
+
         _ = vm.run(&program) catch |e| switch (e) {
             error.JsThrow => {
                 const name = vm.pendingErrorName(self.gpa);
@@ -212,9 +226,23 @@ const Runner = struct {
         self.fail_reason_len = s.len;
     }
 
+    /// Score an async test from its captured `print` output (doneprintHandle
+    /// contract). No sentinel means it never reached `$DONE` — with no real
+    /// async execution yet, that is an honest SKIP rather than a FAIL.
+    fn scoreAsync(self: *Runner, capture: *const std.ArrayList(u8)) report.Outcome {
+        const out = capture.items;
+        if (std.mem.indexOf(u8, out, "Test262:AsyncTestFailure") != null) {
+            self.setReason("async-failure", .{});
+            return .fail;
+        }
+        if (std.mem.indexOf(u8, out, "Test262:AsyncTestComplete") != null) return .pass;
+        self.setReason("async-incomplete: never reached $DONE (no async execution yet)", .{});
+        return .skip;
+    }
+
     /// Concatenate: [use strict] + sta.js + assert.js + includes + test source.
     /// A `raw` test runs verbatim with no harness.
-    fn buildSourceStrict(self: *Runner, source: []const u8, meta: frontmatter.Meta, strict: bool) ![]u8 {
+    fn buildSourceStrict(self: *Runner, source: []const u8, meta: frontmatter.Meta, strict: bool, is_async: bool) ![]u8 {
         if (meta.flags.raw) return self.gpa.dupe(u8, source);
 
         var buf: std.ArrayList(u8) = .empty;
@@ -226,10 +254,19 @@ const Runner = struct {
         try buf.appendSlice(self.gpa, self.assert_src);
         try buf.appendSlice(self.gpa, "\n");
 
+        var has_done = false;
         for (meta.includes) |inc| {
             if (std.mem.eql(u8, inc, "assert.js") or std.mem.eql(u8, inc, "sta.js")) continue;
+            if (std.mem.eql(u8, inc, "doneprintHandle.js")) has_done = true;
             const inc_src = self.includes.get(inc) orelse return error.MissingInclude;
             try buf.appendSlice(self.gpa, inc_src);
+            try buf.appendSlice(self.gpa, "\n");
+        }
+        // Async tests need `$DONE`; supply doneprintHandle.js if the test
+        // didn't list it explicitly.
+        if (is_async and !has_done) {
+            const done_src = self.includes.get("doneprintHandle.js") orelse return error.MissingInclude;
+            try buf.appendSlice(self.gpa, done_src);
             try buf.appendSlice(self.gpa, "\n");
         }
 

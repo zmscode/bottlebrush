@@ -207,6 +207,14 @@ fn consoleWrite(vm: *Vm, args: []const Value, to_stderr: bool) Error!Value {
         try line.appendSlice(vm.gpa, utf8);
     }
     try line.append(vm.gpa, '\n');
+    // A capture sink (set by the async conformance runner) diverts `print`
+    // output so the harness's completion sentinel can be inspected.
+    if (!to_stderr) {
+        if (vm.print_capture) |cap| {
+            try cap.appendSlice(vm.gpa, line.items);
+            return Value.undefined_value;
+        }
+    }
     if (to_stderr) {
         std.debug.print("{s}", .{line.items});
         return Value.undefined_value;

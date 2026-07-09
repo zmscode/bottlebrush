@@ -115,6 +115,9 @@ pub const Vm = struct {
     /// `load_const` reuses one heap string instead of allocating each time.
     /// Marked as GC roots; keys are gpa-owned.
     intern: std.StringHashMapUnmanaged(Value) = .empty,
+    /// When set, `print` (and console.log) append here instead of stdout — the
+    /// Test262 async runner captures the `Test262:AsyncTestComplete` sentinel.
+    print_capture: ?*std.ArrayList(u8) = null,
     // Realm intrinsics (created lazily by `bootstrap`).
     object_proto: ?*gc.Object = null,
     function_proto: ?*gc.Object = null,
