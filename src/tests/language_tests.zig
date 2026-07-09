@@ -753,3 +753,40 @@ test "escaped property keys decode to canonical names" {
         "var o = { \\u0063lass: 9 }; return o[\"class\"] === 9 ? 1 : 0;",
     ));
 }
+
+test "more parser early errors: per-function strict, for-in head" {
+    const parser = @import("bottlebrush").parser;
+    const bad = [_][]const u8{
+        "function f() { \"use strict\"; var eval = 1; }", // strict binding inside a fn
+        "function f() { \"use strict\"; ({ package }); }", // strict shorthand inside a fn
+        "for (this in {}) {}", // invalid for-in LHS
+        "for (1 of []) {}", // invalid for-of LHS
+    };
+    for (bad) |src| {
+        var pr = try parser.parse(std.testing.allocator, src, .script);
+        switch (pr) {
+            .syntax_error => {},
+            .ok => |*a| {
+                a.deinit();
+                std.debug.print("expected SyntaxError: {s}\n", .{src});
+                return error.ExpectedSyntaxError;
+            },
+        }
+    }
+    const ok = [_][]const u8{
+        "function f() { var eval = 1; }", // sloppy: fine
+        "for (x in { a: 1 }) {}",
+        "for (var y in {}) {}",
+        "for ([a, b] of [[1, 2]]) {}",
+    };
+    for (ok) |src| {
+        var pr = try parser.parse(std.testing.allocator, src, .script);
+        switch (pr) {
+            .ok => |*a| a.deinit(),
+            .syntax_error => {
+                std.debug.print("unexpected SyntaxError: {s}\n", .{src});
+                return error.UnexpectedSyntaxError;
+            },
+        }
+    }
+}

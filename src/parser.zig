@@ -242,6 +242,20 @@ pub const Parser = struct {
         return self.node(start, self.prev_end, .{ .block_stmt = try body.toOwnedSlice(self.arena) });
     }
 
+    /// A function body: like `parseBlock`, but a leading `"use strict"`
+    /// directive enables strict mode for the rest of the body.
+    fn parseFunctionBody(self: *Parser) ParseError!*Node {
+        const start = self.cur.start;
+        try self.expect(.l_brace);
+        var body: NodeList = .empty;
+        try self.parseDirectivePrologue(&body); // may set self.strict
+        while (!self.at(.r_brace) and !self.at(.eof)) {
+            try body.append(self.arena, try self.parseStatementListItem());
+        }
+        try self.expect(.r_brace);
+        return self.node(start, self.prev_end, .{ .block_stmt = try body.toOwnedSlice(self.arena) });
+    }
+
     fn parseVarStatement(self: *Parser, kind: ast.VarKind) ParseError!*Node {
         const decl = try self.parseVarDeclaration(kind);
         try self.semicolon();
@@ -284,6 +298,15 @@ pub const Parser = struct {
         } });
     }
 
+    /// Whether `node` is a syntactically valid assignment target: an
+    /// identifier, a member expression, or a destructuring pattern cover.
+    fn isAssignmentTarget(n: *Node) bool {
+        return switch (n.kind) {
+            .ident, .member, .array_literal, .object_literal, .array_pattern, .object_pattern => true,
+            else => false,
+        };
+    }
+
     fn parseFor(self: *Parser) ParseError!*Node {
         const start = self.cur.start;
         self.advance();
@@ -309,6 +332,11 @@ pub const Parser = struct {
         // for-in / for-of
         if (self.at(.kw_in) or self.atContextual("of")) {
             const is_of = self.atContextual("of");
+            // A non-declaration head must be a valid assignment target
+            // (`for (this in …)`, `for (1 of …)` are early errors).
+            if (init_node.?.kind != .var_decl and !isAssignmentTarget(init_node.?)) {
+                return self.fail("invalid left-hand side in for-in/of head");
+            }
             self.advance();
             const right = if (is_of) try self.parseAssignment() else try self.parseExpression();
             try self.expect(.r_paren);
@@ -511,7 +539,7 @@ pub const Parser = struct {
         }
         const saved_ctx = self.enterFn(flags);
         const params = try self.parseParams();
-        const body = try self.parseBlock();
+        const body = try self.parseFunctionBody();
         self.exitFn(saved_ctx);
         const func: ast.Function = .{ .name = name, .params = params, .body = body, .flags = flags };
         return self.node(start, self.prev_end, if (is_expr)
@@ -737,7 +765,7 @@ pub const Parser = struct {
             // Method (or get/set/constructor).
             const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
-            const body = try self.parseBlock();
+            const body = try self.parseFunctionBody();
             self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
@@ -972,12 +1000,13 @@ pub const Parser = struct {
         }
     }
 
-    const FnCtx = struct { fi: bool, is_async: bool, is_gen: bool };
+    const FnCtx = struct { fi: bool, is_async: bool, is_gen: bool, strict: bool };
 
     /// Enter a (non-arrow) function body: reset field-init state and set the
     /// await/yield reservation from the function's own async/generator kind.
+    /// Strictness is saved so a body-level `"use strict"` doesn't leak out.
     fn enterFn(self: *Parser, flags: ast.FunctionFlags) FnCtx {
-        const saved = FnCtx{ .fi = self.in_field_init, .is_async = self.in_async, .is_gen = self.in_generator };
+        const saved = FnCtx{ .fi = self.in_field_init, .is_async = self.in_async, .is_gen = self.in_generator, .strict = self.strict };
         self.in_field_init = false;
         self.in_async = flags.is_async;
         self.in_generator = flags.is_generator;
@@ -987,6 +1016,7 @@ pub const Parser = struct {
         self.in_field_init = saved.fi;
         self.in_async = saved.is_async;
         self.in_generator = saved.is_gen;
+        self.strict = saved.strict;
     }
 
     fn parseIdentifier(self: *Parser) ParseError!*Node {
@@ -1510,7 +1540,7 @@ pub const Parser = struct {
         if (self.at(.l_paren)) {
             const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
-            const body = try self.parseBlock();
+            const body = try self.parseFunctionBody();
             self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
