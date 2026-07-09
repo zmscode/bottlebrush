@@ -39,8 +39,9 @@ const Runner = struct {
 
     /// Features the engine doesn't implement; tests requiring them SKIP.
     const unsupported_features = [_][]const u8{
-        "Math.sumPrecise",        "async-iteration",
-        "TypedArray",             "Float16Array",
+        "Math.sumPrecise",        "Float16Array",
+        // No tail-call elimination: these tests recurse ~100k deep and would
+        // exhaust the native stack (real TCO is a Phase 7 concern).
         "tail-call-optimization",
     };
 

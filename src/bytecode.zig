@@ -170,6 +170,8 @@ pub const CodeBlock = struct {
     num_params: u32 = 0,
     num_registers: u32 = 0,
     is_generator: bool = false,
+    /// Async function: calling it returns a promise driven by the job queue.
+    is_async: bool = false,
     /// Arrow function: has no own `this`/`arguments` and is not `new`-able.
     is_arrow: bool = false,
     /// Strict-mode code: a "use strict" directive here or in an enclosing

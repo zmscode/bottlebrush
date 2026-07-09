@@ -57,6 +57,7 @@ const FnState = struct {
     parent: ?*FnState,
     name: []const u8,
     is_generator: bool = false,
+    is_async: bool = false,
     is_arrow: bool = false,
     is_strict: bool = false,
     simple_params: bool = true,
@@ -298,6 +299,7 @@ pub const Compiler = struct {
         body: *Node,
         is_expression_body: bool,
         is_generator: bool,
+        is_async: bool,
         is_arrow: bool,
         force_strict: bool,
         /// Instance-field members (class constructors only): `this.key = init`
@@ -308,7 +310,9 @@ pub const Compiler = struct {
         is_derived_ctor: bool,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
-        var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_arrow = is_arrow };
+        // Async generators need the async-iteration machinery (Phase 5 §5c).
+        if (is_async and is_generator) return self.fail("async generators unsupported", 0);
+        var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_async = is_async, .is_arrow = is_arrow };
         if (is_derived_ctor) fs.deferred_instance_fields = class_fields;
         // `new.target` is legal in any non-arrow function body; an arrow
         // inherits its enclosing function's new-target (so an arrow at the
@@ -479,7 +483,7 @@ pub const Compiler = struct {
         for (body) |stmt| {
             if (stmt.kind == .function_decl) {
                 const f = stmt.kind.function_decl;
-                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, false, false, &.{}, false, self.fs);
+                const child = try self.compileFunction(f.name orelse "", f.params, f.body, false, f.flags.is_generator, f.flags.is_async, false, false, &.{}, false, self.fs);
                 const idx: u32 = @intCast(self.fs.children.items.len);
                 try self.fs.children.append(self.gpa, child);
                 const r = self.allocReg();
@@ -504,6 +508,7 @@ pub const Compiler = struct {
             .num_registers = fs.max_regs,
             .num_env_slots = fs.env_slot_count,
             .is_generator = fs.is_generator,
+            .is_async = fs.is_async,
             .is_arrow = fs.is_arrow,
             .is_strict = fs.is_strict,
             .simple_params = fs.simple_params,
@@ -1455,6 +1460,16 @@ pub const Compiler = struct {
             .tagged_template => |tt| try self.compileTaggedTemplate(dst, tt),
             .class => |cls| try self.compileClass(dst, cls, node.start),
             .yield_expr => |y| try self.compileYield(dst, y),
+            // `await x` suspends the async frame exactly like a yield; the
+            // async driver (callAsyncFunction) interprets the suspension as an
+            // Await rather than an iterator step.
+            .await_expr => |operand| {
+                if (!self.fs.is_async) return self.fail("await outside an async function", node.start);
+                const val_reg = self.allocReg();
+                try self.compileExprInto(val_reg, operand);
+                _ = try self.emit(.{ .op = .gen_yield, .a = dst, .b = val_reg });
+                self.freeTo(val_reg);
+            },
             // `new.target`. Only modelled inside a direct eval (as undefined,
             // which is correct for the method/field-initializer contexts these
             // tests use). Elsewhere it's left unsupported so real new-target
@@ -1899,7 +1914,7 @@ pub const Compiler = struct {
                     if (fnode.kind != .function) return self.fail("malformed accessor", pos);
                     const f = fnode.kind.function;
                     const name = try self.functionNameFor(prop);
-                    const child = try self.compileFunction(name, f.params, f.body, false, false, false, false, &.{}, false, self.fs);
+                    const child = try self.compileFunction(name, f.params, f.body, false, false, false, false, false, &.{}, false, self.fs);
                     const child_idx: u32 = @intCast(self.fs.children.items.len);
                     try self.fs.children.append(self.gpa, child);
                     const fr = self.allocReg();
@@ -2018,7 +2033,7 @@ pub const Compiler = struct {
         const fnode = prop.value orelse return self.fail("malformed private member", start);
         if (fnode.kind != .function) return self.fail("malformed private member", start);
         const f = fnode.kind.function;
-        const child = try self.compileFunction(try self.functionNameFor(prop), f.params, f.body, false, f.flags.is_generator, false, true, &.{}, false, self.fs);
+        const child = try self.compileFunction(try self.functionNameFor(prop), f.params, f.body, false, f.flags.is_generator, f.flags.is_async, false, true, &.{}, false, self.fs);
         const child_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, child);
         const fr = self.allocReg();
@@ -2374,7 +2389,7 @@ pub const Compiler = struct {
                 std.mem.eql(u8, prop.key.kind.ident, "constructor"))
             {
                 const f = (prop.value orelse return self.fail("malformed constructor", m.start)).kind.function;
-                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, true, instance_elements.items, cls.super_class != null, self.fs);
+                ctor_block = try self.compileFunction(cls.name orelse "", f.params, f.body, false, false, false, false, true, instance_elements.items, cls.super_class != null, self.fs);
                 break;
             }
         }
@@ -2408,7 +2423,7 @@ pub const Compiler = struct {
             }
             const body = try self.arena.create(Node);
             body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = body_stmts } };
-            ctor_block = try self.compileFunction(cls.name orelse "", ctor_params, body, false, false, false, true, instance_elements.items, cls.super_class != null, self.fs);
+            ctor_block = try self.compileFunction(cls.name orelse "", ctor_params, body, false, false, false, false, true, instance_elements.items, cls.super_class != null, self.fs);
         }
         const ctor_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, ctor_block.?);
@@ -2447,7 +2462,7 @@ pub const Compiler = struct {
                 // constructor (compiled as an expression-body closure).
                 const vreg = self.allocReg();
                 if (prop.value) |init_expr| {
-                    const child = try self.compileFunction("", &.{}, init_expr, true, false, false, true, &.{}, false, self.fs);
+                    const child = try self.compileFunction("", &.{}, init_expr, true, false, false, false, true, &.{}, false, self.fs);
                     const child_idx: u32 = @intCast(self.fs.children.items.len);
                     try self.fs.children.append(self.gpa, child);
                     const base = self.allocReg(); // receiver = the constructor
@@ -2477,7 +2492,7 @@ pub const Compiler = struct {
             const f = fnode.kind.function;
 
             const member_name = try self.functionNameFor(prop);
-            const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, false, true, &.{}, false, self.fs);
+            const child = try self.compileFunction(member_name, f.params, f.body, false, f.flags.is_generator, f.flags.is_async, false, true, &.{}, false, self.fs);
             const child_idx: u32 = @intCast(self.fs.children.items.len);
             try self.fs.children.append(self.gpa, child);
             const fr = self.allocReg();
@@ -2524,6 +2539,7 @@ pub const Compiler = struct {
             f.body,
             f.flags.expression_body,
             f.flags.is_generator,
+            f.flags.is_async,
             f.flags.is_arrow,
             false,
             &.{},
@@ -2724,7 +2740,7 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
     const dummy_body = try c.arena.create(Node);
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
-    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, &.{}, false, null) catch |e| switch (e) {
+    const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, false, &.{}, false, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;
@@ -2774,7 +2790,7 @@ pub fn compileEval(gpa: std.mem.Allocator, program: *Node, source: []const u8, p
     const dummy_body = try c.arena.create(Node);
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
-    const root = c.compileFunction("<eval>", &.{}, dummy_body, false, false, false, false, &.{}, false, null) catch |e| switch (e) {
+    const root = c.compileFunction("<eval>", &.{}, dummy_body, false, false, false, false, false, &.{}, false, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;

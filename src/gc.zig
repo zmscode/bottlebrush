@@ -113,7 +113,9 @@ pub const PromiseState = struct {
 /// `undefined` for pass-through), and the derived promise its result settles.
 pub const PromiseReaction = struct {
     handler: Value,
-    derived: *Object,
+    /// The promise settled by this reaction's result; null for internal
+    /// reactions with no capability (an async function's Await).
+    derived: ?*Object,
     on_fulfill: bool,
 };
 
@@ -213,7 +215,7 @@ pub const Object = struct {
             p.value.mark(t);
             for (p.reactions.items) |r| {
                 r.handler.mark(t);
-                t.mark(&r.derived.gc);
+                if (r.derived) |d| t.mark(&d.gc);
             }
         }
         if (self.bound_target) |bt| bt.mark(t);

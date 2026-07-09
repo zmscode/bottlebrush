@@ -174,7 +174,7 @@ pub const Vm = struct {
     pub const Job = union(enum) {
         /// PromiseReactionJob: call `handler(arg)` and settle `derived` with
         /// the result (or pass `arg` through when the handler isn't callable).
-        reaction: struct { handler: Value, arg: Value, derived: *gc.Object, on_fulfill: bool },
+        reaction: struct { handler: Value, arg: Value, derived: ?*gc.Object, on_fulfill: bool },
         /// PromiseResolveThenableJob: `then_fn.call(thenable, resolve, reject)`
         /// for `promise`.
         thenable: struct { promise: *gc.Object, thenable: Value, then_fn: Value },
@@ -325,7 +325,7 @@ pub const Vm = struct {
             .reaction => |r| {
                 r.handler.mark(tracer);
                 r.arg.mark(tracer);
-                tracer.mark(&r.derived.gc);
+                if (r.derived) |d| tracer.mark(&d.gc);
             },
             .thenable => |t| {
                 tracer.mark(&t.promise.gc);
@@ -534,6 +534,10 @@ pub const Vm = struct {
         const obj = try self.heap.create(gc.Object);
         obj.callable = clo;
         obj.prototype = self.function_proto;
+        // Root the new function across the property setup — `makeString` is a
+        // GC safe-point and nothing else references `obj`/`clo` yet.
+        try self.protect(Value.fromObject(obj));
+        defer self.unprotect();
         try self.defineData(obj, "length", Value.fromNumber(@floatFromInt(length)), false, false, true);
         try self.defineData(obj, "name", try self.makeString(name), false, false, true);
         return obj;
@@ -1088,7 +1092,7 @@ pub const Vm = struct {
         const clo = try self.heap.create(gc.Closure);
         clo.code = child;
         clo.env = env;
-        clo.constructor = !child.is_generator and !child.is_arrow; // generators/arrows aren't `new`-able
+        clo.constructor = !child.is_generator and !child.is_arrow and !child.is_async; // generators/arrows/asyncs aren't `new`-able
         if (child.is_arrow) clo.captured_this = creator_this; // lexical `this`
         const fn_obj = try self.heap.create(gc.Object);
         fn_obj.callable = clo;
@@ -1155,6 +1159,15 @@ pub const Vm = struct {
         const code: *const bc.CodeBlock = @ptrCast(@alignCast(clo.code));
         // Calling a generator function creates (but does not run) a generator.
         if (code.is_generator) return self.makeGenerator(code, clo.env, this_value, args);
+        // An async function returns a promise driven by the job queue. Arrows
+        // resolve `this` lexically; sloppy functions coerce a nullish receiver.
+        if (code.is_async) {
+            var athis = if (code.is_arrow) (clo.captured_this orelse Value.undefined_value) else this_value;
+            if (!code.is_arrow and !code.is_strict and athis.isNullish()) {
+                athis = Value.fromObject(self.global_object.?);
+            }
+            return self.callAsyncFunction(code, clo.env, athis, args);
+        }
         // Build `arguments` before the env exists (createEnv can GC, and the
         // env isn't rooted yet — so root the object across it).
         var args_obj: ?Value = null;
@@ -1471,7 +1484,7 @@ pub const Vm = struct {
 
     /// PerformPromiseThen: register (or immediately schedule) the reaction pair
     /// settling `derived`.
-    pub fn performPromiseThen(self: *Vm, p: *gc.Object, on_f: Value, on_r: Value, derived: *gc.Object) Error!void {
+    pub fn performPromiseThen(self: *Vm, p: *gc.Object, on_f: Value, on_r: Value, derived: ?*gc.Object) Error!void {
         const st = p.promise.?;
         switch (st.status) {
             .pending => {
@@ -1537,8 +1550,10 @@ pub const Vm = struct {
     /// exception settles its derived promise; it never escapes the queue.
     pub fn runJobs(self: *Vm) Error!void {
         while (self.jobs_cursor < self.jobs.items.len) {
+            // The cursor advances only after the job completes: markRoots marks
+            // jobs[cursor..], so the running job's payload stays GC-rooted.
             const job = self.jobs.items[self.jobs_cursor];
-            self.jobs_cursor += 1;
+            defer self.jobs_cursor += 1;
             try self.checkBudget();
             switch (job) {
                 .reaction => |r| {
@@ -1547,14 +1562,17 @@ pub const Vm = struct {
                             if (e != error.JsThrow) return e;
                             const exc = self.pending_exception.?;
                             self.pending_exception = null;
-                            try self.settlePromise(r.derived, exc, false);
+                            if (r.derived) |d| try self.settlePromise(d, exc, false);
                             continue;
                         };
-                        try self.resolvePromiseWith(r.derived, result);
-                    } else if (r.on_fulfill) {
-                        try self.resolvePromiseWith(r.derived, r.arg);
-                    } else {
-                        try self.settlePromise(r.derived, r.arg, false);
+                        if (r.derived) |d| try self.resolvePromiseWith(d, result);
+                    } else if (r.derived) |d| {
+                        // No handler: the completion passes through unchanged.
+                        if (r.on_fulfill) {
+                            try self.resolvePromiseWith(d, r.arg);
+                        } else {
+                            try self.settlePromise(d, r.arg, false);
+                        }
                     }
                 },
                 .thenable => |t| {
@@ -1582,12 +1600,91 @@ pub const Vm = struct {
                     };
                 },
             }
-            // Reclaim the queue storage once fully drained.
-            if (self.jobs_cursor == self.jobs.items.len) {
-                self.jobs.clearRetainingCapacity();
-                self.jobs_cursor = 0;
-            }
         }
+        // Fully drained: reclaim the queue storage.
+        self.jobs.clearRetainingCapacity();
+        self.jobs_cursor = 0;
+    }
+
+    // ---- async functions ----------------------------------------------------
+
+    /// Call an async function: build the suspendable frame (reusing the
+    /// generator machinery — `await` compiles to the yield suspension), return
+    /// a promise, and drive the frame over the job queue. Errors during
+    /// parameter evaluation reject the promise instead of throwing.
+    pub fn callAsyncFunction(self: *Vm, code: *const bc.CodeBlock, closure_env: ?*gc.Environment, this_value: Value, args: []const Value) Error!Value {
+        // The async call path uses several native frames per JS frame (driver +
+        // resume + generator machinery), so charge extra depth to keep deep
+        // synchronous-prefix recursion within the native stack.
+        if (self.depth + 4 >= max_call_depth) return self.throwRangeError("maximum call stack size exceeded");
+        self.depth += 4;
+        defer self.depth -= 4;
+        const promise = try self.newPromise();
+        try self.protect(Value.fromObject(promise));
+        defer self.unprotect();
+        const genv = self.makeGenerator(code, closure_env, this_value, args) catch |e| {
+            if (e != error.JsThrow) return e;
+            const exc = self.pending_exception.?;
+            self.pending_exception = null;
+            try self.settlePromise(promise, exc, false);
+            return Value.fromObject(promise);
+        };
+        try self.protect(genv);
+        defer self.unprotect();
+        try self.defineData(genv.asObject(), "\x00asyncP", Value.fromObject(promise), false, false, false);
+        // One resume pair per frame, reused by every await (stepAsync).
+        const on_f = try self.makeBoundNative("", nativeAsyncResumeNext, genv.asObject());
+        try self.protect(Value.fromObject(on_f));
+        defer self.unprotect();
+        const on_r = try self.makeBoundNative("", nativeAsyncResumeThrow, genv.asObject());
+        try self.protect(Value.fromObject(on_r));
+        defer self.unprotect();
+        try self.defineData(genv.asObject(), "\x00asyncF", Value.fromObject(on_f), false, false, false);
+        try self.defineData(genv.asObject(), "\x00asyncR", Value.fromObject(on_r), false, false, false);
+        try self.stepAsync(genv.asObject(), 0, Value.undefined_value);
+        return Value.fromObject(promise);
+    }
+
+    /// Advance an async frame one step. A completion settles its promise; a
+    /// suspension is an Await: resolve the awaited value and register resume
+    /// handlers (spec 27.7.5.3, with no reaction capability).
+    fn stepAsync(self: *Vm, genobj: *gc.Object, mode: u8, sent: Value) Error!void {
+        // Root the frame and its promise across everything below (a resumption
+        // arrives via the job queue, where nothing else roots them mid-step).
+        try self.protect(Value.fromObject(genobj));
+        defer self.unprotect();
+        const promise = genobj.properties.get("\x00asyncP").?.value.asObject();
+        try self.protect(Value.fromObject(promise));
+        defer self.unprotect();
+        const res = self.generatorResume(Value.fromObject(genobj), sent, mode) catch |e| {
+            if (e != error.JsThrow) return e;
+            const exc = self.pending_exception.?;
+            self.pending_exception = null;
+            return self.settlePromise(promise, exc, false);
+        };
+        const done = toBoolean(try self.getProperty(res, "done"));
+        const value = try self.getProperty(res, "value");
+        try self.protect(value);
+        defer self.unprotect();
+        if (done) return self.resolvePromiseWith(promise, value);
+        const inner = try self.promiseResolveValue(value);
+        try self.protect(Value.fromObject(inner));
+        defer self.unprotect();
+        const on_f = genobj.properties.get("\x00asyncF").?.value;
+        const on_r = genobj.properties.get("\x00asyncR").?.value;
+        try self.performPromiseThen(inner, on_f, on_r, null);
+    }
+
+    fn nativeAsyncResumeNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        try vm.stepAsync(this.asObject(), 0, if (args.len > 0) args[0] else Value.undefined_value);
+        return Value.undefined_value;
+    }
+
+    fn nativeAsyncResumeThrow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        try vm.stepAsync(this.asObject(), 2, if (args.len > 0) args[0] else Value.undefined_value);
+        return Value.undefined_value;
     }
 
     // ---- object model ------------------------------------------------------

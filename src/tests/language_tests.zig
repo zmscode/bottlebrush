@@ -1108,6 +1108,54 @@ test "assignment to a const binding throws TypeError" {
     ));
 }
 
+test "promises: then/catch/finally ordering and thenables" {
+    // Jobs drain when vm.run returns, so a second eval can observe the result.
+    var vm = helpers.Vm.init(helpers.gpa);
+    defer vm.deinit();
+    _ = try eval(&vm,
+        \\log = [];
+        \\Promise.resolve(1).then(function (v) { log.push("A" + v); return v + 1; })
+        \\  .then(function (v) { log.push("B" + v); });
+        \\Promise.reject(new TypeError("x")).catch(function (e) { log.push("C" + (e instanceof TypeError)); });
+        \\queueMicrotask(function () { log.push("M"); });
+        \\Promise.resolve({ then: function (res) { res("T"); } }).then(function (v) { log.push(v); });
+        \\log.push("sync");
+    );
+    const v = try eval(&vm, "return log.join('|');");
+    const got = try helpers.utf16ToUtf8Alloc(helpers.gpa, v.asString().units);
+    defer helpers.gpa.free(got);
+    try std.testing.expectEqualStrings("sync|A1|Ctrue|M|B2|T", got);
+}
+
+test "async functions: await, rejection, this, arrows, promise identity" {
+    var vm = helpers.Vm.init(helpers.gpa);
+    defer vm.deinit();
+    _ = try eval(&vm,
+        \\out = {};
+        \\async function add(a, b) { return a + b; }
+        \\async function main() {
+        \\  var x = await add(1, 2);
+        \\  var y = await Promise.resolve(10);
+        \\  try { await Promise.reject(new RangeError("r")); } catch (e) { out.caught = e instanceof RangeError; }
+        \\  return x + y + await 4;
+        \\}
+        \\out.isPromise = main() instanceof Promise;
+        \\main().then(function (r) { out.result = r; });
+        \\var arrow = async (p) => (await p) * 2;
+        \\arrow(Promise.resolve(21)).then(function (v) { out.arrow = v; });
+        \\var o = { v: 5, async m() { return this.v + await 0; } };
+        \\o.m().then(function (v) { out.method = v; });
+        \\async function boom() { throw new TypeError("early"); }
+        \\boom().catch(function (e) { out.rejected = e instanceof TypeError; });
+        \\try { new boom(); out.newOk = true; } catch (e) { out.notCtor = e instanceof TypeError; }
+    );
+    const v = try eval(&vm,
+        \\return (out.isPromise && out.caught && out.result === 17 && out.arrow === 42
+        \\  && out.method === 5 && out.rejected && out.notCtor) ? 1 : 0;
+    );
+    try std.testing.expectEqual(@as(f64, 1), v.asNumber());
+}
+
 test "object spread/rest copy symbol-keyed properties" {
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
         \\var s = Symbol('s');

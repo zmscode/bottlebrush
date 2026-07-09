@@ -1213,6 +1213,12 @@ pub const Parser = struct {
         }
         self.advance(); // =>
 
+        // An async arrow reserves `await` in its body (other context — yield,
+        // field-init — is inherited from the enclosing function, per arrows).
+        const saved_async = self.in_async;
+        if (flags.is_async) self.in_async = true;
+        defer self.in_async = saved_async;
+
         var expression_body = false;
         const body = if (self.at(.l_brace))
             try self.parseBlock()
@@ -1287,7 +1293,10 @@ pub const Parser = struct {
                 return self.node(start, self.prev_end, .{ .update = .{ .op = op, .operand = operand, .prefix = true } });
             },
             else => {
-                if (self.atContextual("await")) {
+                // `await` is an AwaitExpression only inside an async function
+                // (or at module top level); elsewhere it's a plain identifier.
+                if (self.atContextual("await") and (self.in_async or self.source_type == .module)) {
+                    if (self.in_formal_params) return self.fail("an await expression is not allowed in formal parameters");
                     self.advance();
                     const operand = try self.parseUnary();
                     return self.node(start, self.prev_end, .{ .await_expr = operand });
