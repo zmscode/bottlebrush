@@ -59,6 +59,8 @@ const FnState = struct {
     num_params: u32 = 0,
     fn_length: u32 = 0,
     arguments_slot: ?u32 = null,
+    rest_slot: ?u32 = null,
+    rest_from: u32 = 0,
     env_slot_count: u32 = 0,
     reg_top: u32 = 0,
     max_regs: u32 = 0,
@@ -310,11 +312,23 @@ pub const Compiler = struct {
                     if (counting_length) fs.fn_length += 1;
                     _ = try self.declare(try std.fmt.allocPrint(self.arena, "\x00param{d}", .{pidx}));
                 },
-                .rest_element => return self.fail("rest params unsupported", p.start),
+                .rest_element => |target| {
+                    // `...r`: not counted in `length`; the trailing arguments
+                    // are gathered into an array at frame entry.
+                    counting_length = false;
+                    const slot = if (target.kind == .ident)
+                        try self.declare(target.kind.ident)
+                    else
+                        try self.declare(try std.fmt.allocPrint(self.arena, "\x00param{d}", .{pidx}));
+                    fs.rest_slot = slot;
+                    fs.rest_from = @intCast(pidx);
+                },
                 else => return self.fail("pattern params unsupported", p.start),
             }
         }
-        fs.num_params = @intCast(params.len);
+        // The interpreter fills positional slots for the non-rest parameters;
+        // the rest slot (if any) is populated separately.
+        fs.num_params = if (fs.rest_slot != null) fs.rest_from else @intCast(params.len);
 
         // Default parameter values: `param = param === undefined ? dflt : param`.
         for (params, 0..) |p, slot| {
@@ -339,6 +353,9 @@ pub const Compiler = struct {
             const pattern: ?*Node = switch (p.kind) {
                 .array_pattern, .object_pattern => p,
                 .assignment_pattern => |ap2| if (ap2.left.kind != .ident) ap2.left else null,
+                // A rest parameter whose target is a pattern (`...[a, b]`) binds
+                // from the gathered rest array.
+                .rest_element => |target| if (target.kind != .ident) target else null,
                 else => null,
             };
             if (pattern) |pt| {
@@ -459,6 +476,8 @@ pub const Compiler = struct {
             .simple_params = fs.simple_params,
             .fn_length = fs.fn_length,
             .arguments_slot = fs.arguments_slot,
+            .rest_slot = fs.rest_slot,
+            .rest_from = fs.rest_from,
             .code = try self.arena.dupe(Inst, fs.code.items),
             .constants = try self.dupeConstants(fs.constants.items),
             .children = try self.arena.dupe(*bc.CodeBlock, fs.children.items),
@@ -1846,6 +1865,14 @@ pub const Compiler = struct {
         return prop.key.kind == .private_name;
     }
 
+    /// A synthetic `.ident` node (for compiler-generated AST like the default
+    /// constructor's `super(...args)`).
+    fn makeIdentNode(self: *Compiler, name: []const u8, pos: u32) CompileError!*Node {
+        const n = try self.arena.create(Node);
+        n.* = .{ .start = pos, .end = pos, .kind = .{ .ident = name } };
+        return n;
+    }
+
     /// Install one private instance method/accessor on the receiver in `thisr`
     /// (constructor prologue). The closure captures the constructor's scope, so
     /// it sees enclosing private names and `super`.
@@ -2153,15 +2180,27 @@ pub const Compiler = struct {
             }
         }
         if (ctor_block == null) {
-            // Synthesize the default constructor. A derived class's default
-            // constructor forwards to the parent via `super(...)` (here a plain
-            // `super()`), so the parent's instance elements get installed.
+            // Synthesize the default constructor. A derived class's is
+            // `constructor(...args) { super(...args); }`, forwarding every
+            // argument so the parent's instance elements get installed.
             var body_stmts: []*Node = &.{};
+            var ctor_params: []*Node = &.{};
             if (cls.super_class != null) {
+                const args_ident = try self.makeIdentNode("\x00rest", pos);
+                const rest_param = try self.arena.create(Node);
+                rest_param.* = .{ .start = pos, .end = pos, .kind = .{ .rest_element = args_ident } };
+                const params = try self.arena.alloc(*Node, 1);
+                params[0] = rest_param;
+                ctor_params = params;
+
                 const super_node = try self.arena.create(Node);
                 super_node.* = .{ .start = pos, .end = pos, .kind = .super_expr };
+                const spread_node = try self.arena.create(Node);
+                spread_node.* = .{ .start = pos, .end = pos, .kind = .{ .spread = try self.makeIdentNode("\x00rest", pos) } };
+                const call_args = try self.arena.alloc(*Node, 1);
+                call_args[0] = spread_node;
                 const call_node = try self.arena.create(Node);
-                call_node.* = .{ .start = pos, .end = pos, .kind = .{ .call = .{ .callee = super_node, .args = &.{}, .optional = false } } };
+                call_node.* = .{ .start = pos, .end = pos, .kind = .{ .call = .{ .callee = super_node, .args = call_args, .optional = false } } };
                 const stmt = try self.arena.create(Node);
                 stmt.* = .{ .start = pos, .end = pos, .kind = .{ .expression_stmt = call_node } };
                 const arr = try self.arena.alloc(*Node, 1);
@@ -2170,7 +2209,7 @@ pub const Compiler = struct {
             }
             const body = try self.arena.create(Node);
             body.* = .{ .start = pos, .end = pos, .kind = .{ .block_stmt = body_stmts } };
-            ctor_block = try self.compileFunction(cls.name orelse "", &.{}, body, false, false, false, true, instance_elements.items, self.fs);
+            ctor_block = try self.compileFunction(cls.name orelse "", ctor_params, body, false, false, false, true, instance_elements.items, self.fs);
         }
         const ctor_idx: u32 = @intCast(self.fs.children.items.len);
         try self.fs.children.append(self.gpa, ctor_block.?);
@@ -2552,7 +2591,7 @@ test "compiles control flow and functions" {
 }
 
 test "reports unsupported constructs" {
-    const src = "function f(...args) {}"; // rest parameters do not compile yet
+    const src = "var x = a?.b;"; // optional chaining does not compile yet
     const parser = @import("parser.zig");
     var pr = try parser.parse(testing.allocator, src, .script);
     switch (pr) {

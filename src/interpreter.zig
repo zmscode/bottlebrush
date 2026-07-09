@@ -917,6 +917,7 @@ pub const Vm = struct {
             env.slots[slot] = args_obj.?;
             mapArguments(args_obj.?.asObject(), code, env, args.len);
         }
+        try self.buildRestParam(code, env, args);
         // Arrows ignore the call receiver: `this` is the creation site's.
         // Sloppy functions coerce a nullish receiver to the global object;
         // strict functions see it as-is.
@@ -932,6 +933,18 @@ pub const Vm = struct {
     /// Turn a fresh arguments object into a mapped one: indices below
     /// min(argc, num_params) alias the frame's parameter env slots. Only for
     /// sloppy functions with simple (all-identifier) parameter lists.
+    /// Populate a rest parameter's env slot with an array of the trailing
+    /// arguments (`function f(a, ...r)` -> r = [args from rest_from on]).
+    fn buildRestParam(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, args: []const Value) Error!void {
+        const slot = code.rest_slot orelse return;
+        const arr = try self.newArray(0);
+        try self.protect(Value.fromObject(arr));
+        defer self.unprotect();
+        var i: usize = code.rest_from;
+        while (i < args.len) : (i += 1) try self.arrayAppend(arr, args[i]);
+        env.slots[slot] = Value.fromObject(arr);
+    }
+
     fn mapArguments(obj: *gc.Object, code: *const bc.CodeBlock, env: *gc.Environment, argc: usize) void {
         if (code.is_strict or !code.simple_params) return;
         const n = @min(@min(argc, code.num_params), 64);
@@ -1021,6 +1034,7 @@ pub const Vm = struct {
             env.slots[slot] = args_obj.?;
             mapArguments(args_obj.?.asObject(), code, env, args.len);
         }
+        try self.buildRestParam(code, env, args);
         // From here on: only gpa allocations (no GC), so env/regs/state stay live.
         const regs = try self.gpa.alloc(Value, code.num_registers);
         @memset(regs, Value.undefined_value);

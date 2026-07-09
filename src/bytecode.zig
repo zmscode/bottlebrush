@@ -173,6 +173,10 @@ pub const CodeBlock = struct {
     /// Env slot to receive the `arguments` object on entry; null for arrow
     /// functions and the top-level script (which have no own `arguments`).
     arguments_slot: ?u32 = null,
+    /// Rest parameter (`...r`): env slot to receive an array of the arguments
+    /// from index `rest_from` onward. null when there is no rest parameter.
+    rest_slot: ?u32 = null,
+    rest_from: u32 = 0,
     code: []Inst = &.{},
     constants: []Const = &.{},
     children: []*CodeBlock = &.{},

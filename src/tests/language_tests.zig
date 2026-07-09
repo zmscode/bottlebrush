@@ -704,11 +704,17 @@ test "escaped keywords and async/generator context" {
 
 test "derived default constructor installs parent elements; constructor-name errors" {
     // A derived class with no explicit constructor must still run the parent
-    // constructor (default `super()`), so parent private fields/methods exist.
+    // constructor (default `super(...args)`), forwarding arguments and
+    // installing parent private fields/methods.
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
         \\class A { #x = "Av"; read() { return this.#x; } }
         \\class B extends A {}
         \\return new B().read() === "Av" ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\class A { constructor(a, b) { this.s = a + b; } }
+        \\class B extends A {}
+        \\return new B(3, 4).s;
     ));
     // Private members from both a class and its superclass coexist per instance.
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
@@ -789,4 +795,35 @@ test "more parser early errors: per-function strict, for-in head" {
             },
         }
     }
+}
+
+test "rest parameters" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function f(...args) { return args.length === 3 && args[0] === 1 && args[2] === 3; }
+        \\return f(1, 2, 3) ? 1 : 0;
+    ));
+    // Rest after fixed params, and empty rest.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function f(a, b, ...rest) { return a + b + rest.length; }
+        \\return (f(1, 2, 3, 4, 5) === 6 && f(9, 1) === 10) ? 1 : 0;
+    ));
+    // Rest is a real Array.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function f(...xs) { return Array.isArray(xs) && xs.map(function (x) { return x * 2; }).join(","); }
+        \\return (f(1, 2) === "2,4") ? 1 : 0;
+    ));
+    // Destructured rest, and arrow rest.
+    try std.testing.expectEqual(@as(f64, 30), try evalNumber(
+        \\function f(...[a, b]) { return a + b; }
+        \\return f(10, 20);
+    ));
+    try std.testing.expectEqual(@as(f64, 10), try evalNumber(
+        \\var g = (...xs) => xs.reduce(function (a, b) { return a + b; }, 0);
+        \\return g(1, 2, 3, 4);
+    ));
+    // length excludes the rest parameter.
+    try std.testing.expectEqual(@as(f64, 2), try evalNumber(
+        \\function f(a, b, ...rest) {}
+        \\return f.length;
+    ));
 }
