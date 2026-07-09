@@ -1073,6 +1073,8 @@ pub const Parser = struct {
         {
             arg = try self.parseAssignment();
         }
+        // `yield* AssignmentExpression`: the delegate operand is mandatory.
+        if (delegate and arg == null) return self.fail("yield* requires an operand");
         return self.node(start, self.prev_end, .{ .yield_expr = .{ .argument = arg, .delegate = delegate } });
     }
 

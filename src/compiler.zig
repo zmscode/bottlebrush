@@ -2101,10 +2101,11 @@ pub const Compiler = struct {
     /// evaluate to its final `{done:true}` value. (Sent values and throw/return
     /// are not forwarded into the inner iterator yet.)
     fn compileYieldStar(self: *Compiler, dst: u32, y: anytype) CompileError!void {
+        const arg = y.argument orelse return self.fail("yield* requires an operand", 0);
         const iter_reg = self.allocReg();
         {
             const src_reg = self.allocReg();
-            try self.compileExprInto(src_reg, y.argument.?);
+            try self.compileExprInto(src_reg, arg);
             _ = try self.emit(.{ .op = .iter_init, .a = iter_reg, .b = src_reg });
             self.freeTo(src_reg + 1);
         }

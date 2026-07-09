@@ -900,3 +900,58 @@ test "rest parameters" {
         \\return f.length;
     ));
 }
+
+test "generators: yield, next/return/throw, for-of, yield*, methods" {
+    // Basic yield + iterator result protocol.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function* g() { yield 1; yield 2; yield 3; }
+        \\var it = g();
+        \\var a = it.next(), b = it.next(), c = it.next(), d = it.next();
+        \\return (a.value===1 && !a.done && d.done && d.value===undefined) ? 1 : 0;
+    ));
+    // for-of drives the generator; infinite generator with a bounded take.
+    try std.testing.expectEqual(@as(f64, 6), try evalNumber(
+        \\function* g() { yield 1; yield 2; yield 3; }
+        \\var s = 0; for (var x of g()) s += x; return s;
+    ));
+    // `yield` receives the value passed to next().
+    try std.testing.expectEqual(@as(f64, 20), try evalNumber(
+        \\function* g() { var x = yield 1; yield x * 2; }
+        \\var it = g(); it.next(); return it.next(10).value;
+    ));
+    // yield* delegation flattens the inner iterator.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function* inner() { yield 1; yield 2; }
+        \\function* outer() { yield* inner(); yield 3; }
+        \\return [...outer()].join(",") === "1,2,3" ? 1 : 0;
+    ));
+    // return() finishes the generator early.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function* g() { yield 1; yield 2; }
+        \\var it = g(); it.next();
+        \\var r = it.return(99);
+        \\return (r.value===99 && r.done && it.next().done) ? 1 : 0;
+    ));
+    // throw() is catchable inside the generator body.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function* g() { try { yield 1; } catch (e) { yield "caught:" + e; } }
+        \\var it = g(); it.next();
+        \\return it.throw("X").value === "caught:X" ? 1 : 0;
+    ));
+    // Generator methods in objects and classes.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var o = { *gen() { yield 1; yield 2; } };
+        \\class C { *gen() { yield 3; yield 4; } }
+        \\return ([...o.gen()].join(",")==="1,2" && [...new C().gen()].join(",")==="3,4") ? 1 : 0;
+    ));
+    // `yield*` without an operand is a SyntaxError (regression: used to crash).
+    const parser = @import("bottlebrush").parser;
+    var r = try parser.parse(std.testing.allocator, "function* g() { yield* ; }", .script);
+    switch (r) {
+        .ok => |*a| {
+            a.deinit();
+            return error.ExpectedSyntaxError;
+        },
+        .syntax_error => {},
+    }
+}
