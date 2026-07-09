@@ -5,15 +5,20 @@ grouped by root cause and ranked by payoff. Regenerate the raw data by flipping
 `trace_files = true` in `test262/runner.zig`, rebuilding, and grepping the
 runner's `FAILCASE`/`SKIPCASE` lines (each is `TAG <path> <reason>`).
 
-**As of 2026-07-09** (commit `cafdb8f`):
+**As of 2026-07-09** (commit `7963802`):
 
 | Bucket | Count | % of corpus |
 |--------|------:|------------:|
 | **files** | 5977 | 100% |
-| **pass** | 3701 | 61.9% |
-| **fail** | 625 | 10.5% |
-| **skip** | 1651 | 27.6% |
-| pass of executed (pass+fail) | | **85.6%** |
+| **pass** | 3732 | 62.4% |
+| **fail** | 636 | 10.6% |
+| **skip** | 1609 | 26.9% |
+| pass of executed (pass+fail) | | **85.4%** |
+
+> **Phase 0–4 checklist closed:** all P0–P4 plan items are now ticked. Added
+> `$262.createRealm` (real fresh realm; `cross-realm` un-denylisted → +31),
+> `$262.agent` stub, the async `doneprintHandle` capture contract, strict-mode
+> flag on the AST, golden AST + disassembler snapshots, and a parser fuzz test.
 
 > **Progress since the first audit (was 3327 pass / 990 fail):** F1
 > escaped-keys (+172), F5 RegExp @@split species (+22), and the F2/S1

@@ -66,8 +66,8 @@
     - `negative` test → PASS iff it throws the expected error type at the expected phase (parse vs runtime).
     - normal test → PASS iff it completes with no exception.
     - engine can't-yet-run (unimplemented) → **SKIP** with reason, not FAIL.
-  - [ ] `async` flag → wait for `print('Test262:AsyncTestComplete')` sentinel via the `doneprintHandle` harness contract (stub the print hook now). *(deferred with async to Phase 5)*
-- [ ] **`$262` host object** (stub methods, real later): `$262.createRealm`, `$262.evalScript`, `$262.detachArrayBuffer`, `$262.gc`, `$262.global`, `$262.agent`. **PARTIAL: `$262` is installed (`installHostHooks`) with `.global`, `.evalScript`, `.gc`, `.detachArrayBuffer`. STILL OUTSTANDING: `.createRealm` (needs real fresh realms — see phase-3) and `.agent`.**
+  - [x] `async` flag → wait for `print('Test262:AsyncTestComplete')` sentinel via the `doneprintHandle` harness contract (stub the print hook now). **DONE: the VM has a `print_capture` sink, `doneprintHandle.js` is provided, and the runner scores async tests by the sentinel (Complete→pass, Failure→fail, neither→honest skip). Real async *execution* is still Phase 5, so Promise-based tests skip until then.**
+- [x] **`$262` host object** (stub methods, real later): `$262.createRealm`, `$262.evalScript`, `$262.detachArrayBuffer`, `$262.gc`, `$262.global`, `$262.agent`. **DONE: all installed. `.createRealm` builds a genuinely fresh realm (own global + intrinsics; see phase-3); `.agent` is the inert method-surface stub.**
 - [x] **Filtering:** CLI flags to run a subdir (`--path language/types`), by feature include/exclude, and an **expected-fail / skip list file** (so known-unimplemented areas don't spam FAIL). *(partial: directory arg ✓; feature denylist is in-code, no skip-list file)*
 - [x] **Reporting (`report.zig`):** totals + per-directory pass/fail/skip counts; machine-readable JSON output for CI to chart over time; non-zero exit on *regression* vs a committed baseline (not on absolute failures). *(partial: totals + JSON + CI regression ✓; no per-directory counts)*
 

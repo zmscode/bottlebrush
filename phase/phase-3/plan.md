@@ -36,7 +36,7 @@
 
 ## 5. Realm & intrinsics wiring
 - [x] `Realm` holds the intrinsics table (`%Object.prototype%`, `%Function.prototype%`, `%Array.prototype%`, error prototypes, …). `CreateIntrinsics` sets up the prototype graph in the correct order.
-- [ ] `$262.createRealm` returns a genuinely fresh realm (needed by many Test262 tests). **STILL OUTSTANDING: `$262` exists but `createRealm` is not implemented (no multi-realm support). `feature:cross-realm` tests stay denylisted (~42 skips). Needs a real second Realm with its own intrinsics.**
+- [x] `$262.createRealm` returns a genuinely fresh realm (needed by many Test262 tests). **DONE: intrinsics are grouped into a reflective `Realm` snapshot; `createRealm` builds a fresh realm (own global + own Object/Array/… constructors and prototypes), all realms stay GC-rooted, and the returned realm's `evalScript` swaps it in so its objects get distinct cross-realm identities. `cross-realm` is off the denylist — the 42 vendored tests now run (31 pass; the 11 fails need newTarget threading / per-realm error identity / template caching).**
 
 ## 6. `Object` built-in (proves the model)
 - [x] `Object` constructor + `Object.prototype` (`hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`@@toStringTag`), `valueOf`, `toLocaleString`, `__proto__` accessor, legacy `__defineGetter__` etc. — Annex B). *(partial: `@@toStringTag` not consulted; `__proto__` accessor + Annex B getters missing)*

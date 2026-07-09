@@ -53,7 +53,7 @@
 - [x] `%prototype%` chain wiring (proper object model is Phase 3, but the plumbing starts here).
 
 ## 6. Testing
-- [ ] Disassembler snapshot tests for representative functions. **STILL OUTSTANDING: `CodeBlock.disassemble` exists with one smoke test (`bytecode.zig`); no per-function golden snapshots. (Low priority.)**
+- [x] Disassembler snapshot tests for representative functions. **DONE: `disasmSnapshot` (whitespace-normalized) drives golden snapshots of the instruction stream for a function-with-call and a branch, in addition to the smoke test.**
 - [x] Unit tests: arithmetic/coercion edge cases, closures, TDZ, `finally` unwinding.
 - [x] **Test262 `language/**`** now runs for real. Track the number; drive up `expressions`, `statements`, `types`.
 - [x] Run everything under `GC_STRESS=1`.

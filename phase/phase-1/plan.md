@@ -44,16 +44,16 @@
 - [x] Consider an arena allocator for AST nodes (freed after bytecode compile).
 
 ## 4. Testing
-- [ ] Unit: golden AST snapshots for a curated set of tricky inputs (arrows, destructuring, ASI edge cases, template nesting, regex-vs-div). **STILL OUTSTANDING: parser has `expectParses`/behavioral unit tests but no golden-AST-snapshot corpus. (Low priority — Test262 parse-negatives cover the surface.)**
+- [x] Unit: golden AST snapshots for a curated set of tricky inputs (arrows, destructuring, ASI edge cases, template nesting, regex-vs-div). **DONE: a comptime-reflective S-expression dumper (`dumpNode`) drives golden-snapshot tests over arrows, member chains, elision, destructuring defaults, template nesting, and regex-vs-division.**
 - [x] **Test262 parse mode:** run `language/**` with "parse only"; PASS negatives that should be `SyntaxError` at parse phase; PASS positives that parse cleanly. Ignore runtime semantics for now (skip).
-- [ ] Fuzz the lexer/parser with random byte strings for crash-safety. **STILL OUTSTANDING: never fuzzed. (Crash-safety is exercised indirectly by the ~6k-file Test262 corpus, but no dedicated random-input fuzzer.)**
+- [x] Fuzz the lexer/parser with random byte strings for crash-safety. **DONE: a deterministic-PRNG fuzz test feeds 4k pseudo-random JS-ish byte strings and requires parse to return ok-or-error, never panic or leak.**
 
 ---
 
 ## Exit criteria
 - [x] Parses the overwhelming majority of Test262 `.js` sources without panics.
 - [x] Correctly accepts/rejects `negative: {phase: parse, type: SyntaxError}` tests (target: high pass rate on the parse-phase negative corpus).
-- [ ] AST carries source spans + strict-mode flags; arena lifecycle documented. **PARTIAL: source spans on every node ✓ and arena lifecycle ✓; strict mode IS tracked (parser/compiler/VM, see §3) but as parser/compiler state, not as a flag stored on AST nodes. Functionally satisfied; literally a per-node AST flag is not stored.**
+- [x] AST carries source spans + strict-mode flags; arena lifecycle documented. **DONE: source spans on every node, arena lifecycle documented, and `FunctionFlags.strict` / `program.strict` now store the strict-mode flag on the AST itself (set by the parser).**
 
 ## Notes / risks
 - **Cover grammars (arrows, destructuring) are the classic time sink.** Budget for them explicitly; get them right with snapshot tests before moving on.
