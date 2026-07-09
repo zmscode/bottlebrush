@@ -803,6 +803,26 @@ pub const Parser = struct {
         }
     }
 
+    /// A shorthand object property `{ x }` covers an IdentifierReference: it
+    /// may not be a reserved word (hard, or contextually reserved). `eval` and
+    /// `arguments` stay legal here (they are only invalid as *targets*, which
+    /// this cover grammar can't yet distinguish).
+    fn checkShorthandReference(self: *Parser, key: *Node) ParseError!void {
+        if (key.kind != .ident) return;
+        const name = key.kind.ident;
+        if (token.keywordKind(name) != .identifier) {
+            return self.fail("reserved word may not be a shorthand property");
+        }
+        if (self.in_async and std.mem.eql(u8, name, "await")) return self.fail("'await' is reserved here");
+        if ((self.in_generator or self.strict) and std.mem.eql(u8, name, "yield")) return self.fail("'yield' is reserved here");
+        if (self.strict) {
+            const reserved = [_][]const u8{ "implements", "interface", "package", "protected", "private", "public", "let", "static" };
+            for (reserved) |r| {
+                if (std.mem.eql(u8, name, r)) return self.fail("reserved word may not be a shorthand property in strict mode");
+            }
+        }
+    }
+
     /// In strict mode, `eval`, `arguments`, and the future-reserved words may
     /// not be used as binding names (spec 13.1.1 / BindingIdentifier).
     fn checkStrictBindingName(self: *Parser, name: []const u8) ParseError!void {
@@ -1509,7 +1529,9 @@ pub const Parser = struct {
             } });
         }
 
-        // Shorthand `{ x }` or `{ x = default }` (cover for destructuring).
+        // Shorthand `{ x }` or `{ x = default }` (cover for destructuring):
+        // the name must be a valid IdentifierReference.
+        if (!computed) try self.checkShorthandReference(key);
         var value: *Node = key;
         if (self.eat(.assign)) {
             const def = try self.parseAssignment();
