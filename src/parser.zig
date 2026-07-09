@@ -51,6 +51,9 @@ pub const Parser = struct {
     in_async: bool = false,
     /// Inside a generator body: `yield` is reserved (not an identifier).
     in_generator: bool = false,
+    /// Nesting depth of enclosing class bodies. A private-name reference
+    /// (`obj.#x`, `#x in obj`) is only legal when this is > 0.
+    private_depth: u32 = 0,
     /// Scratch buffer for the decoded spelling of an escaped identifier.
     name_buf: [64]u8 = undefined,
     diag: ?Diagnostic = null,
@@ -550,11 +553,13 @@ pub const Parser = struct {
         var super_class: ?*Node = null;
         if (self.eat(.kw_extends)) super_class = try self.parseLeftHandSide();
         try self.expect(.l_brace);
+        self.private_depth += 1;
         var members: NodeList = .empty;
         while (!self.at(.r_brace) and !self.at(.eof)) {
             if (self.eat(.semicolon)) continue;
             try members.append(self.arena, try self.parseClassMember());
         }
+        self.private_depth -= 1;
         try self.expect(.r_brace);
         try self.checkDuplicatePrivateNames(members.items);
         const class: ast.Class = .{
@@ -1260,6 +1265,7 @@ pub const Parser = struct {
     fn parseMemberProperty(self: *Parser) ParseError!*Node {
         const start = self.cur.start;
         if (self.at(.private_identifier)) {
+            if (self.private_depth == 0) return self.fail("private name referenced outside a class body");
             const name = self.cur.lexeme(self.source);
             self.advance();
             return self.node(start, self.prev_end, .{ .private_name = name });
@@ -1298,6 +1304,7 @@ pub const Parser = struct {
             .identifier => return self.parseIdentifier(),
             .private_identifier => {
                 // `#x in obj` ergonomic brand check.
+                if (self.private_depth == 0) return self.fail("private name referenced outside a class body");
                 const name = self.cur.lexeme(self.source);
                 self.advance();
                 return self.node(start, self.prev_end, .{ .private_name = name });
