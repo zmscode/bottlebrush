@@ -5,24 +5,30 @@ grouped by root cause and ranked by payoff. Regenerate the raw data by flipping
 `trace_files = true` in `test262/runner.zig`, rebuilding, and grepping the
 runner's `FAILCASE`/`SKIPCASE` lines (each is `TAG <path> <reason>`).
 
-**As of 2026-07-09** (commit `e879474`):
+**As of 2026-07-09** (commit `cafdb8f`):
 
 | Bucket | Count | % of corpus |
 |--------|------:|------------:|
 | **files** | 5977 | 100% |
-| **pass** | 3591 | 60.1% |
-| **fail** | 736 | 12.3% |
-| **skip** | 1650 | 27.6% |
-| pass of executed (pass+fail) | | **83.0%** |
+| **pass** | 3701 | 61.9% |
+| **fail** | 625 | 10.5% |
+| **skip** | 1651 | 27.6% |
+| pass of executed (pass+fail) | | **85.6%** |
 
 > **Progress since the first audit (was 3327 pass / 990 fail):** F1
 > escaped-keys (+172), F5 RegExp @@split species (+22), and the F2/S1
 > worklist — shorthand-reserved (+46), undeclared-private (+5),
 > per-function strict (+9), for-in head (+2), rest parameters (+8 and
-> `super(...args)` forwarding). Remaining fails are the Proxy invariants
-> (F3, ~104), the direct-eval + brand-ordering class runtime (F4, ~54),
-> the smaller runtime tail (F6), and the fiddlier parse-negatives
-> (cover-init-name, deep dstr-target validation, await/yield labels).
+> `super(...args)` forwarding). Then the class/proxy runtime pass: **F3
+> Proxy deep invariants (+80** — trap GetMethod/forwarding/nested-proxy,
+> ownKeys/gopd/defineProperty/setProto/extensibility invariants, and the
+> `applyDescriptor`/`setPrototypeChecked` bool-vs-throw split); **F4
+> brand-install-after-super (+6)** and **direct-eval private/`this`/
+> `new.target` visibility (+18)**. Remaining: proxy symbol-key ownKeys
+> (spread/rest) and `new.target` threading; direct-eval `super.x` and
+> `arguments`-forbidden; per-evaluation private brands; the smaller runtime
+> tail (F6) and the fiddlier parse-negatives (cover-init-name, deep
+> dstr-target validation, await/yield labels).
 
 "Executed rate" is the honest correctness signal; "skip" is coverage we
 deliberately or unavoidably decline. The goal of this document is to convert the
