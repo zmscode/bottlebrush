@@ -1156,6 +1156,30 @@ test "async functions: await, rejection, this, arrows, promise identity" {
     try std.testing.expectEqual(@as(f64, 1), v.asNumber());
 }
 
+test "promise combinators: all/allSettled/any/race" {
+    var vm = helpers.Vm.init(helpers.gpa);
+    defer vm.deinit();
+    _ = try eval(&vm,
+        \\out = {};
+        \\Promise.all([1, Promise.resolve(2), 3]).then(function (r) { out.all = r.join(","); });
+        \\Promise.all([]).then(function (r) { out.empty = Array.isArray(r) && r.length === 0; });
+        \\Promise.all([1, Promise.reject("R")]).catch(function (e) { out.allRej = e; });
+        \\Promise.race([new Promise(function () {}), Promise.resolve("fast")]).then(function (v) { out.race = v; });
+        \\Promise.allSettled([Promise.resolve(1), Promise.reject("bad")]).then(function (r) {
+        \\  out.settled = r[0].status + "," + r[0].value + "," + r[1].status + "," + r[1].reason;
+        \\});
+        \\Promise.any([Promise.reject("a"), Promise.resolve("win")]).then(function (v) { out.any = v; });
+        \\Promise.any([Promise.reject("a"), Promise.reject("b")]).catch(function (e) {
+        \\  out.agg = (e instanceof AggregateError) && e.errors.join(",") === "a,b";
+        \\});
+    );
+    const v = try eval(&vm,
+        \\return (out.all === "1,2,3" && out.empty && out.allRej === "R" && out.race === "fast"
+        \\  && out.settled === "fulfilled,1,rejected,bad" && out.any === "win" && out.agg) ? 1 : 0;
+    );
+    try std.testing.expectEqual(@as(f64, 1), v.asNumber());
+}
+
 test "object spread/rest copy symbol-keyed properties" {
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
         \\var s = Symbol('s');

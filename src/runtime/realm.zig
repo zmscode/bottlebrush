@@ -398,6 +398,7 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     vm.syntax_error_proto = try vm.installErrorSubtype("SyntaxError");
     _ = try vm.installErrorSubtype("EvalError");
     _ = try vm.installErrorSubtype("URIError");
+    _ = try vm.installErrorSubtype("AggregateError");
 
     // ---- Array ----
     const array_proto = try vm.heap.create(gc.Object);
@@ -664,6 +665,10 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(promise_ctor, "resolve", promise_mod.nativePromiseResolve, 1);
     try vm.defineMethod(promise_ctor, "reject", promise_mod.nativePromiseReject, 1);
     try vm.defineMethod(promise_ctor, "withResolvers", promise_mod.nativePromiseWithResolvers, 0);
+    try vm.defineMethod(promise_ctor, "all", promise_mod.nativePromiseAll, 1);
+    try vm.defineMethod(promise_ctor, "allSettled", promise_mod.nativePromiseAllSettled, 1);
+    try vm.defineMethod(promise_ctor, "any", promise_mod.nativePromiseAny, 1);
+    try vm.defineMethod(promise_ctor, "race", promise_mod.nativePromiseRace, 1);
     try vm.defineData(global, "Promise", Value.fromObject(promise_ctor), true, false, true);
     try vm.defineMethod(global, "queueMicrotask", promise_mod.nativeQueueMicrotask, 1);
 

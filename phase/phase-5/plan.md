@@ -20,19 +20,19 @@
 - [x] `for-of`/spread already route through iteration protocol (Phase 4) → generators just work as iterables. **DONE.**
 
 ## 3. Jobs & the microtask queue (Agent)
-- [ ] `Agent` owns a **job queue** (microtasks). `HostEnqueuePromiseJob`, `RunJobs` drains after each script/module + between turns.
-- [ ] Wire the Test262 `async` flag path: the harness's `doneprintHandle`/`$DONE` contract must actually pump the job queue to completion and detect `Test262:AsyncTestComplete`.
-- [ ] `queueMicrotask` global.
+- [x] `Agent` owns a **job queue** (microtasks). `HostEnqueuePromiseJob`, `RunJobs` drains after each script/module + between turns. **DONE: `Vm.jobs` FIFO (cursor-drained, GC-rooted incl. the running job), drained by `run()` after the script — including abrupt completions.**
+- [x] Wire the Test262 `async` flag path: the harness's `doneprintHandle`/`$DONE` contract must actually pump the job queue to completion and detect `Test262:AsyncTestComplete`. **DONE: jobs drain inside vm.run, so `$DONE` fires from promise chains; the runner scores by the sentinel.**
+- [x] `queueMicrotask` global. **DONE.**
 
 ## 4. Promises
-- [ ] `Promise` constructor (executor, `resolve`/`reject` capabilities), states, `PromiseResolveThenableJob`, `FulfillPromise`/`RejectPromise`, `PerformPromiseThen`.
-- [ ] Prototype `then`/`catch`/`finally`; statics `resolve`/`reject`/`all`/`allSettled`/`any`(→ `AggregateError`)/`race`/`withResolvers`.
-- [ ] `@@species` handling; the exact ordering of reaction jobs (Test262 checks ordering precisely).
+- [x] `Promise` constructor (executor, `resolve`/`reject` capabilities), states, `PromiseResolveThenableJob`, `FulfillPromise`/`RejectPromise`, `PerformPromiseThen`. **DONE: `gc.PromiseState` + Vm core ops (settlePromise/resolvePromiseWith/performPromiseThen/promiseResolveValue); thenable assimilation via the thenable job.**
+- [x] Prototype `then`/`catch`/`finally`; statics `resolve`/`reject`/`all`/`allSettled`/`any`(→ `AggregateError`)/`race`/`withResolvers`. **DONE (`runtime/builtins/promise.zig`); AggregateError installed with an `errors` array.**
+- [ ] `@@species` handling; the exact ordering of reaction jobs (Test262 checks ordering precisely). **PARTIAL: reaction ordering matches V8 on interleaved chains (unit-tested); `@@species` / subclass-aware capabilities (NewPromiseCapability via `this`) not implemented — derived promises are always native.**
 
 ## 5. async / await
-- [ ] `async function` = generator-like machinery over the Promise job queue: `await` suspends, schedules resumption via a promise reaction.
-- [ ] `async` methods, async arrows.
-- [ ] **Async generators** (`async function*`) + `@@asyncIterator` + `for await…of`: the async-iterator queue, `%AsyncGeneratorPrototype%`, `%AsyncIteratorPrototype%`. This is the fiddliest combination — its own sub-milestone.
+- [x] `async function` = generator-like machinery over the Promise job queue: `await` suspends, schedules resumption via a promise reaction. **DONE: `await` compiles to the generator suspension; callAsyncFunction drives the frame (Await = PromiseResolve + PerformPromiseThen with no capability); errors before the first await reject the promise; deep sync-prefix recursion raises RangeError.**
+- [x] `async` methods, async arrows. **DONE (async arrows reserve `await` in their bodies; lexical `this`).**
+- [ ] **Async generators** (`async function*`) + `@@asyncIterator` + `for await…of`: the async-iterator queue, `%AsyncGeneratorPrototype%`, `%AsyncIteratorPrototype%`. This is the fiddliest combination — its own sub-milestone. **STILL OUTSTANDING: async generators are rejected at compile time (honest skip); the async-iteration corpus runs but those tests skip.**
 
 ## 6. Modules
 - [ ] **Module records:** `SourceTextModuleRecord`, parse (done Phase 1) → `ParseModule`.
