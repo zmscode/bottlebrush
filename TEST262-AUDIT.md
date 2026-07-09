@@ -5,20 +5,30 @@ grouped by root cause and ranked by payoff. Regenerate the raw data by flipping
 `trace_files = true` in `test262/runner.zig`, rebuilding, and grepping the
 runner's `FAILCASE`/`SKIPCASE` lines (each is `TAG <path> <reason>`).
 
-**As of 2026-07-09** (commit `7963802`):
+**As of 2026-07-09** (commit `45d1999`):
 
 | Bucket | Count | % of corpus |
 |--------|------:|------------:|
 | **files** | 5977 | 100% |
-| **pass** | 3732 | 62.4% |
-| **fail** | 636 | 10.6% |
-| **skip** | 1609 | 26.9% |
-| pass of executed (pass+fail) | | **85.4%** |
+| **pass** | 4147 | 69.4% |
+| **fail** | 752 | 12.6% |
+| **skip** | 1078 | 18.0% |
+| pass of executed (pass+fail) | | **84.6%** |
 
-> **Phase 0–4 checklist closed:** all P0–P4 plan items are now ticked. Added
-> `$262.createRealm` (real fresh realm; `cross-realm` un-denylisted → +31),
-> `$262.agent` stub, the async `doneprintHandle` capture contract, strict-mode
-> flag on the AST, golden AST + disassembler snapshots, and a parser fuzz test.
+> **Phase 0–4 checklist closed** (all P0–P4 items ticked): `$262.createRealm`
+> (real fresh realm; `cross-realm` un-denylisted → +31), `$262.agent` stub,
+> async `doneprintHandle` capture contract, strict-mode flag on the AST, golden
+> AST + disassembler snapshots, parser fuzz test.
+>
+> **Phase 5 begun — generators enabled (+415).** A `yield*`-with-no-operand
+> crash (null-unwrap in `compileYieldStar`) was gating the whole feature;
+> generators were already ~75% built (yield, next/return/throw, for-of, yield*,
+> sent values, generator methods). Removed from the runner denylist → the 635
+> generator tests run. Plus generator early-errors (yield in labels/params,
+> yield* after newline). Remaining generator fails: destructuring-parameter
+> binding (iterator-close/error-propagation, ~78, shared with non-generators)
+> and the rest of the generator early-errors + `.prototype`/`.name` semantics.
+> Still skipped: async-iteration (~595) and the recoverable parse/compile-gaps.
 
 > **Progress since the first audit (was 3327 pass / 990 fail):** F1
 > escaped-keys (+172), F5 RegExp @@split species (+22), and the F2/S1
