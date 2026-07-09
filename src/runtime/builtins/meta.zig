@@ -140,6 +140,13 @@ pub fn nativeProxyRevocable(ctx: *anyopaque, this: Value, args: []const Value) E
     return Value.fromObject(result);
 }
 
+/// `@@species` getter shared by species-aware constructors: `return this`.
+pub fn nativeReturnThis(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+    _ = ctx;
+    _ = args;
+    return this;
+}
+
 pub fn nativeProxyRevoke(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     _ = ctx;
     _ = args;

@@ -16,6 +16,7 @@ const support_mod = @import("../support.zig");
 const toIntegerOrInfinity = support_mod.toIntegerOrInfinity;
 const toBoolean = support_mod.toBoolean;
 const sameValue = support_mod.sameValue;
+const isConstructorValue = support_mod.isConstructorValue;
 const argAt = support_mod.argAt;
 const castVm = support_mod.castVm;
 const clampIndex = support_mod.clampIndex;
@@ -948,8 +949,112 @@ pub fn nativeRegExpSymbolSplit(ctx: *anyopaque, this: Value, args: []const Value
     defer vm.unprotect();
     const limit_v = argAt(args, 1);
     const lim: u32 = if (limit_v.isUndefined()) std.math.maxInt(u32) else try vm.toUint32(limit_v);
-    if (this.asObject().regex == null) return vm.throwTypeError("Symbol.split requires a RegExp matcher");
-    return splitRegexImpl(vm, this.asObject().regex.?, sv, lim);
+    // Fast path: an unmodified built-in RegExp with the default constructor.
+    if (try isPlainRegExp(vm, this) and try defaultRegExpConstructor(vm, this)) {
+        return splitRegexImpl(vm, this.asObject().regex.?, sv, lim);
+    }
+    return splitExecImpl(vm, this, sv, lim);
+}
+
+/// True when `rx.constructor` is the intrinsic %RegExp% (so no species clone
+/// is observable and the fast internal split is equivalent).
+fn defaultRegExpConstructor(vm: *Vm, rx: Value) Error!bool {
+    const ctor = try vm.getProperty(rx, "constructor");
+    if (!ctor.isObject()) return false;
+    const rx_ctor = try vm.getProperty(Value.fromObject(vm.global_object.?), "RegExp");
+    return rx_ctor.isObject() and ctor.asObject() == rx_ctor.asObject();
+}
+
+/// SpeciesConstructor(rx, %RegExp%): the constructor its `@@species` selects.
+fn regExpSpeciesConstructor(vm: *Vm, rx: Value) Error!Value {
+    const default = try vm.getProperty(Value.fromObject(vm.global_object.?), "RegExp");
+    const ctor = try vm.getProperty(rx, "constructor");
+    if (ctor.isUndefined()) return default;
+    if (!ctor.isObject()) return vm.throwTypeError("constructor is not an object");
+    if (vm.symbol_species_key.len == 0) return default;
+    const species = try vm.getProperty(ctor, vm.symbol_species_key);
+    if (species.isNullish()) return default;
+    if (!isConstructorValue(species)) return vm.throwTypeError("@@species is not a constructor");
+    return species;
+}
+
+/// RegExp.prototype[@@split] via the full spec algorithm: construct a sticky
+/// species splitter and drive it with RegExpExec, splicing captures between
+/// matches (22.2.6.14).
+fn splitExecImpl(vm: *Vm, rx: Value, sv: Value, lim: u32) Error!Value {
+    const constructor = try regExpSpeciesConstructor(vm, rx);
+    try vm.protect(constructor);
+    defer vm.unprotect();
+
+    // newFlags = flags, ensuring "y".
+    const flags_v = try vm.toStringVal(try vm.getProperty(rx, "flags"));
+    try vm.protect(flags_v);
+    defer vm.unprotect();
+    const flags = flags_v.asString().units;
+    var unicode = false;
+    var has_y = false;
+    for (flags) |c| {
+        if (c == 'u') unicode = true;
+        if (c == 'y') has_y = true;
+    }
+    var new_flags_buf: std.ArrayList(u16) = .empty;
+    defer new_flags_buf.deinit(vm.gpa);
+    try new_flags_buf.appendSlice(vm.gpa, flags);
+    if (!has_y) try new_flags_buf.append(vm.gpa, 'y');
+    const new_flags = try vm.makeStringFromUtf16(new_flags_buf.items);
+    try vm.protect(new_flags);
+    defer vm.unprotect();
+
+    const splitter = try vm.constructValue(constructor, &.{ rx, new_flags });
+    try vm.protect(splitter);
+    defer vm.unprotect();
+
+    const result = try vm.newArray(0);
+    try vm.protect(Value.fromObject(result));
+    defer vm.unprotect();
+    if (lim == 0) return Value.fromObject(result);
+
+    const units = sv.asString().units;
+    const size = units.len;
+    if (size == 0) {
+        const z = try regExpExec(vm, splitter, sv);
+        if (!z.isNull()) return Value.fromObject(result);
+        try vm.arrayAppend(result, sv);
+        return Value.fromObject(result);
+    }
+
+    var p: usize = 0;
+    var q: usize = 0;
+    while (q < size) {
+        try vm.checkBudget();
+        try vm.setProperty(splitter, "lastIndex", Value.fromNumber(@floatFromInt(q)));
+        const z = try regExpExec(vm, splitter, sv);
+        if (z.isNull()) {
+            q = advanceStringIndex(units, q, unicode);
+            continue;
+        }
+        const li = try toIntegerOrInfinity(vm, try vm.getProperty(splitter, "lastIndex"));
+        const e = @min(@as(usize, @intFromFloat(@max(0, li))), size);
+        if (e == p) {
+            q = advanceStringIndex(units, q, unicode);
+            continue;
+        }
+        try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..q]));
+        if (result.array_length >= lim) return Value.fromObject(result);
+        // Splice in the captures.
+        const ncap_f = try toIntegerOrInfinity(vm, try vm.getProperty(z, "length"));
+        const ncap: usize = if (ncap_f < 1) 0 else @intFromFloat(@min(ncap_f - 1, 1000));
+        var i: usize = 1;
+        while (i <= ncap) : (i += 1) {
+            var b: [24]u8 = undefined;
+            try vm.arrayAppend(result, try vm.getProperty(z, std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable));
+            if (result.array_length >= lim) return Value.fromObject(result);
+        }
+        p = e;
+        q = p;
+    }
+    try vm.arrayAppend(result, try vm.makeStringFromUtf16(units[p..]));
+    return Value.fromObject(result);
 }
 
 /// @@replace via the exec protocol (custom `exec` / subclasses). Reads each

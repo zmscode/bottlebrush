@@ -181,6 +181,7 @@ const opTanh = math_mod.opTanh;
 const meta_mod = @import("builtins/meta.zig");
 const nativeProxy = meta_mod.nativeProxy;
 const nativeProxyRevocable = meta_mod.nativeProxyRevocable;
+const nativeReturnThis = meta_mod.nativeReturnThis;
 const nativeReflectApply = meta_mod.nativeReflectApply;
 const nativeReflectConstruct = meta_mod.nativeReflectConstruct;
 const nativeReflectDelete = meta_mod.nativeReflectDelete;
@@ -807,6 +808,8 @@ pub fn installBuiltins(vm: *Vm) Error!void {
             vm.symbol_search_key = try vm.toPropertyKey(sym);
         } else if (comptime std.mem.eql(u8, name, "split")) {
             vm.symbol_split_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "species")) {
+            vm.symbol_species_key = try vm.toPropertyKey(sym);
         }
     }
 
@@ -816,6 +819,11 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(vm.regexp_proto.?, vm.symbol_replace_key, nativeRegExpSymbolReplace, 2);
     try vm.defineMethod(vm.regexp_proto.?, vm.symbol_search_key, nativeRegExpSymbolSearch, 1);
     try vm.defineMethod(vm.regexp_proto.?, vm.symbol_split_key, nativeRegExpSymbolSplit, 2);
+    // `get RegExp[@@species] { return this }` — drives SpeciesConstructor.
+    {
+        const rx_ctor = try vm.getProperty(Value.fromObject(global), "RegExp");
+        if (rx_ctor.isObject()) try vm.defineGetter(rx_ctor.asObject(), vm.symbol_species_key, nativeReturnThis);
+    }
     try vm.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 
     // ---- BigInt ----

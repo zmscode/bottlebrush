@@ -151,6 +151,7 @@ pub const Vm = struct {
     symbol_replace_key: []const u8 = &.{},
     symbol_search_key: []const u8 = &.{},
     symbol_split_key: []const u8 = &.{},
+    symbol_species_key: []const u8 = &.{},
     iterator_proto: ?*gc.Object = null,
     generator_proto: ?*gc.Object = null,
     bigint_proto: ?*gc.Object = null,
@@ -160,6 +161,7 @@ pub const Vm = struct {
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
     }
+
     pub fn deinit(self: *Vm) void {
         self.frames.deinit(self.gpa);
         self.temp_roots.deinit(self.gpa);
@@ -173,6 +175,7 @@ pub const Vm = struct {
         if (self.symbol_replace_key.len != 0) self.gpa.free(self.symbol_replace_key);
         if (self.symbol_search_key.len != 0) self.gpa.free(self.symbol_search_key);
         if (self.symbol_split_key.len != 0) self.gpa.free(self.symbol_split_key);
+        if (self.symbol_species_key.len != 0) self.gpa.free(self.symbol_species_key);
         // Programs compiled by eval/Function() live as long as the VM: closures
         // created inside them keep pointing at their bytecode arenas.
         for (self.eval_programs.items) |*p| p.deinit();

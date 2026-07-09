@@ -840,3 +840,30 @@ test "RegExp exec protocol (Symbol methods honor custom exec)" {
         \\catch (e) { return (e instanceof TypeError) ? 1 : 2; }
     ));
 }
+
+test "RegExp @@split species and exec protocol" {
+    // Plain split still works (fast path).
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return ("a1b2c".split(/\d/).join("|") === "a|b|c") ? 1 : 0;
+    ));
+    // Captures are spliced into the result.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return ("2016-01".split(/(-)/).join(",") === "2016,-,01") ? 1 : 0;
+    ));
+    // limit is honored.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return ("a,b,c,d".split(/,/, 2).join("|") === "a|b") ? 1 : 0;
+    ));
+    // @@species selects the splitter constructor.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var re = /x/iy;
+        \\re.constructor = function () {};
+        \\re.constructor[Symbol.species] = function () { return /[db]/y; };
+        \\var r = RegExp.prototype[Symbol.split].call(re, "abcde");
+        \\return (r.join("") === "ace") ? 1 : 0;
+    ));
+    // RegExp[@@species] returns the receiver.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\return RegExp[Symbol.species] === RegExp ? 1 : 0;
+    ));
+}
