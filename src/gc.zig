@@ -97,6 +97,26 @@ pub const GeneratorState = struct {
     status: enum(u8) { start, suspended, executing, completed } = .start,
 };
 
+/// A promise's internal state (spec 27.2): status, settled value/reason, and
+/// the reactions registered while pending. Heap-owned by its promise object.
+pub const PromiseState = struct {
+    status: enum(u8) { pending, fulfilled, rejected } = .pending,
+    /// The fulfillment value or rejection reason once settled.
+    value: Value = Value.undefined_value,
+    /// Set once the executor's resolve/reject (or a thenable's) has been
+    /// called; later calls are no-ops.
+    already_resolved: bool = false,
+    reactions: std.ArrayList(PromiseReaction) = .empty,
+};
+
+/// One registered reaction: the handler to call with the settled value (or
+/// `undefined` for pass-through), and the derived promise its result settles.
+pub const PromiseReaction = struct {
+    handler: Value,
+    derived: *Object,
+    on_fulfill: bool,
+};
+
 /// A typed-array view over an ArrayBuffer.
 pub const TypedArrayView = struct {
     buffer: *Object, // the backing ArrayBuffer object
@@ -145,6 +165,8 @@ pub const Object = struct {
     proxy_handler: ?*Object = null,
     /// Generator activation state (heap-owned); null for non-generators.
     generator: ?*GeneratorState = null,
+    /// Promise internal state (heap-owned); null for non-promises.
+    promise: ?*PromiseState = null,
     /// Bound-function exotic: when set, [[Call]]/[[Construct]] forward to
     /// `bound_target` with `bound_this` prepended to the bound args (which live
     /// in `elements`).
@@ -187,6 +209,13 @@ pub const Object = struct {
             g.this_value.mark(t);
             for (g.regs) |v| v.mark(t);
         }
+        if (self.promise) |p| {
+            p.value.mark(t);
+            for (p.reactions.items) |r| {
+                r.handler.mark(t);
+                t.mark(&r.derived.gc);
+            }
+        }
         if (self.bound_target) |bt| bt.mark(t);
         self.bound_this.mark(t);
         if (self.args_env) |e| t.mark(&e.gc);
@@ -201,6 +230,10 @@ pub const Object = struct {
         if (self.generator) |g| {
             gpa.free(g.regs);
             gpa.destroy(g);
+        }
+        if (self.promise) |p| {
+            p.reactions.deinit(gpa);
+            gpa.destroy(p);
         }
         if (self.regex) |re| {
             re.deinit(gpa);

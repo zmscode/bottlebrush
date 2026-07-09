@@ -118,6 +118,10 @@ pub const Vm = struct {
     /// When set, `print` (and console.log) append here instead of stdout — the
     /// Test262 async runner captures the `Test262:AsyncTestComplete` sentinel.
     print_capture: ?*std.ArrayList(u8) = null,
+    /// The microtask job queue (promise reactions, thenables, queueMicrotask).
+    /// Drained (FIFO, via `jobs_cursor`) after the top-level script completes.
+    jobs: std.ArrayList(Job) = .empty,
+    jobs_cursor: usize = 0,
     // Realm intrinsics (created lazily by `bootstrap`).
     object_proto: ?*gc.Object = null,
     function_proto: ?*gc.Object = null,
@@ -158,12 +162,25 @@ pub const Vm = struct {
     iterator_proto: ?*gc.Object = null,
     generator_proto: ?*gc.Object = null,
     bigint_proto: ?*gc.Object = null,
+    promise_proto: ?*gc.Object = null,
     /// Every realm ever built (primary at index 0, plus `$262.createRealm`
     /// results). The active realm's intrinsics live in the flat fields above;
     /// this list keeps the others rooted and lets `evalScript` swap in a realm.
     realms: std.ArrayList(Realm) = .empty,
 
     const SymbolReg = struct { key: []u8, sym: *gc.Symbol };
+
+    /// One queued microtask.
+    pub const Job = union(enum) {
+        /// PromiseReactionJob: call `handler(arg)` and settle `derived` with
+        /// the result (or pass `arg` through when the handler isn't callable).
+        reaction: struct { handler: Value, arg: Value, derived: *gc.Object, on_fulfill: bool },
+        /// PromiseResolveThenableJob: `then_fn.call(thenable, resolve, reject)`
+        /// for `promise`.
+        thenable: struct { promise: *gc.Object, thenable: Value, then_fn: Value },
+        /// queueMicrotask(fn).
+        callback: struct { func: Value },
+    };
 
     /// A snapshot of one realm's intrinsics. Field names match the `Vm`
     /// intrinsic fields exactly, so capture/restore is a reflective copy. The
@@ -202,6 +219,7 @@ pub const Vm = struct {
         iterator_proto: ?*gc.Object = null,
         generator_proto: ?*gc.Object = null,
         bigint_proto: ?*gc.Object = null,
+        promise_proto: ?*gc.Object = null,
     };
 
     /// Copy the active realm (flat fields) into a `Realm` snapshot.
@@ -258,6 +276,7 @@ pub const Vm = struct {
             }
         }
         self.realms.deinit(self.gpa);
+        self.jobs.deinit(self.gpa);
         // Programs compiled by eval/Function() live as long as the VM: closures
         // created inside them keep pointing at their bytecode arenas.
         for (self.eval_programs.items) |*p| p.deinit();
@@ -300,6 +319,21 @@ pub const Vm = struct {
         if (self.generator_proto) |o| tracer.mark(&o.gc);
         if (self.bigint_proto) |o| tracer.mark(&o.gc);
         for (self.symbol_registry.items) |r| tracer.mark(&r.sym.gc);
+        if (self.promise_proto) |o| tracer.mark(&o.gc);
+        // Pending microtasks hold values/promises that must survive collection.
+        for (self.jobs.items[self.jobs_cursor..]) |job| switch (job) {
+            .reaction => |r| {
+                r.handler.mark(tracer);
+                r.arg.mark(tracer);
+                tracer.mark(&r.derived.gc);
+            },
+            .thenable => |t| {
+                tracer.mark(&t.promise.gc);
+                t.thenable.mark(tracer);
+                t.then_fn.mark(tracer);
+            },
+            .callback => |c| c.func.mark(tracer),
+        };
         // Keep every realm's intrinsics alive (the active one overlaps the flat
         // fields above; the rest are only reachable here).
         for (self.realms.items) |*rlm| markRealm(rlm, tracer);
@@ -631,7 +665,18 @@ pub const Vm = struct {
         self.deadline_ns = std.Io.Clock.now(.awake, self.threaded.io()).nanoseconds + max_wall_ns;
         const root = program.root;
         const env = try self.createEnv(null, root.num_env_slots);
-        return self.execute(root, env, Value.fromObject(self.global_object.?));
+        // Run the script, then drain the microtask queue (promise reactions run
+        // even when the script itself completed abruptly).
+        const result = self.execute(root, env, Value.fromObject(self.global_object.?)) catch |e| {
+            if (e == error.JsThrow) {
+                const exc = self.pending_exception;
+                self.runJobs() catch {};
+                self.pending_exception = exc;
+            }
+            return e;
+        };
+        try self.runJobs();
+        return result;
     }
 
     /// If a JS exception is pending and is an Error-like object, return its
@@ -1369,6 +1414,179 @@ pub const Vm = struct {
                 g.status = .completed;
                 return self.makeIterResult(v, true);
             },
+        }
+    }
+
+    // ---- promises & the job queue -------------------------------------------
+
+    /// A fresh pending promise on %Promise.prototype%.
+    pub fn newPromise(self: *Vm) Error!*gc.Object {
+        const obj = try self.newObject(self.promise_proto);
+        const state = try self.gpa.create(gc.PromiseState);
+        state.* = .{};
+        obj.promise = state;
+        return obj;
+    }
+
+    pub fn enqueueJob(self: *Vm, job: Job) Error!void {
+        try self.jobs.append(self.gpa, job);
+    }
+
+    /// FulfillPromise / RejectPromise: settle and flush the matching reactions
+    /// onto the job queue (the others settle their derived promise by passing
+    /// the completion through).
+    pub fn settlePromise(self: *Vm, p: *gc.Object, value: Value, fulfilled: bool) Error!void {
+        const st = p.promise.?;
+        if (st.status != .pending) return;
+        st.status = if (fulfilled) .fulfilled else .rejected;
+        st.value = value;
+        for (st.reactions.items) |r| {
+            if (r.on_fulfill == fulfilled) {
+                try self.enqueueJob(.{ .reaction = .{ .handler = r.handler, .arg = value, .derived = r.derived, .on_fulfill = fulfilled } });
+            }
+        }
+        st.reactions.clearAndFree(self.gpa);
+    }
+
+    /// ResolvePromise(p, v): self-resolution is a TypeError; a thenable defers
+    /// through a PromiseResolveThenableJob; anything else fulfills directly.
+    pub fn resolvePromiseWith(self: *Vm, p: *gc.Object, v: Value) Error!void {
+        if (v.isObject() and v.asObject() == p) {
+            const err = try self.makeError(self.type_error_proto, "cannot resolve a promise with itself");
+            return self.settlePromise(p, Value.fromObject(err), false);
+        }
+        if (v.isObject()) {
+            const then = self.getProperty(v, "then") catch |e| {
+                if (e != error.JsThrow) return e;
+                const exc = self.pending_exception.?;
+                self.pending_exception = null;
+                return self.settlePromise(p, exc, false);
+            };
+            if (isCallable(then)) {
+                return self.enqueueJob(.{ .thenable = .{ .promise = p, .thenable = v, .then_fn = then } });
+            }
+        }
+        return self.settlePromise(p, v, true);
+    }
+
+    /// PerformPromiseThen: register (or immediately schedule) the reaction pair
+    /// settling `derived`.
+    pub fn performPromiseThen(self: *Vm, p: *gc.Object, on_f: Value, on_r: Value, derived: *gc.Object) Error!void {
+        const st = p.promise.?;
+        switch (st.status) {
+            .pending => {
+                try st.reactions.append(self.gpa, .{ .handler = on_f, .derived = derived, .on_fulfill = true });
+                try st.reactions.append(self.gpa, .{ .handler = on_r, .derived = derived, .on_fulfill = false });
+            },
+            .fulfilled => try self.enqueueJob(.{ .reaction = .{ .handler = on_f, .arg = st.value, .derived = derived, .on_fulfill = true } }),
+            .rejected => try self.enqueueJob(.{ .reaction = .{ .handler = on_r, .arg = st.value, .derived = derived, .on_fulfill = false } }),
+        }
+    }
+
+    /// PromiseResolve: pass a native promise through; wrap anything else.
+    pub fn promiseResolveValue(self: *Vm, v: Value) Error!*gc.Object {
+        if (v.isObject() and v.asObject().promise != null) return v.asObject();
+        const p = try self.newPromise();
+        try self.protect(Value.fromObject(p));
+        defer self.unprotect();
+        try self.resolvePromiseWith(p, v);
+        return p;
+    }
+
+    /// The `resolve` function handed to executors/thenables: `this` is the
+    /// promise (via the bound-native trick); first call wins.
+    pub fn nativePromiseResolveFn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        if (this.isObject()) {
+            if (this.asObject().promise) |st| {
+                if (!st.already_resolved) {
+                    st.already_resolved = true;
+                    try vm.resolvePromiseWith(this.asObject(), if (args.len > 0) args[0] else Value.undefined_value);
+                }
+            }
+        }
+        return Value.undefined_value;
+    }
+
+    pub fn nativePromiseRejectFn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        if (this.isObject()) {
+            if (this.asObject().promise) |st| {
+                if (!st.already_resolved) {
+                    st.already_resolved = true;
+                    try vm.settlePromise(this.asObject(), if (args.len > 0) args[0] else Value.undefined_value, false);
+                }
+            }
+        }
+        return Value.undefined_value;
+    }
+
+    /// A native whose `this` is pre-bound to `receiver` (the Proxy.revocable
+    /// trick: an outer bound function forwarding to an inner native).
+    pub fn makeBoundNative(self: *Vm, name: []const u8, func: gc.NativeFn, receiver: *gc.Object) Error!*gc.Object {
+        const inner = try self.makeNative(name, func, 1);
+        try self.protect(Value.fromObject(inner));
+        defer self.unprotect();
+        const outer = try self.makeNative(name, func, 1);
+        outer.bound_target = Value.fromObject(inner);
+        outer.bound_this = Value.fromObject(receiver);
+        return outer;
+    }
+
+    /// Drain the microtask queue (each job may enqueue more). A reaction's
+    /// exception settles its derived promise; it never escapes the queue.
+    pub fn runJobs(self: *Vm) Error!void {
+        while (self.jobs_cursor < self.jobs.items.len) {
+            const job = self.jobs.items[self.jobs_cursor];
+            self.jobs_cursor += 1;
+            try self.checkBudget();
+            switch (job) {
+                .reaction => |r| {
+                    if (isCallable(r.handler)) {
+                        const result = self.callValue(r.handler, Value.undefined_value, &.{r.arg}) catch |e| {
+                            if (e != error.JsThrow) return e;
+                            const exc = self.pending_exception.?;
+                            self.pending_exception = null;
+                            try self.settlePromise(r.derived, exc, false);
+                            continue;
+                        };
+                        try self.resolvePromiseWith(r.derived, result);
+                    } else if (r.on_fulfill) {
+                        try self.resolvePromiseWith(r.derived, r.arg);
+                    } else {
+                        try self.settlePromise(r.derived, r.arg, false);
+                    }
+                },
+                .thenable => |t| {
+                    const resolve_fn = try self.makeBoundNative("resolve", nativePromiseResolveFn, t.promise);
+                    try self.protect(Value.fromObject(resolve_fn));
+                    defer self.unprotect();
+                    const reject_fn = try self.makeBoundNative("reject", nativePromiseRejectFn, t.promise);
+                    try self.protect(Value.fromObject(reject_fn));
+                    defer self.unprotect();
+                    _ = self.callValue(t.then_fn, t.thenable, &.{ Value.fromObject(resolve_fn), Value.fromObject(reject_fn) }) catch |e| {
+                        if (e != error.JsThrow) return e;
+                        const exc = self.pending_exception.?;
+                        self.pending_exception = null;
+                        const st = t.promise.promise.?;
+                        if (!st.already_resolved) {
+                            st.already_resolved = true;
+                            try self.settlePromise(t.promise, exc, false);
+                        }
+                    };
+                },
+                .callback => |c| {
+                    _ = self.callValue(c.func, Value.undefined_value, &.{}) catch |e| {
+                        if (e != error.JsThrow) return e;
+                        self.pending_exception = null; // host reports; we swallow
+                    };
+                },
+            }
+            // Reclaim the queue storage once fully drained.
+            if (self.jobs_cursor == self.jobs.items.len) {
+                self.jobs.clearRetainingCapacity();
+                self.jobs_cursor = 0;
+            }
         }
     }
 

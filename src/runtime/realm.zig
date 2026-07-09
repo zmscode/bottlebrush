@@ -48,6 +48,8 @@ const nativeArrayPush = array_mod.nativeArrayPush;
 const nativeArraySlice = array_mod.nativeArraySlice;
 const nativeArrayToString = array_mod.nativeArrayToString;
 
+const promise_mod = @import("builtins/promise.zig");
+
 const collections_mod = @import("builtins/collections.zig");
 const nativeCollectionClear = collections_mod.nativeCollectionClear;
 const nativeMap = collections_mod.nativeMap;
@@ -649,6 +651,21 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineData(weakref_ctor, "prototype", Value.fromObject(weakref_proto), false, false, false);
     try vm.defineData(weakref_proto, "constructor", Value.fromObject(weakref_ctor), true, false, true);
     try vm.defineData(global, "WeakRef", Value.fromObject(weakref_ctor), true, false, true);
+
+    // ---- Promise ----
+    const promise_proto = try vm.newObject(vm.object_proto);
+    vm.promise_proto = promise_proto;
+    try vm.defineMethod(promise_proto, "then", promise_mod.nativePromiseThen, 2);
+    try vm.defineMethod(promise_proto, "catch", promise_mod.nativePromiseCatch, 1);
+    try vm.defineMethod(promise_proto, "finally", promise_mod.nativePromiseFinally, 1);
+    const promise_ctor = asCtor(try vm.makeNative("Promise", promise_mod.nativePromise, 1));
+    try vm.defineData(promise_ctor, "prototype", Value.fromObject(promise_proto), false, false, false);
+    try vm.defineData(promise_proto, "constructor", Value.fromObject(promise_ctor), true, false, true);
+    try vm.defineMethod(promise_ctor, "resolve", promise_mod.nativePromiseResolve, 1);
+    try vm.defineMethod(promise_ctor, "reject", promise_mod.nativePromiseReject, 1);
+    try vm.defineMethod(promise_ctor, "withResolvers", promise_mod.nativePromiseWithResolvers, 0);
+    try vm.defineData(global, "Promise", Value.fromObject(promise_ctor), true, false, true);
+    try vm.defineMethod(global, "queueMicrotask", promise_mod.nativeQueueMicrotask, 1);
 
     // ---- Date ----
     const date_proto = try vm.newObject(vm.object_proto);
