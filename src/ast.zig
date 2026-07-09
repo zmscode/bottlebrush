@@ -24,6 +24,9 @@ pub const FunctionFlags = struct {
     is_arrow: bool = false,
     /// Arrow with a concise expression body (no block).
     expression_body: bool = false,
+    /// Strict-mode code: this function has a `"use strict"` prologue, or is
+    /// nested in strict code / a class body / a module. Set by the parser.
+    strict: bool = false,
 };
 
 pub const Function = struct {
@@ -107,7 +110,7 @@ pub const Node = struct {
         rest_element: *Node,
 
         // ---- statements ----
-        program: struct { body: []*Node, source_type: SourceType },
+        program: struct { body: []*Node, source_type: SourceType, strict: bool = false },
         block_stmt: []*Node,
         var_decl: struct { kind: VarKind, decls: []*Node },
         variable_declarator: struct { id: *Node, init: ?*Node },

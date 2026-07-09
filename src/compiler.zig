@@ -2717,6 +2717,59 @@ test "compiles arithmetic and variables" {
     try testing.expect(p.root.code.len > 0);
 }
 
+/// Disassemble `source` and collapse runs of whitespace to single spaces, so
+/// the golden snapshot pins the instruction stream (headers, opcodes, operands)
+/// without being brittle about the disassembler's column widths.
+fn disasmSnapshot(source: []const u8, out: *std.ArrayList(u8)) !void {
+    var p = try compileOk(source);
+    defer p.deinit();
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(testing.allocator);
+    try p.root.disassemble(testing.allocator, &raw);
+    var prev_space = false;
+    for (raw.items) |c| {
+        if (c == ' ' or c == '\t') {
+            if (!prev_space) try out.append(testing.allocator, ' ');
+            prev_space = true;
+        } else {
+            try out.append(testing.allocator, c);
+            prev_space = c == '\n';
+        }
+    }
+}
+
+test "disassembler snapshot: function with a call and a return" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try disasmSnapshot("function add(a, b) { return a + b; }", &out);
+    try testing.expectEqualStrings(
+        \\== <script> (params=0, regs=1, env_slots=0) ==
+        \\0 ensure_global a=0 b=0 c=0
+        \\1 new_closure a=0 b=0 c=0
+        \\2 set_global a=1 b=0 c=0
+        \\3 load_undefined a=0 b=0 c=0
+        \\4 ret a=0 b=0 c=0
+        \\
+        \\== add (params=2, regs=2, env_slots=3) ==
+        \\0 get_var a=0 b=0 c=0
+        \\1 get_var a=1 b=0 c=1
+        \\2 add a=0 b=0 c=1
+        \\3 ret a=0 b=0 c=0
+        \\4 load_undefined a=0 b=0 c=0
+        \\5 ret a=0 b=0 c=0
+        \\
+    , out.items);
+}
+
+test "disassembler snapshot: if/else branch" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try disasmSnapshot("var x = a ? 1 : 2;", &out);
+    // Just pin the branch structure (conditional lowers to jumps).
+    try testing.expect(std.mem.indexOf(u8, out.items, "jump_if_false") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "jump a=") != null);
+}
+
 test "compiles control flow and functions" {
     var p = try compileOk(
         \\function fib(n) {

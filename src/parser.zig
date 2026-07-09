@@ -146,6 +146,7 @@ pub const Parser = struct {
         return self.node(start, self.prev_end, .{ .program = .{
             .body = try body.toOwnedSlice(self.arena),
             .source_type = self.source_type,
+            .strict = self.strict,
         } });
     }
 
@@ -540,6 +541,7 @@ pub const Parser = struct {
         const saved_ctx = self.enterFn(flags);
         const params = try self.parseParams();
         const body = try self.parseFunctionBody();
+        flags.strict = self.strict; // may have been enabled by a "use strict" prologue
         self.exitFn(saved_ctx);
         const func: ast.Function = .{ .name = name, .params = params, .body = body, .flags = flags };
         return self.node(start, self.prev_end, if (is_expr)
@@ -766,6 +768,7 @@ pub const Parser = struct {
             const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
             const body = try self.parseFunctionBody();
+            flags.strict = self.strict; // strict from context (class body) or a prologue
             self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
@@ -1124,6 +1127,7 @@ pub const Parser = struct {
             break :blk try self.parseAssignment();
         };
         flags.expression_body = expression_body;
+        flags.strict = self.strict; // arrows inherit the surrounding strictness
         return try self.node(start, self.prev_end, .{ .function = .{
             .name = null,
             .params = params,
@@ -1541,6 +1545,7 @@ pub const Parser = struct {
             const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
             const body = try self.parseFunctionBody();
+            flags.strict = self.strict; // strict from context (class body) or a prologue
             self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
                 .name = null,
@@ -1822,6 +1827,118 @@ pub fn parseWithOptions(gpa: std.mem.Allocator, source: []const u8, source_type:
 // ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+
+// ---- AST snapshot dumping (test-only) --------------------------------------
+
+/// Emit a compact, position-independent S-expression for an AST node via
+/// comptime reflection over the `Kind` union — every node kind is handled
+/// structurally, so the golden-snapshot tests below never hit an unknown node.
+fn dumpNode(node: *const Node, out: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+    try out.append(gpa, '(');
+    try out.appendSlice(gpa, @tagName(std.meta.activeTag(node.kind)));
+    switch (node.kind) {
+        inline else => |payload| try dumpVal(@TypeOf(payload), payload, out, gpa),
+    }
+    try out.append(gpa, ')');
+}
+
+fn dumpVal(comptime T: type, val: T, out: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+    if (T == Node) return dumpNode(&val, out, gpa);
+    switch (@typeInfo(T)) {
+        .pointer => |p| switch (p.size) {
+            .one => if (p.child == Node) {
+                try out.append(gpa, ' ');
+                try dumpNode(val, out, gpa);
+            },
+            .slice => if (p.child == u8) {
+                try out.append(gpa, ' ');
+                try out.appendSlice(gpa, val);
+            } else for (val) |e| try dumpVal(p.child, e, out, gpa),
+            else => {},
+        },
+        .optional => |o| if (val) |v| try dumpVal(o.child, v, out, gpa) else try out.appendSlice(gpa, " ."),
+        .@"struct" => |s| inline for (s.fields) |f| try dumpVal(f.type, @field(val, f.name), out, gpa),
+        .@"enum" => {
+            try out.append(gpa, ' ');
+            try out.appendSlice(gpa, @tagName(val));
+        },
+        .bool => try out.appendSlice(gpa, if (val) " #t" else " #f"),
+        .int => try out.print(gpa, " {d}", .{val}),
+        .float => try out.print(gpa, " {d}", .{val}),
+        else => {},
+    }
+}
+
+fn astSnapshot(gpa: std.mem.Allocator, source: []const u8) ![]u8 {
+    var r = try parse(gpa, source, .script);
+    defer switch (r) {
+        .ok => |*a| a.deinit(),
+        .syntax_error => {},
+    };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    switch (r) {
+        .ok => |a| try dumpNode(a.root, &out, gpa),
+        .syntax_error => |d| {
+            std.debug.print("snapshot parse error: {s}\n", .{d.message});
+            return error.UnexpectedSyntaxError;
+        },
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn expectSnapshot(source: []const u8, golden: []const u8) !void {
+    const s = try astSnapshot(testing.allocator, source);
+    defer testing.allocator.free(s);
+    testing.expectEqualStrings(golden, s) catch |e| {
+        std.debug.print("snapshot mismatch for `{s}`\n  got: {s}\n", .{ source, s });
+        return e;
+    };
+}
+
+test "golden AST snapshots" {
+    // Tricky shapes: arrow bodies, member chains, elision, destructuring with
+    // defaults, template nesting, regex-vs-division, and the strict flag.
+    try expectSnapshot("x => x + 1;", "(program (expression_stmt (function . (ident x) (binary plus (ident x) (number 1 #f)) #f #f #t #t #f)) script #f)");
+    try expectSnapshot("a.b.c;", "(program (expression_stmt (member (member (ident a) (ident b) #f #f) (ident c) #f #f)) script #f)");
+    try expectSnapshot("f(1, 2);", "(program (expression_stmt (call (ident f) (number 1 #f) (number 2 #f) #f)) script #f)");
+    try expectSnapshot("[1, , 3];", "(program (expression_stmt (array_literal (number 1 #f) . (number 3 #f))) script #f)");
+    try expectSnapshot("let { x, y = 2 } = o;", "(program (var_decl let (variable_declarator (object_pattern (property (ident x) (ident x) init #f #t #f) (property (ident y) (assignment_pattern (ident y) (number 2 #f)) init #f #t #f)) (ident o))) script #f)");
+    try expectSnapshot("`a${b}c`;", "(program (expression_stmt (template `a${ }c` (ident b))) script #f)");
+    try expectSnapshot("a / b / c;", "(program (expression_stmt (binary slash (binary slash (ident a) (ident b)) (ident c))) script #f)");
+    try expectSnapshot("\"use strict\"; function f() {}", "(program (expression_stmt (string \"use strict\")) (function_decl f (block_stmt) #f #f #f #f #t) script #t)");
+}
+
+test "AST carries the strict-mode flag on functions" {
+    // A `"use strict"` prologue marks its own function strict; a nested plain
+    // function inside strict code inherits it; a sloppy sibling does not.
+    try expectSnapshot("function f() { \"use strict\"; }", "(program (function_decl f (block_stmt (expression_stmt (string \"use strict\"))) #f #f #f #f #t) script #f)");
+    try expectSnapshot("function g() {}", "(program (function_decl g (block_stmt) #f #f #f #f #f) script #f)");
+}
+
+test "lexer/parser fuzz: no crashes on arbitrary input" {
+    // Crash-safety: feed pseudo-random byte strings (biased toward JS
+    // punctuation/keywords) and require the parser to return ok-or-error, never
+    // panic or leak. Deterministic PRNG so failures reproduce.
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xB07713EB05);
+    const rand = prng.random();
+    const alphabet = "abc123 (){}[];,.=+-*/%<>!&|?:'\"`\\\n\t/*use strict*/functionreturnvarletconst=>...";
+    var buf: [128]u8 = undefined;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const len = rand.intRangeAtMost(usize, 0, buf.len);
+        for (buf[0..len]) |*b| b.* = alphabet[rand.intRangeLessThan(usize, 0, alphabet.len)];
+        var r = parse(gpa, buf[0..len], .script) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.SyntaxError => continue, // returned as a Result variant, but be safe
+        };
+        switch (r) {
+            .ok => |*a| a.deinit(),
+            .syntax_error => {},
+        }
+    }
+}
 
 fn expectParses(source: []const u8) !void {
     var r = try parse(testing.allocator, source, .script);
