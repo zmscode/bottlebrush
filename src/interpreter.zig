@@ -1026,7 +1026,11 @@ pub const Vm = struct {
         const o = v.asObject();
         if (o.callable == null and o.proxy_target == null) return;
         if (o.properties.getPtr("name")) |desc| {
-            if (desc.value.isString() and desc.value.asString().units.len != 0) return; // already named
+            // Only the default empty-string name is replaceable. A non-empty
+            // string (already named) or a non-string own `name` — e.g. a class
+            // with `static name() {}` — must not be overwritten.
+            if (desc.is_accessor) return;
+            if (!desc.value.isString() or desc.value.asString().units.len != 0) return;
         }
         try self.defineData(o, "name", try self.makeString(name), false, false, true);
     }
@@ -1240,13 +1244,53 @@ pub const Vm = struct {
             mapArguments(args_obj.?.asObject(), code, env, args.len);
         }
         try self.buildRestParam(code, env, args);
-        // From here on: only gpa allocations (no GC), so env/regs/state stay live.
         const regs = try self.gpa.alloc(Value, code.num_registers);
+        errdefer self.gpa.free(regs);
         @memset(regs, Value.undefined_value);
+
+        // Parameters (defaults + destructuring) are evaluated eagerly at
+        // creation — so an unresolvable reference, a throwing initializer, or
+        // destructuring null surfaces here, not on the first `next()`. A
+        // temporary frame roots env/regs while the prologue runs (it can GC).
+        var start_pc: u32 = 0;
+        if (code.param_prologue_end > 0) {
+            var frame = Frame{ .code = code, .env = env, .regs = regs, .this_value = this_value, .pc = 0 };
+            try self.frames.append(self.gpa, &frame);
+            defer _ = self.frames.pop();
+            try self.runUntil(&frame, code.param_prologue_end);
+            start_pc = code.param_prologue_end;
+        }
+
         const state = try self.gpa.create(gc.GeneratorState);
-        state.* = .{ .code = code, .env = env, .regs = regs, .this_value = this_value };
+        state.* = .{ .code = code, .env = env, .regs = regs, .this_value = this_value, .pc = start_pc };
         obj.generator = state;
         return Value.fromObject(obj);
+    }
+
+    /// Run `frame` until its pc reaches `end` (used for a generator's eager
+    /// parameter prologue). Honors catch handlers within the range; a throw
+    /// with no local handler propagates to the caller.
+    fn runUntil(self: *Vm, frame: *Frame, end: u32) Error!void {
+        const code = frame.code;
+        while (frame.pc < end) {
+            try self.checkBudget();
+            const inst = code.code[frame.pc];
+            const step = self.exec(code, frame.env, frame.regs, frame.this_value, inst, &frame.pc) catch |e| {
+                if (e != error.JsThrow) return e;
+                if (self.findHandler(code, frame.pc)) |h| {
+                    frame.regs[h.catch_reg] = self.pending_exception.?;
+                    self.pending_exception = null;
+                    frame.pc = h.target_pc;
+                    continue;
+                }
+                return error.JsThrow;
+            };
+            switch (step) {
+                .advance => frame.pc += 1,
+                .jumped => {},
+                .returned, .yielded => return,
+            }
+        }
     }
 
     /// Resume a generator. mode: 0=next(v), 1=return(v), 2=throw(v). Returns an

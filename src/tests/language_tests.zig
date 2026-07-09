@@ -948,6 +948,18 @@ test "generators: yield, next/return/throw, for-of, yield*, methods" {
         \\class C { *gen() { yield 3; yield 4; } }
         \\return ([...o.gen()].join(",")==="1,2" && [...new C().gen()].join(",")==="3,4") ? 1 : 0;
     ));
+    // Parameters (defaults + destructuring) evaluate at generator *creation*,
+    // not on the first next(): a bad default throws immediately.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function* g({ x }) {}
+        \\try { g(undefined); return 0; } catch (e) { return e instanceof TypeError ? 1 : 2; }
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var log = "";
+        \\function* g(a = (log += "D", 5)) { yield a; }
+        \\var it = g();      // default runs now, before any next()
+        \\return log === "D" ? 1 : 0;
+    ));
     // `yield*` without an operand is a SyntaxError (regression: used to crash).
     const parser = @import("bottlebrush").parser;
     var r = try parser.parse(std.testing.allocator, "function* g() { yield* ; }", .script);

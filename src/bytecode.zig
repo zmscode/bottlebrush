@@ -187,6 +187,10 @@ pub const CodeBlock = struct {
     /// from index `rest_from` onward. null when there is no rest parameter.
     rest_slot: ?u32 = null,
     rest_from: u32 = 0,
+    /// pc just past the parameter-init prologue (defaults + destructuring). A
+    /// generator evaluates its parameters eagerly at creation and starts the
+    /// body proper here (0 means no prologue).
+    param_prologue_end: u32 = 0,
     /// Private names in lexical scope here, for direct `eval` to resolve.
     private_env: []const PrivateBinding = &.{},
     code: []Inst = &.{},

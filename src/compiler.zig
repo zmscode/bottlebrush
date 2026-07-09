@@ -61,6 +61,9 @@ const FnState = struct {
     arguments_slot: ?u32 = null,
     rest_slot: ?u32 = null,
     rest_from: u32 = 0,
+    /// pc just past the parameter-init prologue (defaults + destructuring), so a
+    /// generator can evaluate its parameters eagerly at creation.
+    param_prologue_end: u32 = 0,
     /// Derived-class constructor: instance fields and private methods install
     /// only after `super(...)` returns (not at frame entry), so `this` isn't
     /// touched before initialization. Empty for base constructors (which
@@ -411,6 +414,10 @@ pub const Compiler = struct {
                 self.freeTo(v);
             }
         }
+        // End of the parameter-initialization prologue (default + destructuring
+        // evaluation). A generator runs this eagerly at creation, per spec, then
+        // suspends the body from here.
+        fs.param_prologue_end = self.here();
 
         // Ordinary (non-arrow) functions get an implicit `arguments` binding,
         // materialized at run time. Skip the top-level script (parent == null)
@@ -494,6 +501,7 @@ pub const Compiler = struct {
             .arguments_slot = fs.arguments_slot,
             .rest_slot = fs.rest_slot,
             .rest_from = fs.rest_from,
+            .param_prologue_end = fs.param_prologue_end,
             .private_env = fs.private_env,
             .code = try self.arena.dupe(Inst, fs.code.items),
             .constants = try self.dupeConstants(fs.constants.items),
