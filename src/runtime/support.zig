@@ -169,12 +169,12 @@ pub fn isCallable(v: Value) bool {
 }
 
 /// IsConstructor: true iff `v` is a callable object that implements
-/// [[Construct]]. A proxy defers to its target/handler, so treat it as a
-/// constructor here and let `constructValue` validate.
+/// [[Construct]]. A proxy is a constructor iff its target is; a bound function
+/// iff its target is.
 pub fn isConstructorValue(v: Value) bool {
     if (!v.isObject()) return false;
     const obj = v.asObject();
-    if (obj.proxy_target != null) return true;
+    if (obj.proxy_target) |t| return isConstructorValue(Value.fromObject(t));
     if (obj.bound_target) |bt| return isConstructorValue(bt);
     const clo = obj.callable orelse return false;
     return clo.constructor;
@@ -287,29 +287,124 @@ pub fn orderedOwnKeys(vm: *Vm, obj: *gc.Object, enumerable_only: bool, out: *std
     }
 }
 
-/// The proxy `ownKeys` trap result (string keys), or false to forward.
-fn proxyOwnKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!bool {
+/// A property-map key that encodes a Symbol (`\x00S<ptr>`), as opposed to an
+/// internal slot (`\x00prim`, `\x00re…`, private `\x00P…`) or a string key.
+fn isSymbolKey(k: []const u8) bool {
+    return k.len >= 2 and k[0] == 0 and k[1] == 'S';
+}
+
+fn keyIndexIn(items: []const []const u8, used: []const bool, k: []const u8) ?usize {
+    for (items, 0..) |it, i| {
+        if (!used[i] and std.mem.eql(u8, it, k)) return i;
+    }
+    return null;
+}
+
+/// Collect `target`'s own keys (strings and symbols, encoded) split by
+/// configurability — the raw material for the proxy `ownKeys` invariants.
+fn targetOwnKeysSplit(vm: *Vm, target: *gc.Object, config: *std.ArrayList([]const u8), nonconfig: *std.ArrayList([]const u8)) Error!void {
+    if (target.is_array) {
+        var ints: std.ArrayList(u32) = .empty;
+        defer ints.deinit(vm.gpa);
+        try vm.arrayPresentIndices(target, &ints);
+        for (ints.items) |i| {
+            var b: [16]u8 = undefined;
+            try config.append(vm.gpa, try vm.gpa.dupe(u8, std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable));
+        }
+        try nonconfig.append(vm.gpa, try vm.gpa.dupe(u8, "length"));
+    }
+    var it = target.properties.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (k.len > 0 and k[0] == 0 and !isSymbolKey(k)) continue; // internal slot
+        const dst = if (entry.value_ptr.configurable) config else nonconfig;
+        try dst.append(vm.gpa, try vm.gpa.dupe(u8, k));
+    }
+}
+
+/// The proxy `ownKeys` trap result, or false when `obj` is not a proxy.
+/// Runs CreateListFromArrayLike validation, duplicate detection, and the
+/// non-configurable / non-extensible invariants (spec 10.5.11). Only string
+/// keys are appended to `out` (symbol keys are validated but not yet emitted).
+fn proxyOwnKeys(vm: *Vm, obj: *gc.Object, enumerable_only: bool, out: *std.ArrayList([]const u8)) Error!bool {
     const target = obj.proxy_target orelse return false;
     if (obj.proxy_revoked) return vm.throwTypeError("cannot perform operation on a revoked proxy");
     const handler = obj.proxy_handler.?;
     const trap = try vm.getProperty(Value.fromObject(handler), "ownKeys");
-    if (!isCallable(trap)) return false;
-    const r = try vm.callValue(trap, Value.fromObject(handler), &.{Value.fromObject(target)});
-    if (!r.isObject() or !r.asObject().is_array) {
-        return vm.throwTypeError("proxy ownKeys must return an array");
+    if (trap.isNullish()) {
+        // Forward [[OwnPropertyKeys]] to the target (may be a nested proxy).
+        if (enumerable_only) try ownEnumerableKeys(vm, target, out) else try ownPropertyNames(vm, target, out);
+        return true;
     }
-    const arr = r.asObject();
-    var i: u32 = 0;
-    while (i < arr.array_length) : (i += 1) {
-        const kv = Vm.arrayGetOwn(arr, i) orelse continue;
-        if (kv.isString()) try out.append(vm.gpa, try utf16ToUtf8Alloc(vm.gpa, kv.asString().units));
+    if (!isCallable(trap)) return vm.throwTypeError("proxy ownKeys trap is not callable");
+    const r = try vm.callValue(trap, Value.fromObject(handler), &.{Value.fromObject(target)});
+    if (!r.isObject()) return vm.throwTypeError("proxy ownKeys must return an object");
+
+    // CreateListFromArrayLike(r, «String, Symbol»): reject other element types
+    // and duplicate keys. `trap_keys` holds encoded keys.
+    var trap_keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (trap_keys.items) |k| vm.gpa.free(k);
+        trap_keys.deinit(vm.gpa);
+    }
+    const len = try lengthOfArrayLike(vm, r);
+    var i: u64 = 0;
+    while (i < len) : (i += 1) {
+        var b: [24]u8 = undefined;
+        const el = try vm.getProperty(r, std.fmt.bufPrint(&b, "{d}", .{i}) catch unreachable);
+        if (!el.isString() and !el.isSymbol()) return vm.throwTypeError("proxy ownKeys entries must be strings or symbols");
+        const enc = try vm.toPropertyKey(el);
+        for (trap_keys.items) |ex| {
+            if (std.mem.eql(u8, ex, enc)) {
+                vm.gpa.free(enc);
+                return vm.throwTypeError("proxy ownKeys returned duplicate keys");
+            }
+        }
+        try trap_keys.append(vm.gpa, enc);
+    }
+
+    // Invariants (spec 10.5.11 steps 16-27).
+    var config: std.ArrayList([]const u8) = .empty;
+    var nonconfig: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (config.items) |k| vm.gpa.free(k);
+        config.deinit(vm.gpa);
+        for (nonconfig.items) |k| vm.gpa.free(k);
+        nonconfig.deinit(vm.gpa);
+    }
+    try targetOwnKeysSplit(vm, target, &config, &nonconfig);
+    const extensible = target.extensible;
+    if (!(extensible and nonconfig.items.len == 0)) {
+        const used = try vm.gpa.alloc(bool, trap_keys.items.len);
+        defer vm.gpa.free(used);
+        @memset(used, false);
+        for (nonconfig.items) |k| {
+            const idx = keyIndexIn(trap_keys.items, used, k) orelse
+                return vm.throwTypeError("proxy ownKeys must include every non-configurable key of the target");
+            used[idx] = true;
+        }
+        if (!extensible) {
+            for (config.items) |k| {
+                const idx = keyIndexIn(trap_keys.items, used, k) orelse
+                    return vm.throwTypeError("proxy ownKeys must include every key of a non-extensible target");
+                used[idx] = true;
+            }
+            for (used) |u| if (!u) return vm.throwTypeError("proxy ownKeys must not add keys to a non-extensible target");
+        }
+    }
+
+    // Emit string keys only for now (symbol emission needs the wider ownKeys
+    // rework that threads real Symbol values through enumeration).
+    for (trap_keys.items) |k| {
+        if (k.len > 0 and k[0] == 0) continue;
+        try out.append(vm.gpa, try vm.gpa.dupe(u8, k));
     }
     return true;
 }
 
 /// Own enumerable string keys in spec order (Object.keys/values/entries).
 pub fn ownEnumerableKeys(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
-    if (try proxyOwnKeys(vm, obj, out)) return;
+    if (try proxyOwnKeys(vm, obj, true, out)) return;
     return orderedOwnKeys(vm, obj, true, out);
 }
 
@@ -338,7 +433,7 @@ pub fn primitiveOwnKeysResult(vm: *Vm, v: Value, include_length: bool) Error!?Va
 /// All own string-keyed property names (enumerable and not), skipping symbol
 /// and internal-slot keys. Array indices and `length` are included for arrays.
 pub fn ownPropertyNames(vm: *Vm, obj: *gc.Object, out: *std.ArrayList([]const u8)) Error!void {
-    if (try proxyOwnKeys(vm, obj, out)) return;
+    if (try proxyOwnKeys(vm, obj, false, out)) return;
     try orderedOwnKeys(vm, obj, false, out);
     if (obj.is_array) try out.append(vm.gpa, try vm.gpa.dupe(u8, "length"));
 }

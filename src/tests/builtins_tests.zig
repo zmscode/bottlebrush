@@ -413,6 +413,50 @@ test "Proxy" {
         \\var p = new Proxy(base, { apply: function (t, thisArg, args) { return args[0] * 2; } });
         \\return p(10);
     ));
+    // A falsy `set` trap result reports failure through Reflect.set.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var p = new Proxy({}, { set: function () { return 0; } });
+        \\return Reflect.set(p, 'x', 1) === false ? 1 : 0;
+    ));
+    // A non-callable trap is a TypeError.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var p = new Proxy({}, { get: 5 });
+        \\try { p.x; return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // ownKeys must return the target's non-configurable keys.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var t = {}; Object.defineProperty(t, 'a', { value: 1, configurable: false });
+        \\var p = new Proxy(t, { ownKeys: function () { return []; } });
+        \\try { Object.keys(p); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // ownKeys entries must be strings or symbols.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var p = new Proxy({}, { ownKeys: function () { return [1]; } });
+        \\try { Object.keys(p); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // A construct trap must return an object.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function C() {}
+        \\var p = new Proxy(C, { construct: function () { return 5; } });
+        \\try { new p(); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
+    // A proxy over a non-constructor is not a constructor.
+    try testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var p = new Proxy(function(){}.bind(null), {});
+        \\return (new Proxy(() => {}, {}), 1);
+    ));
+    // A missing trap forwards through a nested proxy target.
+    try testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\var inner = new Proxy({ v: 7 }, {});
+        \\var outer = new Proxy(inner, {});
+        \\return outer.v;
+    ));
+    // A proxy in the prototype chain runs its get trap with the receiver.
+    try testing.expectEqual(@as(f64, 42), try evalNumber(
+        \\var p = new Proxy({}, { get: function () { return 42; } });
+        \\var o = Object.create(p);
+        \\return o.anything;
+    ));
 }
 
 test "Reflect" {

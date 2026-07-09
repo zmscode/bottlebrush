@@ -142,6 +142,56 @@ fn proxyTrap(vm: *Vm, handler: *gc.Object, name: []const u8) Error!?Value {
     return null;
 }
 
+/// The target's own property descriptor for `key`, or null when absent.
+/// Covers ordinary map properties plus array index/length exotics.
+fn targetOwnDesc(o: *gc.Object, key: []const u8) ?gc.PropertyDescriptor {
+    if (o.is_array) {
+        if (std.mem.eql(u8, key, "length"))
+            return .{ .value = Value.undefined_value, .writable = true, .enumerable = false, .configurable = false };
+        if (support_mod.arrayIndex(key)) |i| {
+            if (Vm.arrayGetOwn(o, i)) |v|
+                return .{ .value = v, .writable = true, .enumerable = true, .configurable = true };
+        }
+    }
+    return o.properties.get(key);
+}
+
+/// [[IsExtensible]] of a proxy target, honoring a nested proxy's trap.
+fn targetExtensible(vm: *Vm, o: *gc.Object) Error!bool {
+    const r = try nativeObjectIsExtensible(@ptrCast(vm), Value.undefined_value, &.{Value.fromObject(o)});
+    return toBoolean(r);
+}
+
+/// IsCompatiblePropertyDescriptor(extensible, Desc, current): whether applying
+/// the partial descriptor `desc_v` over `current` is permitted. `current` null
+/// means the property is absent.
+fn isCompatibleDesc(vm: *Vm, extensible: bool, desc_v: Value, current: ?gc.PropertyDescriptor) Error!bool {
+    const cur = current orelse return extensible;
+    if (cur.configurable) return true;
+    const d = desc_v.asObject();
+    const has_conf = vm.hasProperty(d, "configurable");
+    const has_enum = vm.hasProperty(d, "enumerable");
+    const has_value = vm.hasProperty(d, "value");
+    const has_writable = vm.hasProperty(d, "writable");
+    const has_get = vm.hasProperty(d, "get");
+    const has_set = vm.hasProperty(d, "set");
+    if (has_conf and toBoolean(try vm.getProperty(desc_v, "configurable"))) return false;
+    if (has_enum and toBoolean(try vm.getProperty(desc_v, "enumerable")) != cur.enumerable) return false;
+    const desc_is_accessor = has_get or has_set;
+    const desc_is_data = has_value or has_writable;
+    if (desc_is_accessor or desc_is_data) {
+        if (desc_is_accessor != cur.is_accessor) return false;
+    }
+    if (cur.is_accessor) {
+        if (has_get and !sameValue(try vm.getProperty(desc_v, "get"), cur.get orelse Value.undefined_value)) return false;
+        if (has_set and !sameValue(try vm.getProperty(desc_v, "set"), cur.set orelse Value.undefined_value)) return false;
+    } else if (!cur.writable) {
+        if (has_writable and toBoolean(try vm.getProperty(desc_v, "writable"))) return false;
+        if (has_value and !sameValue(try vm.getProperty(desc_v, "value"), cur.value)) return false;
+    }
+    return true;
+}
+
 pub fn nativeObjectGetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
     const vm = castVm(ctx);
     _ = this;
@@ -151,6 +201,12 @@ pub fn nativeObjectGetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Va
         if (try proxyTrap(vm, p.handler, "getPrototypeOf")) |trap| {
             const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{Value.fromObject(p.target)});
             if (!r.isObject() and !r.isNull()) return vm.throwTypeError("proxy getPrototypeOf must return an object or null");
+            // Invariant: for a non-extensible target, the reported prototype
+            // must equal the target's actual prototype.
+            if (!try targetExtensible(vm, p.target)) {
+                const tp = try nativeObjectGetPrototypeOf(ctx, Value.undefined_value, &.{Value.fromObject(p.target)});
+                if (!sameValue(r, tp)) return vm.throwTypeError("proxy getPrototypeOf must match a non-extensible target's prototype");
+            }
             return r;
         }
         return nativeObjectGetPrototypeOf(ctx, Value.undefined_value, &.{Value.fromObject(p.target)});
@@ -168,17 +224,37 @@ pub fn nativeObjectCreate(ctx: *anyopaque, this: Value, args: []const Value) Err
 
 /// Parse a JS property-descriptor object and define `key` on `obj` with it
 /// (shared by Object.defineProperty / Object.defineProperties).
-pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value) Error!void {
+/// [[DefineOwnProperty]] for `key` on `obj` from a descriptor object.
+/// Returns false on an ordinary rejection (the caller decides throw-vs-report);
+/// a thrown error is a hard error (malformed descriptor, proxy invariant).
+pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value) Error!bool {
     if (!desc_v.isObject()) return vm.throwTypeError("property descriptor must be an object");
-    // Proxy: dispatch to the defineProperty trap (falsy result throws).
+    // Proxy: dispatch to the defineProperty trap.
     if (try proxyParts(vm, obj)) |p| {
         if (try proxyTrap(vm, p.handler, "defineProperty")) |trap| {
             const ks = try vm.makeString(key);
             try vm.protect(ks);
             defer vm.unprotect();
             const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{ Value.fromObject(p.target), ks, desc_v });
-            if (!toBoolean(r)) return vm.throwTypeError("proxy defineProperty trap returned falsy");
-            return;
+            if (!toBoolean(r)) return false;
+            // Invariants (spec 10.5.6, steps 9-13).
+            const td = targetOwnDesc(p.target, key);
+            const ext = try targetExtensible(vm, p.target);
+            const setting_config_false = vm.hasProperty(desc_v.asObject(), "configurable") and
+                !toBoolean(try vm.getProperty(desc_v, "configurable"));
+            if (td == null) {
+                if (!ext) return vm.throwTypeError("proxy defineProperty cannot add a property to a non-extensible target");
+                if (setting_config_false) return vm.throwTypeError("proxy defineProperty cannot report an added property as non-configurable when absent from the target");
+            } else {
+                if (!try isCompatibleDesc(vm, ext, desc_v, td))
+                    return vm.throwTypeError("proxy defineProperty result is incompatible with the target's non-configurable property");
+                if (setting_config_false and td.?.configurable)
+                    return vm.throwTypeError("proxy defineProperty cannot report a configurable property as non-configurable");
+                if (!td.?.is_accessor and !td.?.configurable and td.?.writable and
+                    vm.hasProperty(desc_v.asObject(), "writable") and !toBoolean(try vm.getProperty(desc_v, "writable")))
+                    return vm.throwTypeError("proxy defineProperty cannot report a non-configurable writable property as non-writable");
+            }
+            return true;
         }
         return applyDescriptor(vm, p.target, key, desc_v);
     }
@@ -223,26 +299,20 @@ pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value)
     const accessor_req = has_get or has_set;
 
     if (obj.properties.getPtr(key)) |ex| {
-        // ValidateAndApplyPropertyDescriptor over an existing property.
+        // ValidateAndApplyPropertyDescriptor over an existing property. A
+        // rejected change is an ordinary failure (false), not a hard throw.
         if (!ex.configurable) {
-            if (has_configurable and v_configurable)
-                return vm.throwTypeError("cannot redefine non-configurable property");
-            if (has_enumerable and v_enumerable != ex.enumerable)
-                return vm.throwTypeError("cannot change enumerability of non-configurable property");
-            if ((accessor_req and !ex.is_accessor) or ((has_value or has_writable) and ex.is_accessor))
-                return vm.throwTypeError("cannot change the kind of a non-configurable property");
+            if (has_configurable and v_configurable) return false;
+            if (has_enumerable and v_enumerable != ex.enumerable) return false;
+            if ((accessor_req and !ex.is_accessor) or ((has_value or has_writable) and ex.is_accessor)) return false;
             if (ex.is_accessor) {
                 const ex_get = ex.get orelse Value.undefined_value;
                 const ex_set = ex.set orelse Value.undefined_value;
-                if (has_get and !sameValue(v_get, ex_get))
-                    return vm.throwTypeError("cannot redefine getter of non-configurable property");
-                if (has_set and !sameValue(v_set, ex_set))
-                    return vm.throwTypeError("cannot redefine setter of non-configurable property");
+                if (has_get and !sameValue(v_get, ex_get)) return false;
+                if (has_set and !sameValue(v_set, ex_set)) return false;
             } else if (!ex.writable) {
-                if (has_writable and v_writable)
-                    return vm.throwTypeError("cannot make non-configurable read-only property writable");
-                if (has_value and !sameValue(v_value, ex.value))
-                    return vm.throwTypeError("cannot change value of non-configurable read-only property");
+                if (has_writable and v_writable) return false;
+                if (has_value and !sameValue(v_value, ex.value)) return false;
             }
         }
         // Apply: convert kinds first, then merge only the present fields.
@@ -265,11 +335,11 @@ pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value)
         if (has_set) ex.set = if (v_set.isUndefined()) null else v_set;
         if (has_enumerable) ex.enumerable = v_enumerable;
         if (has_configurable) ex.configurable = v_configurable;
-        return;
+        return true;
     }
 
     // New property: absent fields default to false/undefined.
-    if (!obj.extensible) return vm.throwTypeError("cannot define property on non-extensible object");
+    if (!obj.extensible) return false;
     var desc = gc.PropertyDescriptor{
         .enumerable = v_enumerable,
         .writable = v_writable,
@@ -285,6 +355,7 @@ pub fn applyDescriptor(vm: *Vm, obj: *gc.Object, key: []const u8, desc_v: Value)
     const gop = try obj.properties.getOrPut(vm.gpa, key);
     if (!gop.found_existing) gop.key_ptr.* = try vm.gpa.dupe(u8, key);
     gop.value_ptr.* = desc;
+    return true;
 }
 
 pub fn nativeObjectDefineProperty(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -294,7 +365,8 @@ pub fn nativeObjectDefineProperty(ctx: *anyopaque, this: Value, args: []const Va
     if (!obj_v.isObject()) return vm.throwTypeError("Object.defineProperty called on non-object");
     const key = try vm.toPropertyKey(argAt(args, 1));
     defer vm.gpa.free(key);
-    try applyDescriptor(vm, obj_v.asObject(), key, argAt(args, 2));
+    if (!try applyDescriptor(vm, obj_v.asObject(), key, argAt(args, 2)))
+        return vm.throwTypeError("cannot define property");
     return obj_v;
 }
 
@@ -312,7 +384,8 @@ pub fn nativeObjectDefineProperties(ctx: *anyopaque, this: Value, args: []const 
     }
     try ownEnumerableKeys(vm, props_v.asObject(), &keys);
     for (keys.items) |k| {
-        try applyDescriptor(vm, obj_v.asObject(), k, try vm.getProperty(props_v, k));
+        if (!try applyDescriptor(vm, obj_v.asObject(), k, try vm.getProperty(props_v, k)))
+            return vm.throwTypeError("cannot define property");
     }
     return obj_v;
 }
@@ -326,10 +399,13 @@ pub fn nativeObjectPreventExtensions(ctx: *anyopaque, this: Value, args: []const
             if (try proxyTrap(vm, p.handler, "preventExtensions")) |trap| {
                 const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{Value.fromObject(p.target)});
                 if (!toBoolean(r)) return vm.throwTypeError("proxy preventExtensions trap returned falsy");
+                // Invariant: a truthy result requires the target to now be
+                // non-extensible.
+                if (try targetExtensible(vm, p.target))
+                    return vm.throwTypeError("proxy preventExtensions cannot report success while the target is still extensible");
                 return v;
             }
-            p.target.extensible = false;
-            return v;
+            return nativeObjectPreventExtensions(ctx, Value.undefined_value, &.{Value.fromObject(p.target)});
         }
         v.asObject().extensible = false;
     }
@@ -345,13 +421,13 @@ pub fn nativeObjectIsExtensible(ctx: *anyopaque, this: Value, args: []const Valu
             if (try proxyTrap(vm, p.handler, "isExtensible")) |trap| {
                 const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{Value.fromObject(p.target)});
                 const answer = toBoolean(r);
-                // Invariant: must agree with the target.
-                if (answer != p.target.extensible) {
+                // Invariant: must agree with the target's extensibility.
+                if (answer != try targetExtensible(vm, p.target)) {
                     return vm.throwTypeError("proxy isExtensible must match the target's extensibility");
                 }
                 return Value.fromBool(answer);
             }
-            return Value.fromBool(p.target.extensible);
+            return Value.fromBool(try targetExtensible(vm, p.target));
         }
     }
     return Value.fromBool(v.isObject() and v.asObject().extensible);
@@ -447,6 +523,39 @@ pub fn nativeObjectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: 
             const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{ Value.fromObject(p.target), ks });
             if (!r.isObject() and !r.isUndefined()) {
                 return vm.throwTypeError("proxy getOwnPropertyDescriptor must return an object or undefined");
+            }
+            const target_desc = targetOwnDesc(p.target, key);
+            if (r.isUndefined()) {
+                // A non-configurable target property, or any property of a
+                // non-extensible target, may not be reported absent.
+                if (target_desc) |td| {
+                    if (!td.configurable)
+                        return vm.throwTypeError("proxy getOwnPropertyDescriptor cannot report a non-configurable property as absent");
+                    if (!try targetExtensible(vm, p.target))
+                        return vm.throwTypeError("proxy getOwnPropertyDescriptor cannot report a property of a non-extensible target as absent");
+                }
+                return Value.undefined_value;
+            }
+            // ToPropertyDescriptor validity: not both data and accessor.
+            const d = r.asObject();
+            const has_value = vm.hasProperty(d, "value");
+            const has_writable = vm.hasProperty(d, "writable");
+            const v_get = try vm.getProperty(r, "get");
+            const v_set = try vm.getProperty(r, "set");
+            const has_get = vm.hasProperty(d, "get");
+            const has_set = vm.hasProperty(d, "set");
+            if ((has_value or has_writable) and (has_get or has_set))
+                return vm.throwTypeError("property descriptor cannot be both a data and an accessor descriptor");
+            if (has_get and !v_get.isUndefined() and !isCallable(v_get)) return vm.throwTypeError("getter must be a function");
+            if (has_set and !v_set.isUndefined() and !isCallable(v_set)) return vm.throwTypeError("setter must be a function");
+            const res_conf = toBoolean(try vm.getProperty(r, "configurable"));
+            const res_is_accessor = has_get or has_set;
+            const res_writable = toBoolean(try vm.getProperty(r, "writable"));
+            if (!res_conf) {
+                if (target_desc == null or target_desc.?.configurable)
+                    return vm.throwTypeError("proxy getOwnPropertyDescriptor cannot report a non-existent or configurable property as non-configurable");
+                if (!res_is_accessor and !res_writable and !target_desc.?.is_accessor and target_desc.?.writable)
+                    return vm.throwTypeError("proxy getOwnPropertyDescriptor cannot report a writable property as non-configurable, non-writable");
             }
             return r;
         }
@@ -601,26 +710,38 @@ pub fn nativeObjectToLocaleString(ctx: *anyopaque, this: Value, args: []const Va
     return vm.callValue(m, this, &.{});
 }
 
-/// OrdinarySetPrototypeOf with the spec's cycle check.
-pub fn setPrototypeChecked(vm: *Vm, obj: *gc.Object, proto_v: Value) Error!void {
+/// [[SetPrototypeOf]]: returns false on an ordinary rejection (non-extensible
+/// with a different prototype, or a cycle); a thrown error is a hard error
+/// (proxy invariant, trap not callable, abrupt trap).
+pub fn setPrototypeChecked(vm: *Vm, obj: *gc.Object, proto_v: Value) Error!bool {
     const new_proto: ?*gc.Object = if (proto_v.isNull()) null else if (proto_v.isObject()) proto_v.asObject() else return vm.throwTypeError("prototype must be an object or null");
-    // Proxy: dispatch to the setPrototypeOf trap (falsy result throws).
+    // Proxy: dispatch to the setPrototypeOf trap.
     if (try proxyParts(vm, obj)) |p| {
         if (try proxyTrap(vm, p.handler, "setPrototypeOf")) |trap| {
             const r = try vm.callValue(trap, Value.fromObject(p.handler), &.{ Value.fromObject(p.target), proto_v });
-            if (!toBoolean(r)) return vm.throwTypeError("proxy setPrototypeOf trap returned falsy");
-            return;
+            if (!toBoolean(r)) return false;
+            // Invariant: a non-extensible target's prototype is immutable, so
+            // the reported new prototype must equal the target's actual one.
+            if (!try targetExtensible(vm, p.target)) {
+                const tp = try nativeObjectGetPrototypeOf(@ptrCast(vm), Value.undefined_value, &.{Value.fromObject(p.target)});
+                if (!sameValue(proto_v, tp)) return vm.throwTypeError("proxy setPrototypeOf cannot change a non-extensible target's prototype");
+            }
+            return true;
         }
         return setPrototypeChecked(vm, p.target, proto_v);
     }
-    if (!obj.extensible) return vm.throwTypeError("cannot set prototype of a non-extensible object");
-    // Reject prototype cycles.
+    // OrdinarySetPrototypeOf.
+    if (obj.prototype == new_proto) return true; // no-op even if non-extensible
+    if (!obj.extensible) return false;
+    // Reject prototype cycles (stop at a proxy, which can't be walked statically).
     var p = new_proto;
     while (p) |cur| {
-        if (cur == obj) return vm.throwTypeError("cyclic prototype chain");
+        if (cur == obj) return false;
+        if (cur.proxy_target != null) break;
         p = cur.prototype;
     }
     obj.prototype = new_proto;
+    return true;
 }
 
 pub fn nativeObjectSetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -629,7 +750,8 @@ pub fn nativeObjectSetPrototypeOf(ctx: *anyopaque, this: Value, args: []const Va
     const target = argAt(args, 0);
     if (target.isNullish()) return vm.throwTypeError("Object.setPrototypeOf called on null or undefined");
     if (!target.isObject()) return target; // primitives pass through
-    try setPrototypeChecked(vm, target.asObject(), argAt(args, 1));
+    if (!try setPrototypeChecked(vm, target.asObject(), argAt(args, 1)))
+        return vm.throwTypeError("cannot set prototype");
     return target;
 }
 
@@ -652,7 +774,8 @@ pub fn nativeProtoSetter(ctx: *anyopaque, this: Value, args: []const Value) Erro
     if (!this.isObject()) return Value.undefined_value; // primitives: no-op
     const v = argAt(args, 0);
     if (!v.isNull() and !v.isObject()) return Value.undefined_value; // non-object values ignored
-    try setPrototypeChecked(vm, this.asObject(), v);
+    if (!try setPrototypeChecked(vm, this.asObject(), v))
+        return vm.throwTypeError("cannot set prototype");
     return Value.undefined_value;
 }
 

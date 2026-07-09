@@ -173,8 +173,7 @@ pub fn nativeReflectSet(ctx: *anyopaque, this: Value, args: []const Value) Error
     if (!target.isObject()) return vm.throwTypeError("Reflect.set called on non-object");
     const key = try vm.toPropertyKey(argAt(args, 1));
     defer vm.gpa.free(key);
-    try vm.setProperty(target, key, argAt(args, 2));
-    return Value.fromBool(true);
+    return Value.fromBool(try vm.setPropertyReport(target, key, argAt(args, 2)));
 }
 
 pub fn nativeReflectHas(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -213,6 +212,17 @@ pub fn nativeReflectOwnKeys(ctx: *anyopaque, this: Value, args: []const Value) E
     const result = try vm.newArray(0);
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
+    // Proxy: run the validated [[OwnPropertyKeys]] (string keys only for now).
+    if (o.proxy_target != null) {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (keys.items) |k| vm.gpa.free(k);
+            keys.deinit(vm.gpa);
+        }
+        try support_mod.ownPropertyNames(vm, o, &keys);
+        for (keys.items) |k| try vm.arrayAppend(result, try vm.makeString(k));
+        return Value.fromObject(result);
+    }
     if (o.is_array) {
         var idxs: std.ArrayList(u32) = .empty;
         defer idxs.deinit(vm.gpa);
@@ -270,15 +280,9 @@ pub fn nativeReflectDefineProperty(ctx: *anyopaque, this: Value, args: []const V
     if (!desc.isObject()) return vm.throwTypeError("property descriptor must be an object");
     const key = try vm.toPropertyKey(argAt(args, 1));
     defer vm.gpa.free(key);
-    object_mod.applyDescriptor(vm, target.asObject(), key, desc) catch |e| switch (e) {
-        error.JsThrow => {
-            // A rejected define surfaces as `false`, not a throw.
-            vm.pending_exception = null;
-            return Value.fromBool(false);
-        },
-        else => return e,
-    };
-    return Value.fromBool(true);
+    // An ordinary rejection reports false; a hard error (malformed descriptor,
+    // proxy invariant violation) still propagates.
+    return Value.fromBool(try object_mod.applyDescriptor(vm, target.asObject(), key, desc));
 }
 
 pub fn nativeReflectGetOwnPropertyDescriptor(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
@@ -295,14 +299,7 @@ pub fn nativeReflectSetProto(ctx: *anyopaque, this: Value, args: []const Value) 
     if (!target.isObject()) return vm.throwTypeError("Reflect.setPrototypeOf called on non-object");
     const proto = argAt(args, 1);
     if (!proto.isObject() and !proto.isNull()) return vm.throwTypeError("prototype must be an object or null");
-    object_mod.setPrototypeChecked(vm, target.asObject(), proto) catch |e| switch (e) {
-        error.JsThrow => {
-            vm.pending_exception = null;
-            return Value.fromBool(false);
-        },
-        else => return e,
-    };
-    return Value.fromBool(true);
+    return Value.fromBool(try object_mod.setPrototypeChecked(vm, target.asObject(), proto));
 }
 
 pub fn nativeReflectIsExtensible(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {

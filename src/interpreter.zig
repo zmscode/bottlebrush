@@ -868,12 +868,11 @@ pub const Vm = struct {
             if (callee.asObject().proxy_target) |target| {
                 if (callee.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
                 const handler = callee.asObject().proxy_handler.?;
-                const trap = try self.getProperty(Value.fromObject(handler), "apply");
-                if (isCallable(trap)) {
+                if (try self.proxyTrapFn(handler, "apply")) |trap| {
                     const arr = try self.newArray(0);
                     try self.protect(Value.fromObject(arr));
                     defer self.unprotect();
-                    for (args) |a| try arr.elements.append(self.gpa, a);
+                    for (args) |a| try self.arrayAppend(arr, a);
                     return self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), this_value, Value.fromObject(arr) });
                 }
                 return self.callValue(Value.fromObject(target), this_value, args);
@@ -982,14 +981,16 @@ pub const Vm = struct {
         if (callee.isObject()) {
             if (callee.asObject().proxy_target) |target| {
                 if (callee.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
+                if (!isConstructorValue(Value.fromObject(target))) return self.throwTypeError("proxy target is not a constructor");
                 const handler = callee.asObject().proxy_handler.?;
-                const trap = try self.getProperty(Value.fromObject(handler), "construct");
-                if (isCallable(trap)) {
+                if (try self.proxyTrapFn(handler, "construct")) |trap| {
                     const arr = try self.newArray(0);
                     try self.protect(Value.fromObject(arr));
                     defer self.unprotect();
-                    for (args) |a| try arr.elements.append(self.gpa, a);
-                    return self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), Value.fromObject(arr), callee });
+                    for (args) |a| try self.arrayAppend(arr, a);
+                    const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), Value.fromObject(arr), callee });
+                    if (!r.isObject()) return self.throwTypeError("proxy construct trap must return an object");
+                    return r;
                 }
                 return self.constructValue(Value.fromObject(target), args);
             }
@@ -1551,27 +1552,62 @@ pub const Vm = struct {
         if (is_get) gop.value_ptr.get = fnv else gop.value_ptr.set = fnv;
     }
 
+    /// GetMethod(handler, name) for a proxy trap: returns the callable trap, or
+    /// null when it is undefined/null (the caller forwards to the target).
+    /// Throws TypeError when the trap is present but not callable.
+    fn proxyTrapFn(self: *Vm, handler: *gc.Object, name: []const u8) Error!?Value {
+        const trap = try self.getProperty(Value.fromObject(handler), name);
+        if (trap.isNullish()) return null;
+        if (!isCallable(trap)) return self.throwTypeError("proxy trap is not callable");
+        return trap;
+    }
+
+    /// [[Get]] on a proxy with an explicit receiver (spec 10.5.8). Used both
+    /// when the proxy is the base and when it appears in a prototype chain.
+    fn proxyGet(self: *Vm, p: *gc.Object, key: []const u8, receiver: Value) Error!Value {
+        if (p.proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
+        const handler = p.proxy_handler.?;
+        const target = p.proxy_target.?;
+        if (try self.proxyTrapFn(handler, "get")) |trap| {
+            const result = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), receiver });
+            // Invariants against a non-configurable own property of the target.
+            if (target.properties.get(key)) |desc| {
+                if (!desc.is_accessor and !desc.configurable and !desc.writable and !sameValue(result, desc.value))
+                    return self.throwTypeError("proxy get must report the same value for a non-configurable, non-writable property");
+                if (desc.is_accessor and !desc.configurable and desc.get == null and !result.isUndefined())
+                    return self.throwTypeError("proxy get must report undefined for a non-configurable accessor with an undefined getter");
+            }
+            return result;
+        }
+        return self.getProperty(Value.fromObject(target), key);
+    }
+
+    /// [[Set]] on a proxy with an explicit receiver (spec 10.5.9). Returns
+    /// false when the trap refuses the write.
+    fn proxySet(self: *Vm, p: *gc.Object, key: []const u8, value: Value, receiver: Value) Error!bool {
+        if (p.proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
+        const handler = p.proxy_handler.?;
+        const target = p.proxy_target.?;
+        if (try self.proxyTrapFn(handler, "set")) |trap| {
+            const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), value, receiver });
+            if (!toBoolean(r)) return false;
+            // Invariants against a non-configurable own property of the target.
+            if (target.properties.get(key)) |desc| {
+                if (!desc.is_accessor and !desc.configurable and !desc.writable and !sameValue(value, desc.value))
+                    return self.throwTypeError("proxy set cannot change the value of a non-configurable, non-writable property");
+                if (desc.is_accessor and !desc.configurable and desc.set == null)
+                    return self.throwTypeError("proxy set cannot succeed for a non-configurable accessor with an undefined setter");
+            }
+            return true;
+        }
+        return self.setPropertyInner(Value.fromObject(target), key, value);
+    }
+
     /// [[Get]] on a value: walk the prototype chain; invoke getters.
     pub fn getProperty(self: *Vm, base: Value, key: []const u8) Error!Value {
         if (base.isObject()) {
-            if (base.asObject().proxy_target) |target| {
-                if (base.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
-                const handler = base.asObject().proxy_handler.?;
-                const trap = try self.getProperty(Value.fromObject(handler), "get");
-                if (isCallable(trap)) {
-                    const result = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), base });
-                    // Invariant: a non-configurable non-writable data property
-                    // of the target pins the trap's answer.
-                    if (target.properties.get(key)) |desc| {
-                        if (!desc.configurable and !desc.is_accessor and !desc.writable and
-                            !sameValue(result, desc.value))
-                        {
-                            return self.throwTypeError("proxy get must report the same value for a non-configurable, non-writable property");
-                        }
-                    }
-                    return result;
-                }
-                return self.getProperty(Value.fromObject(target), key);
+            if (base.asObject().proxy_target != null) {
+                return self.proxyGet(base.asObject(), key, base);
             }
         }
         if (!base.isObject()) {
@@ -1641,6 +1677,11 @@ pub const Vm = struct {
         }
         var obj: ?*gc.Object = base.asObject();
         while (obj) |o| {
+            // A proxy encountered while walking the prototype chain dispatches
+            // its own [[Get]], preserving the original receiver.
+            if (o != base.asObject() and o.proxy_target != null) {
+                return self.proxyGet(o, key, base);
+            }
             if (o.properties.getPtr(key)) |desc| {
                 if (desc.is_accessor) {
                     const getter = desc.get orelse return Value.undefined_value;
@@ -1660,6 +1701,11 @@ pub const Vm = struct {
         _ = try self.setPropertyInner(base, key, value);
     }
 
+    /// [[Set]] reporting the boolean success/refusal (for `Reflect.set`).
+    pub fn setPropertyReport(self: *Vm, base: Value, key: []const u8, value: Value) Error!bool {
+        return self.setPropertyInner(base, key, value);
+    }
+
     /// Mode-aware [[Set]] for compiled code: in strict mode a failed write
     /// throws TypeError.
     pub fn setPropertyMode(self: *Vm, base: Value, key: []const u8, value: Value, strict: bool) Error!void {
@@ -1671,17 +1717,8 @@ pub const Vm = struct {
     /// setter-less accessor, non-extensible receiver, primitive receiver).
     fn setPropertyInner(self: *Vm, base: Value, key: []const u8, value: Value) Error!bool {
         if (base.isObject()) {
-            if (base.asObject().proxy_target) |target| {
-                if (base.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
-                const handler = base.asObject().proxy_handler.?;
-                const trap = try self.getProperty(Value.fromObject(handler), "set");
-                if (isCallable(trap)) {
-                    const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key), value, base });
-                    // A falsy trap result means the write was refused (strict
-                    // mode callers turn that into a TypeError).
-                    return toBoolean(r);
-                }
-                return self.setPropertyInner(Value.fromObject(target), key, value);
+            if (base.asObject().proxy_target != null) {
+                return self.proxySet(base.asObject(), key, value, base);
             }
         }
         if (!base.isObject()) {
@@ -1720,6 +1757,11 @@ pub const Vm = struct {
         // Search prototype chain for an accessor or a non-writable data prop.
         var obj: ?*gc.Object = receiver;
         while (obj) |o| {
+            // A proxy in the prototype chain runs its own [[Set]] with the
+            // original receiver.
+            if (o != receiver and o.proxy_target != null) {
+                return self.proxySet(o, key, value, base);
+            }
             if (o.properties.getPtr(key)) |desc| {
                 if (desc.is_accessor) {
                     const setter = desc.set orelse return false; // no setter
@@ -1768,18 +1810,19 @@ pub const Vm = struct {
         if (o.proxy_target) |target| {
             if (o.proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
             const handler = o.proxy_handler.?;
-            const trap = try self.getProperty(Value.fromObject(handler), "deleteProperty");
-            if (isCallable(trap)) {
+            if (try self.proxyTrapFn(handler, "deleteProperty")) |trap| {
                 const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key) });
-                const answer = toBoolean(r);
-                if (answer) {
-                    if (target.properties.get(key)) |desc| {
-                        if (!desc.configurable) {
-                            return self.throwTypeError("proxy deleteProperty cannot report a non-configurable property as deleted");
-                        }
-                    }
+                if (!toBoolean(r)) return false;
+                // Invariants: a still-present target property may not be
+                // reported deleted if it is non-configurable, or if the target
+                // is non-extensible.
+                if (target.properties.get(key)) |desc| {
+                    if (!desc.configurable)
+                        return self.throwTypeError("proxy deleteProperty cannot report a non-configurable property as deleted");
+                    if (!target.extensible)
+                        return self.throwTypeError("proxy deleteProperty cannot report a property of a non-extensible target as deleted");
                 }
-                return answer;
+                return true;
             }
             return self.deleteProperty(Value.fromObject(target), key);
         }
@@ -1788,6 +1831,8 @@ pub const Vm = struct {
             o.args_map &= ~(@as(u64, 1) << @intCast(i));
         }
         if (o.is_array) {
+            // `length` is a non-configurable own property; deleting it fails.
+            if (std.mem.eql(u8, key, "length")) return false;
             if (arrayIndex(key)) |i| {
                 self.deleteArrayElement(o, i);
                 return true;
@@ -1854,31 +1899,50 @@ pub const Vm = struct {
         return false;
     }
 
+    /// [[HasProperty]] on a proxy (spec 10.5.7).
+    fn proxyHas(self: *Vm, p: *gc.Object, key: []const u8) Error!bool {
+        if (p.proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
+        const handler = p.proxy_handler.?;
+        const target = p.proxy_target.?;
+        if (try self.proxyTrapFn(handler, "has")) |trap| {
+            const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(key) });
+            if (toBoolean(r)) return true;
+            // Invariants: a non-configurable own property, or any own property
+            // of a non-extensible target, may not be reported absent.
+            if (target.properties.get(key)) |desc| {
+                if (!desc.configurable)
+                    return self.throwTypeError("proxy has cannot report a non-configurable own property as absent");
+                if (!target.extensible)
+                    return self.throwTypeError("proxy has cannot report a property of a non-extensible target as absent");
+            }
+            return false;
+        }
+        return self.hasPropertyChain(target, key);
+    }
+
+    /// [[HasProperty]] walking the prototype chain, dispatching any proxy found
+    /// along the way (so `in` sees proxy `has` traps at every level).
+    fn hasPropertyChain(self: *Vm, obj: *gc.Object, key: []const u8) Error!bool {
+        var o: ?*gc.Object = obj;
+        while (o) |cur| {
+            if (cur.proxy_target != null) return self.proxyHas(cur, key);
+            if (cur.is_array) {
+                if (std.mem.eql(u8, key, "length")) return true;
+                if (arrayIndex(key)) |i| {
+                    if (arrayHasOwn(cur, i)) return true;
+                }
+            }
+            if (cur.properties.contains(key)) return true;
+            o = cur.prototype;
+        }
+        return false;
+    }
+
     pub fn inOperator(self: *Vm, key: Value, obj: Value) Error!bool {
         if (!obj.isObject()) return self.throwTypeError("cannot use 'in' on a non-object");
         const k = try self.toPropertyKey(key);
         defer self.gpa.free(k);
-        if (obj.asObject().proxy_target) |target| {
-            if (obj.asObject().proxy_revoked) return self.throwTypeError("cannot perform operation on a revoked proxy");
-            const handler = obj.asObject().proxy_handler.?;
-            const trap = try self.getProperty(Value.fromObject(handler), "has");
-            if (isCallable(trap)) {
-                const r = try self.callValue(trap, Value.fromObject(handler), &.{ Value.fromObject(target), try self.makeString(k) });
-                const answer = toBoolean(r);
-                // Invariant: `has` may not hide a non-configurable own
-                // property of the target.
-                if (!answer) {
-                    if (target.properties.get(k)) |desc| {
-                        if (!desc.configurable) {
-                            return self.throwTypeError("proxy has must report a non-configurable own property as present");
-                        }
-                    }
-                }
-                return answer;
-            }
-            return self.hasProperty(target, k);
-        }
-        return self.hasProperty(obj.asObject(), k);
+        return self.hasPropertyChain(obj.asObject(), k);
     }
 
     pub fn toPropertyKey(self: *Vm, v: Value) Error![]u8 {
