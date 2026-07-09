@@ -155,8 +155,85 @@ pub const Vm = struct {
     iterator_proto: ?*gc.Object = null,
     generator_proto: ?*gc.Object = null,
     bigint_proto: ?*gc.Object = null,
+    /// Every realm ever built (primary at index 0, plus `$262.createRealm`
+    /// results). The active realm's intrinsics live in the flat fields above;
+    /// this list keeps the others rooted and lets `evalScript` swap in a realm.
+    realms: std.ArrayList(Realm) = .empty,
 
     const SymbolReg = struct { key: []u8, sym: *gc.Symbol };
+
+    /// A snapshot of one realm's intrinsics. Field names match the `Vm`
+    /// intrinsic fields exactly, so capture/restore is a reflective copy. The
+    /// global symbol registry is intentionally excluded (it is agent-wide).
+    pub const Realm = struct {
+        object_proto: ?*gc.Object = null,
+        function_proto: ?*gc.Object = null,
+        global_object: ?*gc.Object = null,
+        error_proto: ?*gc.Object = null,
+        type_error_proto: ?*gc.Object = null,
+        range_error_proto: ?*gc.Object = null,
+        reference_error_proto: ?*gc.Object = null,
+        syntax_error_proto: ?*gc.Object = null,
+        array_proto: ?*gc.Object = null,
+        string_proto: ?*gc.Object = null,
+        number_proto: ?*gc.Object = null,
+        boolean_proto: ?*gc.Object = null,
+        regexp_proto: ?*gc.Object = null,
+        map_proto: ?*gc.Object = null,
+        set_proto: ?*gc.Object = null,
+        date_proto: ?*gc.Object = null,
+        arraybuffer_proto: ?*gc.Object = null,
+        typed_array_proto: ?*gc.Object = null,
+        dataview_proto: ?*gc.Object = null,
+        symbol_proto: ?*gc.Object = null,
+        symbol_iterator: ?Value = null,
+        symbol_iterator_key: []const u8 = &.{},
+        symbol_to_primitive_key: []const u8 = &.{},
+        symbol_to_string_tag_key: []const u8 = &.{},
+        symbol_has_instance_key: []const u8 = &.{},
+        symbol_match_key: []const u8 = &.{},
+        symbol_replace_key: []const u8 = &.{},
+        symbol_search_key: []const u8 = &.{},
+        symbol_split_key: []const u8 = &.{},
+        symbol_species_key: []const u8 = &.{},
+        iterator_proto: ?*gc.Object = null,
+        generator_proto: ?*gc.Object = null,
+        bigint_proto: ?*gc.Object = null,
+    };
+
+    /// Copy the active realm (flat fields) into a `Realm` snapshot.
+    fn captureRealm(self: *const Vm) Realm {
+        var r: Realm = undefined;
+        inline for (std.meta.fields(Realm)) |f| @field(r, f.name) = @field(self, f.name);
+        return r;
+    }
+
+    /// Make `r` the active realm by copying it into the flat fields.
+    fn loadRealm(self: *Vm, r: Realm) void {
+        inline for (std.meta.fields(Realm)) |f| @field(self, f.name) = @field(r, f.name);
+    }
+
+    /// Blank the active-realm fields (without freeing the strings, which the
+    /// previously-captured realm still owns) so `buildRealm` starts fresh.
+    fn resetRealmFields(self: *Vm) void {
+        inline for (std.meta.fields(Realm)) |f| {
+            @field(self, f.name) = switch (@typeInfo(f.type)) {
+                .optional => null,
+                .pointer => &.{},
+                else => unreachable,
+            };
+        }
+    }
+
+    fn markRealm(r: *const Realm, tracer: *gc.Tracer) void {
+        inline for (std.meta.fields(Realm)) |f| {
+            if (f.type == ?*gc.Object) {
+                if (@field(r, f.name)) |o| tracer.mark(&o.gc);
+            } else if (f.type == ?Value) {
+                if (@field(r, f.name)) |v| v.mark(tracer);
+            }
+        }
+    }
 
     pub fn init(gpa: std.mem.Allocator) Vm {
         return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
@@ -167,15 +244,17 @@ pub const Vm = struct {
         self.temp_roots.deinit(self.gpa);
         for (self.symbol_registry.items) |r| self.gpa.free(r.key);
         self.symbol_registry.deinit(self.gpa);
-        if (self.symbol_iterator_key.len != 0) self.gpa.free(self.symbol_iterator_key);
-        if (self.symbol_to_primitive_key.len != 0) self.gpa.free(self.symbol_to_primitive_key);
-        if (self.symbol_to_string_tag_key.len != 0) self.gpa.free(self.symbol_to_string_tag_key);
-        if (self.symbol_has_instance_key.len != 0) self.gpa.free(self.symbol_has_instance_key);
-        if (self.symbol_match_key.len != 0) self.gpa.free(self.symbol_match_key);
-        if (self.symbol_replace_key.len != 0) self.gpa.free(self.symbol_replace_key);
-        if (self.symbol_search_key.len != 0) self.gpa.free(self.symbol_search_key);
-        if (self.symbol_split_key.len != 0) self.gpa.free(self.symbol_split_key);
-        if (self.symbol_species_key.len != 0) self.gpa.free(self.symbol_species_key);
+        // Each realm allocated its own well-known-symbol keys; free per realm
+        // (the active realm's keys alias realms[0], so they are freed here too).
+        for (self.realms.items) |rlm| {
+            inline for (std.meta.fields(Realm)) |f| {
+                if (comptime std.mem.endsWith(u8, f.name, "_key")) {
+                    const k = @field(rlm, f.name);
+                    if (k.len != 0) self.gpa.free(k);
+                }
+            }
+        }
+        self.realms.deinit(self.gpa);
         // Programs compiled by eval/Function() live as long as the VM: closures
         // created inside them keep pointing at their bytecode arenas.
         for (self.eval_programs.items) |*p| p.deinit();
@@ -218,6 +297,9 @@ pub const Vm = struct {
         if (self.generator_proto) |o| tracer.mark(&o.gc);
         if (self.bigint_proto) |o| tracer.mark(&o.gc);
         for (self.symbol_registry.items) |r| tracer.mark(&r.sym.gc);
+        // Keep every realm's intrinsics alive (the active one overlaps the flat
+        // fields above; the rest are only reachable here).
+        for (self.realms.items) |*rlm| markRealm(rlm, tracer);
         for (self.temp_roots.items) |v| v.mark(tracer);
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
@@ -250,6 +332,14 @@ pub const Vm = struct {
     /// Create the base intrinsics if they don't exist yet.
     pub fn bootstrap(self: *Vm) Error!void {
         if (self.object_proto != null) return;
+        try self.buildRealm();
+        // Register the primary realm so the collector keeps it (and any later
+        // realms) rooted even while another realm is swapped in.
+        try self.realms.append(self.gpa, self.captureRealm());
+    }
+
+    /// Build a fresh set of realm intrinsics into the active (flat) fields.
+    fn buildRealm(self: *Vm) Error!void {
         const obj_proto = try self.heap.create(gc.Object); // [[Prototype]] = null
         self.object_proto = obj_proto;
         const fn_proto = try self.heap.create(gc.Object);
@@ -275,6 +365,25 @@ pub const Vm = struct {
         try realm.installBuiltins(self);
     }
 
+    /// `$262.createRealm`: build a genuinely fresh realm (its own global object
+    /// and intrinsics) and return its index in `self.realms`. The primary realm
+    /// is restored as active; callers run code in the new realm by swapping it
+    /// in (see `nativeRealmEvalScript`).
+    pub fn createRealm(self: *Vm) Error!usize {
+        try self.bootstrap();
+        const saved = self.captureRealm(); // primary (kept rooted via realms[0])
+        self.resetRealmFields();
+        self.buildRealm() catch |e| {
+            self.resetRealmFields();
+            self.loadRealm(saved);
+            return e;
+        };
+        const fresh = self.captureRealm();
+        try self.realms.append(self.gpa, fresh);
+        self.loadRealm(saved); // restore the primary realm as active
+        return self.realms.items.len - 1;
+    }
+
     /// Test262 host hooks: define `$262` on the global. Called by the
     /// conformance runner only — normal realms never see it.
     pub fn installHost262(self: *Vm) Error!void {
@@ -286,7 +395,67 @@ pub const Vm = struct {
         try self.defineMethod(host, "evalScript", nativeHostEvalScript, 1);
         try self.defineMethod(host, "gc", nativeHostGc, 0);
         try self.defineMethod(host, "detachArrayBuffer", nativeHostDetachArrayBuffer, 1);
+        try self.defineMethod(host, "createRealm", nativeHostCreateRealm, 0);
+        try self.defineData(host, "agent", Value.fromObject(try self.makeAgentStub()), true, false, true);
         try self.defineData(self.global_object.?, "$262", Value.fromObject(host), true, false, true);
+    }
+
+    /// `$262.createRealm()` → a `$262`-shaped object bound to a fresh realm.
+    /// `evalScript` on it swaps that realm in for the duration of the eval, so
+    /// objects it creates use the new realm's intrinsics (distinct identities).
+    fn nativeHostCreateRealm(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        _ = this;
+        _ = args;
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        const idx = try vm.createRealm();
+        const rlm = vm.realms.items[idx];
+        const desc = try vm.newObject(vm.object_proto);
+        try vm.protect(Value.fromObject(desc));
+        defer vm.unprotect();
+        try vm.defineData(desc, "global", Value.fromObject(rlm.global_object.?), true, false, true);
+        try vm.defineData(desc, "\x00realmIdx", Value.fromNumber(@floatFromInt(idx)), false, false, false);
+        try vm.defineMethod(desc, "evalScript", nativeRealmEvalScript, 1);
+        try vm.defineMethod(desc, "createRealm", nativeHostCreateRealm, 0);
+        try vm.defineMethod(desc, "gc", nativeHostGc, 0);
+        try vm.defineMethod(desc, "detachArrayBuffer", nativeHostDetachArrayBuffer, 1);
+        return Value.fromObject(desc);
+    }
+
+    /// `evalScript` bound to a specific realm (read from the receiver's hidden
+    /// index slot): run the source with that realm's intrinsics active.
+    fn nativeRealmEvalScript(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        const idxv = if (this.isObject()) this.asObject().properties.get("\x00realmIdx") else null;
+        if (idxv == null or !idxv.?.value.isNumber()) return vm.throwTypeError("evalScript called on a non-realm object");
+        const idx: usize = @intFromFloat(idxv.?.value.asNumber());
+        const sv = try vm.toStringVal(if (args.len > 0) args[0] else Value.undefined_value);
+        try vm.protect(sv);
+        defer vm.unprotect();
+        const utf8 = try utf16ToUtf8Alloc(vm.gpa, sv.asString().units);
+        defer vm.gpa.free(utf8);
+        const saved = vm.captureRealm();
+        vm.loadRealm(vm.realms.items[idx]);
+        defer vm.loadRealm(saved);
+        return vm.evalSource(utf8);
+    }
+
+    /// `$262.agent` stub: the method surface the harness expects, inert because
+    /// there is no multi-agent/SharedArrayBuffer support yet.
+    fn makeAgentStub(self: *Vm) Error!*gc.Object {
+        const agent = try self.newObject(self.object_proto);
+        try self.protect(Value.fromObject(agent));
+        defer self.unprotect();
+        const names = [_][]const u8{ "start", "broadcast", "getReport", "sleep", "monotonicNow", "receiveBroadcast", "report", "leaving" };
+        inline for (names) |n| try self.defineMethod(agent, n, nativeAgentInert, 0);
+        return agent;
+    }
+
+    fn nativeAgentInert(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        _ = ctx;
+        _ = this;
+        _ = args;
+        // monotonicNow-ish callers expect a number; others ignore the result.
+        return Value.fromNumber(0);
     }
 
     fn nativeHostEvalScript(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {

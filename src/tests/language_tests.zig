@@ -497,6 +497,28 @@ test "$262 host object" {
     try std.testing.expectEqual(@as(f64, 1), v.asNumber());
 }
 
+test "$262.createRealm builds a genuinely fresh realm" {
+    var vm = helpers.Vm.init(helpers.gpa);
+    defer vm.deinit();
+    try vm.installHost262();
+    // A fresh realm has its own global + intrinsics: distinct constructor
+    // identities, and objects it creates use its own prototypes.
+    const v = try eval(&vm,
+        \\var r = $262.createRealm();
+        \\var otherArray = r.evalScript("Array");
+        \\var arr = r.evalScript("[1, 2, 3]");
+        \\r.evalScript("realmVar = 40 + 2;");
+        \\var ok = otherArray !== Array
+        \\  && r.global !== globalThis
+        \\  && !(arr instanceof Array)
+        \\  && (arr instanceof otherArray)
+        \\  && r.evalScript("realmVar") === 42
+        \\  && typeof $262.agent.start === "function";
+        \\return ok ? 1 : 0;
+    );
+    try std.testing.expectEqual(@as(f64, 1), v.asNumber());
+}
+
 test "private class members" {
     // Instance fields (with and without initializer), read/write, methods.
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
