@@ -45,6 +45,7 @@ pub const Op = enum(u8) {
     exp,
     neg, // a=dst, b=operand
     to_number, // a=dst, b=operand (unary +)
+    require_coercible, // a=src  (RequireObjectCoercible: TypeError if null/undefined)
 
     // Bitwise
     bit_and,

@@ -959,3 +959,53 @@ test "generators: yield, next/return/throw, for-of, yield*, methods" {
         .syntax_error => {},
     }
 }
+
+test "destructuring binding semantics: named eval, coercible, strict params" {
+    // NamedEvaluation: an anonymous default is named after its binding, in both
+    // binding and assignment patterns, and via a renamed target.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function f({ arrow = () => {}, fn = function(){} }) {
+        \\  return (arrow.name === "arrow" && fn.name === "fn") ? 1 : 0;
+        \\}
+        \\return f({});
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var a; ({ a = () => {} } = {}); return a.name === "a" ? 1 : 0;
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\function g({ x: y = function(){} }) { return y.name === "y" ? 1 : 0; }
+        \\return g({});
+    ));
+    // RequireObjectCoercible: destructuring null/undefined throws — even an
+    // empty pattern.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\try { var {} = null; return 0; } catch (e) { return e instanceof TypeError ? 1 : 2; }
+    ));
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\try { var [{x}] = [undefined]; return 0; } catch (e) { return e instanceof TypeError ? 1 : 2; }
+    ));
+    // A "use strict" directive is illegal with a non-simple parameter list.
+    const parser = @import("bottlebrush").parser;
+    const bad = [_][]const u8{
+        "function f({x}) { \"use strict\"; }",
+        "function f(a = 1) { \"use strict\"; }",
+        "function f(...r) { \"use strict\"; }",
+        "var o = { m([a]) { \"use strict\"; } };",
+    };
+    for (bad) |src| {
+        var r = try parser.parse(std.testing.allocator, src, .script);
+        switch (r) {
+            .ok => |*a| {
+                a.deinit();
+                std.debug.print("expected SyntaxError: {s}\n", .{src});
+                return error.ExpectedSyntaxError;
+            },
+            .syntax_error => {},
+        }
+    }
+    // But a simple parameter list may declare strict mode.
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\function f(a, b) { "use strict"; return a + b; }
+        \\return f(1, 2);
+    ));
+}

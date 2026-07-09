@@ -880,6 +880,8 @@ pub const Vm = struct {
             .exp => regs[inst.a] = try self.numericBinop(.exp, regs[inst.b], regs[inst.c]),
             .neg => regs[inst.a] = try self.opNegate(regs[inst.b]),
             .to_number => regs[inst.a] = Value.fromNumber(try self.toNumber(regs[inst.b])),
+            .require_coercible => if (regs[inst.a].isNullish())
+                return self.throwTypeError("cannot destructure null or undefined"),
 
             .bit_and => regs[inst.a] = try self.numericBinop(.bit_and, regs[inst.b], regs[inst.c]),
             .bit_or => regs[inst.a] = try self.numericBinop(.bit_or, regs[inst.b], regs[inst.c]),

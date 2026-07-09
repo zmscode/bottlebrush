@@ -142,7 +142,7 @@ pub const Parser = struct {
         const start = self.cur.start;
         var body: NodeList = .empty;
         // Directive prologue: an initial "use strict" enables strict mode.
-        try self.parseDirectivePrologue(&body);
+        _ = try self.parseDirectivePrologue(&body);
         while (!self.at(.eof)) {
             try body.append(self.arena, try self.parseStatementListItem());
         }
@@ -153,7 +153,9 @@ pub const Parser = struct {
         } });
     }
 
-    fn parseDirectivePrologue(self: *Parser, body: *NodeList) ParseError!void {
+    /// Returns whether a `"use strict"` directive appeared in the prologue.
+    fn parseDirectivePrologue(self: *Parser, body: *NodeList) ParseError!bool {
+        var saw_use_strict = false;
         while (self.at(.string)) {
             const s = self.save();
             const lit = self.cur.lexeme(self.source);
@@ -164,6 +166,7 @@ pub const Parser = struct {
                 _ = self.eat(.semicolon);
                 if (std.mem.eql(u8, lit, "\"use strict\"") or std.mem.eql(u8, lit, "'use strict'")) {
                     self.strict = true;
+                    saw_use_strict = true;
                 }
                 const str = try self.node(start, self.prev_end, .{ .string = lit });
                 try body.append(self.arena, try self.node(start, self.prev_end, .{ .expression_stmt = str }));
@@ -173,6 +176,7 @@ pub const Parser = struct {
                 break;
             }
         }
+        return saw_use_strict;
     }
 
     // ---- statements --------------------------------------------------------
@@ -248,11 +252,21 @@ pub const Parser = struct {
 
     /// A function body: like `parseBlock`, but a leading `"use strict"`
     /// directive enables strict mode for the rest of the body.
-    fn parseFunctionBody(self: *Parser) ParseError!*Node {
+    /// A simple parameter list is a possibly-empty sequence of plain
+    /// BindingIdentifiers (no defaults, rest, or destructuring patterns).
+    fn paramsAreSimple(params: []const *Node) bool {
+        for (params) |p| if (p.kind != .ident) return false;
+        return true;
+    }
+
+    fn parseFunctionBody(self: *Parser, simple_params: bool) ParseError!*Node {
         const start = self.cur.start;
         try self.expect(.l_brace);
         var body: NodeList = .empty;
-        try self.parseDirectivePrologue(&body); // may set self.strict
+        const saw_use_strict = try self.parseDirectivePrologue(&body); // may set self.strict
+        // A `"use strict"` directive is illegal when the parameter list is not
+        // simple (has a default, rest, or destructuring parameter).
+        if (saw_use_strict and !simple_params) return self.fail("'use strict' directive not allowed in a function with a non-simple parameter list");
         while (!self.at(.r_brace) and !self.at(.eof)) {
             try body.append(self.arena, try self.parseStatementListItem());
         }
@@ -547,7 +561,7 @@ pub const Parser = struct {
         }
         const saved_ctx = self.enterFn(flags);
         const params = try self.parseParams();
-        const body = try self.parseFunctionBody();
+        const body = try self.parseFunctionBody(paramsAreSimple(params));
         flags.strict = self.strict; // may have been enabled by a "use strict" prologue
         self.exitFn(saved_ctx);
         const func: ast.Function = .{ .name = name, .params = params, .body = body, .flags = flags };
@@ -777,7 +791,7 @@ pub const Parser = struct {
             // Method (or get/set/constructor).
             const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
-            const body = try self.parseFunctionBody();
+            const body = try self.parseFunctionBody(paramsAreSimple(params));
             flags.strict = self.strict; // strict from context (class body) or a prologue
             self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{
@@ -1563,7 +1577,7 @@ pub const Parser = struct {
         if (self.at(.l_paren)) {
             const saved_ctx = self.enterFn(flags);
             const params = try self.parseParams();
-            const body = try self.parseFunctionBody();
+            const body = try self.parseFunctionBody(paramsAreSimple(params));
             flags.strict = self.strict; // strict from context (class body) or a prologue
             self.exitFn(saved_ctx);
             const fnode = try self.node(start, self.prev_end, .{ .function = .{

@@ -668,6 +668,13 @@ pub const Compiler = struct {
         _ = try self.emit(.{ .op = .strict_eq, .a = cmp, .b = v, .c = und });
         const jskip = try self.emit(.{ .op = .jump_if_false, .a = cmp });
         try self.compileExprInto(v, dflt);
+        // NamedEvaluation: `{ x = () => {} }` / `[x = function(){}]` names the
+        // anonymous default after the binding — but only when the target is a
+        // plain identifier and the default was actually taken (this branch).
+        if (target.kind == .ident and isAnonFnLike(dflt)) {
+            const idx = try self.addConst(.{ .string = target.kind.ident });
+            _ = try self.emit(.{ .op = .set_fn_name, .a = v, .b = idx });
+        }
         self.patchTarget(jskip, self.here());
         self.freeTo(und);
         try self.compilePatternBind(target, v, mode);
@@ -721,6 +728,9 @@ pub const Compiler = struct {
     }
 
     fn bindObjectPattern(self: *Compiler, props: []*Node, src: u32, mode: BindMode) CompileError!void {
+        // RequireObjectCoercible: `{} = null` / `{ x } = undefined` throw a
+        // TypeError before any property access (even for an empty pattern).
+        _ = try self.emit(.{ .op = .require_coercible, .a = src });
         // A rest element needs the set of already-bound keys at run time (for
         // computed keys), so collect every key into an excluded-keys array.
         // Binding patterns spell rest as a .rest_element node; the assignment
