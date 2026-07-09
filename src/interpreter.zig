@@ -1463,6 +1463,19 @@ pub const Vm = struct {
             defer self.unprotect();
             try self.defineData(target, key, v, true, true, true);
         }
+        // Symbol-keyed enumerable own properties are copied too (string
+        // enumeration skips the NUL-prefixed encoded keys, so walk the map).
+        var it = src.asObject().properties.iterator();
+        while (it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            if (!(k.len >= 2 and k[0] == 0 and k[1] == 'S')) continue; // not a symbol key
+            if (!entry.value_ptr.enumerable) continue;
+            if (keyIn(excluded.items, k)) continue;
+            const v = try self.getProperty(src, k);
+            try self.protect(v);
+            defer self.unprotect();
+            try self.defineData(target, k, v, true, true, true);
+        }
     }
 
     fn keyIn(list: []const []u8, key: []const u8) bool {

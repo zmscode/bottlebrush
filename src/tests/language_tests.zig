@@ -1057,3 +1057,44 @@ test "array destructuring IteratorClose" {
         \\catch (e) { return (e instanceof TypeError && log.length === 0) ? 1 : 2; }
     ));
 }
+
+test "destructuring-assignment target validation" {
+    const parser = @import("bottlebrush").parser;
+    const bad = [_][]const u8{
+        "[a?.b] = x;", // optional chain target
+        "[...a, b] = x;", // rest not last
+        "[...a = 1] = x;", // rest with default
+        "[a] += 1;", // compound assignment to a pattern
+        "\"use strict\"; var x = {}; 0, [ x[yield] ] = [];", // yield reserved in strict
+        "\"use strict\"; 0, { x = yield } = {};",
+    };
+    for (bad) |src| {
+        var r = try parser.parse(std.testing.allocator, src, .script);
+        switch (r) {
+            .ok => |*a| {
+                a.deinit();
+                std.debug.print("expected SyntaxError: {s}\n", .{src});
+                return error.ExpectedSyntaxError;
+            },
+            .syntax_error => {},
+        }
+    }
+    // Sloppy-mode `yield` is an ordinary identifier outside generators.
+    try std.testing.expectEqual(@as(f64, 7), try evalNumber(
+        \\var yield = 3;
+        \\function f(arg) { var yield = arg; return yield + 3; }
+        \\return f(yield + 1);
+    ));
+}
+
+test "object spread/rest copy symbol-keyed properties" {
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var s = Symbol('s');
+        \\var src = { a: 1, [s]: 42 };
+        \\var spread = { ...src };
+        \\var { a, ...rest } = src;
+        \\var { [s]: v, ...rest2 } = src;
+        \\return (spread[s] === 42 && rest[s] === 42 && !("a" in rest)
+        \\  && v === 42 && !(s in rest2)) ? 1 : 0;
+    ));
+}

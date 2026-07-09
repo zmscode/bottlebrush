@@ -325,6 +325,60 @@ pub const Parser = struct {
         };
     }
 
+    /// Validate the LHS of `=` (AssignmentTargetType). `simple_only` (a compound
+    /// assignment like `+=`) forbids destructuring patterns. Recurses into array
+    /// / object literals reinterpreted as assignment patterns, enforcing:
+    /// rest-must-be-last (no default), no optional chains, and no `eval`/
+    /// `arguments` targets in strict mode.
+    fn validateAssignTarget(self: *Parser, n: *Node, simple_only: bool) ParseError!void {
+        switch (n.kind) {
+            .ident => |name| {
+                if (self.strict and (std.mem.eql(u8, name, "eval") or std.mem.eql(u8, name, "arguments")))
+                    return self.fail("'eval'/'arguments' may not be assignment targets in strict mode");
+            },
+            .member => |m| {
+                if (m.optional) return self.fail("an optional chain is not a valid assignment target");
+            },
+            .array_literal => |elems| {
+                if (simple_only) return self.fail("invalid target for a compound assignment");
+                for (elems, 0..) |maybe, i| {
+                    const el = maybe orelse continue;
+                    if (el.kind == .spread) {
+                        if (i != elems.len - 1) return self.fail("a rest element must be last in an array destructuring target");
+                        if (el.kind.spread.kind == .assignment) return self.fail("a rest element may not have a default");
+                        try self.validateAssignTarget(el.kind.spread, false);
+                    } else if (el.kind == .assignment and el.kind.assignment.op == .assign) {
+                        try self.validateAssignTarget(el.kind.assignment.target, false);
+                    } else {
+                        try self.validateAssignTarget(el, false);
+                    }
+                }
+            },
+            .object_literal => |props| {
+                if (simple_only) return self.fail("invalid target for a compound assignment");
+                for (props, 0..) |p, i| {
+                    if (p.kind != .property) return self.fail("invalid object destructuring target");
+                    const prop = p.kind.property;
+                    if (prop.kind == .spread) {
+                        if (i != props.len - 1) return self.fail("a rest element must be last in an object destructuring target");
+                        try self.validateAssignTarget(prop.key, false); // spread stores its target in `key`
+                        continue;
+                    }
+                    const v = prop.value orelse continue;
+                    const target = switch (v.kind) {
+                        .assignment_pattern => |ap| ap.left,
+                        .assignment => |a| if (a.op == .assign) a.target else v,
+                        else => v,
+                    };
+                    try self.validateAssignTarget(target, false);
+                }
+            },
+            .assignment_pattern => |ap| try self.validateAssignTarget(ap.left, false),
+            .array_pattern, .object_pattern, .rest_element => {},
+            else => return self.fail("invalid assignment target"),
+        }
+    }
+
     fn parseFor(self: *Parser) ParseError!*Node {
         const start = self.cur.start;
         self.advance();
@@ -1076,11 +1130,18 @@ pub const Parser = struct {
         // Arrow functions (cover grammar) — try, then backtrack.
         if (try self.tryParseArrow()) |arrow| return arrow;
 
-        if (self.atContextual("yield")) return self.parseYield();
+        // `yield` is a YieldExpression only inside a generator. In strict
+        // non-generator code it is reserved (parse error, via the identifier
+        // path); in sloppy code it is an ordinary identifier.
+        if (self.atContextual("yield")) {
+            if (self.in_generator) return self.parseYield();
+            if (self.strict) return self.fail("'yield' is reserved here");
+        }
 
         const start = self.cur.start;
         const left = try self.parseConditional();
         if (assignmentOp(self.cur.kind)) |op| {
+            try self.validateAssignTarget(left, op != .assign);
             self.advance();
             const right = try self.parseAssignment();
             return self.node(start, self.prev_end, .{ .assignment = .{ .op = op, .target = left, .value = right } });
