@@ -127,6 +127,7 @@ pub const Op = enum(u8) {
 
     // Exceptions
     throw, // a=src
+    throw_type_error, // a=message const index  (unconditional TypeError; e.g. write to a const)
     end_finally, // rethrows the pending exception if the finally was entered abnormally
 
     pub fn mnemonic(self: Op) []const u8 {

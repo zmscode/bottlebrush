@@ -1087,6 +1087,27 @@ test "destructuring-assignment target validation" {
     ));
 }
 
+test "assignment to a const binding throws TypeError" {
+    // Plain, destructuring, compound, and update writes all throw; the RHS
+    // still evaluates first (spec order).
+    try std.testing.expectEqual(@as(f64, 5), try evalNumber(
+        \\const c = 1;
+        \\var hits = 0;
+        \\function probe() { hits += 1; return 9; }
+        \\try { c = probe(); } catch (e) { if (!(e instanceof TypeError)) return 0; }
+        \\try { [c] = [probe()]; } catch (e) { if (!(e instanceof TypeError)) return 0; }
+        \\try { ({ x: c } = { x: probe() }); } catch (e) { if (!(e instanceof TypeError)) return 0; }
+        \\try { c += probe(); } catch (e) { if (!(e instanceof TypeError)) return 0; }
+        \\try { c++; } catch (e) { if (!(e instanceof TypeError)) return 0; }
+        \\return hits === 4 ? 5 : hits;
+    ));
+    // Shadowing and reads stay legal.
+    try std.testing.expectEqual(@as(f64, 3), try evalNumber(
+        \\const c = 1;
+        \\{ let c = 2; c = 3; return c; }
+    ));
+}
+
 test "object spread/rest copy symbol-keyed properties" {
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
         \\var s = Symbol('s');

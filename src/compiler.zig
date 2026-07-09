@@ -37,7 +37,11 @@ pub const Result = union(enum) {
 
 const CompileError = error{ Unsupported, BadCode, OutOfMemory };
 
-const Binding = struct { depth: u32, slot: u32 };
+const Binding = struct { depth: u32, slot: u32, is_const: bool = false };
+
+/// One declared name in a block: its env slot, and whether writes to it are
+/// illegal (`const` — assignment throws a TypeError at run time).
+const BlockBinding = struct { slot: u32, is_const: bool = false };
 
 /// One class body's private-name namespace: maps `#name` (as written) to the
 /// hidden storage key used at run time.
@@ -46,7 +50,7 @@ const PrivateScope = struct {
 };
 
 const Block = struct {
-    names: std.StringHashMapUnmanaged(u32) = .empty,
+    names: std.StringHashMapUnmanaged(BlockBinding) = .empty,
 };
 
 const FnState = struct {
@@ -171,11 +175,17 @@ pub const Compiler = struct {
     }
     fn declare(self: *Compiler, name: []const u8) CompileError!u32 {
         const b = &self.fs.blocks.items[self.fs.blocks.items.len - 1];
-        if (b.names.get(name)) |slot| return slot; // redeclaration -> same slot
+        if (b.names.get(name)) |bind| return bind.slot; // redeclaration -> same slot
         const slot = self.fs.env_slot_count;
         self.fs.env_slot_count += 1;
-        try b.names.put(self.gpa, name, slot);
+        try b.names.put(self.gpa, name, .{ .slot = slot });
         return slot;
+    }
+
+    /// Mark a name just declared in the current block as `const` (writes throw).
+    fn markConst(self: *Compiler, name: []const u8) void {
+        const b = &self.fs.blocks.items[self.fs.blocks.items.len - 1];
+        if (b.names.getPtr(name)) |bind| bind.is_const = true;
     }
     fn resolve(self: *Compiler, name: []const u8) ?Binding {
         var fs: ?*FnState = self.fs;
@@ -184,7 +194,7 @@ pub const Compiler = struct {
             var i = f.blocks.items.len;
             while (i > 0) {
                 i -= 1;
-                if (f.blocks.items[i].names.get(name)) |slot| return .{ .depth = depth, .slot = slot };
+                if (f.blocks.items[i].names.get(name)) |bind| return .{ .depth = depth, .slot = bind.slot, .is_const = bind.is_const };
             }
             fs = f.parent;
             depth += 1;
@@ -619,12 +629,13 @@ pub const Compiler = struct {
 
     // ---- destructuring ------------------------------------------------------
 
-    const BindMode = enum { decl_lexical, decl_var, assign };
+    const BindMode = enum { decl_lexical, decl_const, decl_var, assign };
 
     fn bindPatternName(self: *Compiler, name: []const u8, src: u32, mode: BindMode) CompileError!void {
         switch (mode) {
-            .decl_lexical => {
+            .decl_lexical, .decl_const => {
                 const slot = try self.declare(name);
+                if (mode == .decl_const) self.markConst(name);
                 _ = try self.emit(.{ .op = .init_var, .a = 0, .b = slot, .c = src });
             },
             .decl_var => {
@@ -640,6 +651,11 @@ pub const Compiler = struct {
             },
             .assign => {
                 if (self.resolve(name)) |b| {
+                    if (b.is_const) {
+                        const midx = try self.addConst(.{ .string = "assignment to constant variable" });
+                        _ = try self.emit(.{ .op = .throw_type_error, .a = midx });
+                        return;
+                    }
                     _ = try self.emit(.{ .op = .set_var, .a = b.depth, .b = b.slot, .c = src });
                 } else {
                     const idx = try self.addConst(.{ .string = name });
@@ -897,7 +913,8 @@ pub const Compiler = struct {
             if (decl.id.kind != .ident) {
                 const init_expr = decl.init orelse return self.fail("destructuring declaration requires an initializer", decl.id.start);
                 const r = try self.compileExprToNew(init_expr);
-                try self.compilePatternBind(decl.id, r, if (lexical) BindMode.decl_lexical else BindMode.decl_var);
+                const pmode: BindMode = if (vd.kind == .keyword_const) .decl_const else if (lexical) .decl_lexical else .decl_var;
+                try self.compilePatternBind(decl.id, r, pmode);
                 self.freeTo(r);
                 continue;
             }
@@ -917,8 +934,11 @@ pub const Compiler = struct {
             }
             const slot = if (vd.kind == .keyword_var)
                 self.resolve(name).?.slot // already hoisted
-            else
-                try self.declare(name);
+            else blk: {
+                const s = try self.declare(name);
+                if (vd.kind == .keyword_const) self.markConst(name);
+                break :blk s;
+            };
             if (decl.init) |init_expr| {
                 const r = try self.compileExprToNew(init_expr);
                 // `var f = function(){}` / `= () => …` / `= class {}` names the
@@ -965,6 +985,7 @@ pub const Compiler = struct {
                 const decl = d.kind.variable_declarator;
                 if (decl.id.kind != .ident) continue; // destructuring rejected later
                 const slot = try self.declare(decl.id.kind.ident);
+                if (vd.kind == .keyword_const) self.markConst(decl.id.kind.ident);
                 _ = try self.emit(.{ .op = .set_dead, .a = 0, .b = slot });
             }
         }
@@ -1579,6 +1600,11 @@ pub const Compiler = struct {
 
     fn emitUpdateStore(self: *Compiler, bind: ?Binding, gidx: ?u32, src: u32) CompileError!void {
         if (bind) |b| {
+            if (b.is_const) {
+                const midx = try self.addConst(.{ .string = "assignment to constant variable" });
+                _ = try self.emit(.{ .op = .throw_type_error, .a = midx });
+                return;
+            }
             _ = try self.emit(.{ .op = .set_var, .a = b.depth, .b = b.slot, .c = src });
         } else {
             _ = try self.emit(.{ .op = .set_global, .a = gidx.?, .b = src });
@@ -1643,6 +1669,13 @@ pub const Compiler = struct {
                 const op = compoundOpcode(a.op) orelse return self.fail("unsupported assignment operator", pos);
                 _ = try self.emit(.{ .op = op, .a = dst, .b = dst, .c = rhs });
                 self.freeTo(rhs);
+            }
+            // Assignment to a `const` binding: the RHS still evaluates (spec
+            // order), then the write itself throws.
+            if (bind.is_const) {
+                const midx = try self.addConst(.{ .string = "assignment to constant variable" });
+                _ = try self.emit(.{ .op = .throw_type_error, .a = midx });
+                return;
             }
             _ = try self.emit(.{ .op = .set_var, .a = bind.depth, .b = bind.slot, .c = dst });
         } else {

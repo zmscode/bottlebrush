@@ -1003,6 +1003,7 @@ pub const Vm = struct {
                 self.pending_exception = regs[inst.a];
                 return error.JsThrow;
             },
+            .throw_type_error => return self.throwTypeError(code.constants[inst.a].string),
             .end_finally => {
                 if (self.pending_exception != null) return error.JsThrow;
             },
