@@ -5,15 +5,29 @@ grouped by root cause and ranked by payoff. Regenerate the raw data by flipping
 `trace_files = true` in `test262/runner.zig`, rebuilding, and grepping the
 runner's `FAILCASE`/`SKIPCASE` lines (each is `TAG <path> <reason>`).
 
-**As of 2026-07-09** (commit `45d1999`):
+**As of 2026-07-10** (commit `5ef1bdd`):
 
 | Bucket | Count | % of corpus |
 |--------|------:|------------:|
 | **files** | 5977 | 100% |
-| **pass** | 4147 | 69.4% |
-| **fail** | 752 | 12.6% |
-| **skip** | 1078 | 18.0% |
-| pass of executed (pass+fail) | | **84.6%** |
+| **pass** | 4512 | 75.5% |
+| **fail** | 587 | 9.8% |
+| **skip** | 878 | 14.7% |
+| pass of executed (pass+fail) | | **88.5%** |
+
+> **Phase 5 core landed (2026-07-10, +365):** destructuring cluster closed
+> (NamedEvaluation, RequireObjectCoercible, IteratorClose, target validation,
+> const-write TypeError, yield-as-identifier, symbol spread/rest); then the
+> async stack — microtask job queue, full Promise core (constructor, reaction
+> jobs, thenables, then/catch/finally, resolve/reject/withResolvers,
+> all/allSettled/any/race + AggregateError), and async/await (functions,
+> methods, arrows) over the generator suspension machinery. async-iteration +
+> TypedArray un-denylisted (async generators skip as a compile-gap); TCO stays
+> denylisted (100k recursion, no tail calls). Two latent GC bugs fixed
+> (makeNative unrooted mid-construction; the running job unrooted in runJobs).
+> Remaining: async generators / for-await, promise @@species + subclass
+> capabilities, modules, and the pre-existing fail tail. `built-ins/Promise`
+> corpus is NOT yet vendored — Promise is only exercised indirectly.
 
 > **Phase 0–4 checklist closed** (all P0–P4 items ticked): `$262.createRealm`
 > (real fresh realm; `cross-realm` un-denylisted → +31), `$262.agent` stub,
