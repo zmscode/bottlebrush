@@ -728,6 +728,10 @@ test "escaped keywords and async/generator context" {
         "x = \\u0074his;", // escaped `this` as reference
         "class C { async m() { void \\u0061wait; } }", // escaped await in async
         "function* g() { var \\u0079ield = 1; }", // escaped yield in generator
+        "function* g() { yield: 1; }", // yield as a label in a generator
+        "function* g(a = yield) {}", // yield expression in generator params
+        "function* g(a = yield 1) {}", // yield-with-operand in generator params
+        "function* g() { yield*\n[1]; }", // newline breaks the yield* delegate form
     };
     for (bad) |src| {
         var pr = try parser.parse(std.testing.allocator, src, .script);

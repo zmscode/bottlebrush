@@ -51,6 +51,9 @@ pub const Parser = struct {
     in_async: bool = false,
     /// Inside a generator body: `yield` is reserved (not an identifier).
     in_generator: bool = false,
+    /// Parsing a function's formal parameter list: a `yield` (or `await`)
+    /// expression is a SyntaxError there. Reset when entering a nested body.
+    in_formal_params: bool = false,
     /// Nesting depth of enclosing class bodies. A private-name reference
     /// (`obj.#x`, `#x in obj`) is only legal when this is > 0.
     private_depth: u32 = 0,
@@ -505,10 +508,14 @@ pub const Parser = struct {
         // `ident :` is a labeled statement.
         if (self.at(.identifier)) {
             const s = self.save();
+            const tok = self.cur;
             const label = self.cur.lexeme(self.source);
             const start = self.cur.start;
             self.advance();
             if (self.eat(.colon)) {
+                // A LabelIdentifier obeys IdentifierReference rules: `yield` in a
+                // generator / strict code and `await` in async are reserved.
+                try self.checkIdentifierName(tok);
                 const body = try self.parseStatement();
                 return self.node(start, self.prev_end, .{ .labeled_stmt = .{ .label = label, .body = body } });
             }
@@ -551,6 +558,9 @@ pub const Parser = struct {
     }
 
     fn parseParams(self: *Parser) ParseError![]*Node {
+        const saved_ifp = self.in_formal_params;
+        self.in_formal_params = true;
+        defer self.in_formal_params = saved_ifp;
         try self.expect(.l_paren);
         var params: NodeList = .empty;
         while (!self.at(.r_paren) and !self.at(.eof)) {
@@ -1003,20 +1013,22 @@ pub const Parser = struct {
         }
     }
 
-    const FnCtx = struct { fi: bool, is_async: bool, is_gen: bool, strict: bool };
+    const FnCtx = struct { fi: bool, is_async: bool, is_gen: bool, strict: bool, ifp: bool };
 
     /// Enter a (non-arrow) function body: reset field-init state and set the
     /// await/yield reservation from the function's own async/generator kind.
     /// Strictness is saved so a body-level `"use strict"` doesn't leak out.
     fn enterFn(self: *Parser, flags: ast.FunctionFlags) FnCtx {
-        const saved = FnCtx{ .fi = self.in_field_init, .is_async = self.in_async, .is_gen = self.in_generator, .strict = self.strict };
+        const saved = FnCtx{ .fi = self.in_field_init, .is_async = self.in_async, .is_gen = self.in_generator, .strict = self.strict, .ifp = self.in_formal_params };
         self.in_field_init = false;
+        self.in_formal_params = false;
         self.in_async = flags.is_async;
         self.in_generator = flags.is_generator;
         return saved;
     }
     fn exitFn(self: *Parser, saved: FnCtx) void {
         self.in_field_init = saved.fi;
+        self.in_formal_params = saved.ifp;
         self.in_async = saved.is_async;
         self.in_generator = saved.is_gen;
         self.strict = saved.strict;
@@ -1063,9 +1075,14 @@ pub const Parser = struct {
     }
 
     fn parseYield(self: *Parser) ParseError!*Node {
+        // A YieldExpression may not appear in a formal parameter list.
+        if (self.in_formal_params) return self.fail("a yield expression is not allowed in formal parameters");
         const start = self.cur.start;
         self.advance(); // yield
-        const delegate = self.eat(.star);
+        // `yield [no LineTerminator here] * AssignmentExpression`: a newline
+        // before `*` breaks the delegate form.
+        const delegate = !self.cur.newline_before and self.at(.star);
+        if (delegate) self.advance();
         var arg: ?*Node = null;
         if (!self.cur.newline_before and !self.at(.semicolon) and !self.at(.r_paren) and
             !self.at(.r_brace) and !self.at(.r_bracket) and !self.at(.comma) and
