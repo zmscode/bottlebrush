@@ -106,6 +106,8 @@ pub const Op = enum(u8) {
     arr_spread, // a=array reg, b=iterable reg  (append all elements)
     iter_init, // a=dst iterator, b=iterable reg  (GetIterator)
     iter_next, // a=dst result{value,done}, b=iterator reg  (IteratorNext)
+    iter_close, // a=iterator reg  (IteratorClose, normal completion — may throw)
+    iter_close_quiet, // a=iterator reg  (IteratorClose during an abrupt completion — swallows errors)
     enum_keys, // a=dst array, b=object reg  (enumerable keys, for for-in)
     copy_rest, // a=target object (mutated), b=src reg, c=excluded-keys array reg or non-object for none  (CopyDataProperties)
     gen_yield, // a=dst (resumed value), b=yielded value reg

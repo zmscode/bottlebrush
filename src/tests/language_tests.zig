@@ -1021,3 +1021,39 @@ test "destructuring binding semantics: named eval, coercible, strict params" {
         \\return f(1, 2);
     ));
 }
+
+test "array destructuring IteratorClose" {
+    const mk =
+        \\function mk(log) { var n = 0; return {
+        \\  [Symbol.iterator]() { return this; },
+        \\  next() { return { value: ++n, done: false }; },
+        \\  return() { log.push(n); return {}; }
+        \\}; }
+        \\
+    ;
+    // Normal completion without exhausting the iterator closes it.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(mk ++
+        \\var log = []; var [a, b] = mk(log);
+        \\return (a === 1 && b === 2 && log.length === 1 && log[0] === 2) ? 1 : 0;
+    ));
+    // A rest element exhausts the iterator, so it is NOT closed.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var log = []; var it = { [Symbol.iterator]() { var n=0; return {
+        \\  next() { return { value: n, done: ++n > 3 }; }, return() { log.push("x"); return {}; } }; } };
+        \\var [...r] = it;
+        \\return log.length === 0 ? 1 : 0;
+    ));
+    // A throwing target triggers a (best-effort) close, then the error propagates.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(mk ++
+        \\var log = [];
+        \\try { var [[z]] = mk(log); return 0; }
+        \\catch (e) { return (e instanceof TypeError && log.length === 1) ? 1 : 2; }
+    ));
+    // But an error from the iterator itself marks it done — no close.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\var log = []; var it = { [Symbol.iterator]() { return {
+        \\  next() { throw new TypeError("boom"); }, return() { log.push("x"); return {}; } }; } };
+        \\try { var [a] = it; return 0; }
+        \\catch (e) { return (e instanceof TypeError && log.length === 0) ? 1 : 2; }
+    ));
+}

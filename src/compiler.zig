@@ -689,13 +689,44 @@ pub const Compiler = struct {
         self.freeTo(v);
     }
 
+    /// One IteratorBindingInitialization step into `val`: if the record is
+    /// already done, `val = undefined`; otherwise advance, record done-ness,
+    /// and read the value (undefined if this step reached the end).
+    fn emitIterStep(self: *Compiler, iter: u32, done: u32, val: u32, value_name: u32, done_name: u32) CompileError!void {
+        const juse1 = try self.emit(.{ .op = .jump_if_true, .a = done });
+        // IteratorStep / IteratorValue set the record's Done on an abrupt
+        // completion, so a throw from next() or the value getter must NOT
+        // trigger IteratorClose. Mark done pessimistically, clear it only once
+        // a value is successfully read.
+        _ = try self.emit(.{ .op = .load_true, .a = done });
+        const res = self.allocReg();
+        _ = try self.emit(.{ .op = .iter_next, .a = res, .b = iter });
+        const d = self.allocReg();
+        _ = try self.emit(.{ .op = .get_prop, .a = d, .b = res, .c = done_name });
+        const juse2 = try self.emit(.{ .op = .jump_if_true, .a = d });
+        _ = try self.emit(.{ .op = .get_prop, .a = val, .b = res, .c = value_name });
+        _ = try self.emit(.{ .op = .load_false, .a = done });
+        self.freeTo(res);
+        const jhave = try self.emit(.{ .op = .jump });
+        self.patchTarget(juse1, self.here());
+        self.patchTarget(juse2, self.here());
+        _ = try self.emit(.{ .op = .load_undefined, .a = val });
+        self.patchTarget(jhave, self.here());
+    }
+
     fn bindArrayPattern(self: *Compiler, elems: []?*Node, src: u32, mode: BindMode) CompileError!void {
         // Iterator-protocol based, per spec: works for arrays, strings, Maps,
-        // Sets, generators, and custom iterables alike.
+        // Sets, generators, and custom iterables alike. Tracks the iterator's
+        // done-ness so it can be IteratorClose'd on normal completion (not
+        // exhausted) or on an abrupt one (a target/default that throws).
         const iter = self.allocReg();
         _ = try self.emit(.{ .op = .iter_init, .a = iter, .b = src });
+        const done = self.allocReg();
+        _ = try self.emit(.{ .op = .load_false, .a = done });
         const value_name = try self.addConst(.{ .string = "value" });
         const done_name = try self.addConst(.{ .string = "done" });
+
+        const hstart = self.here();
         for (elems) |maybe| {
             if (maybe) |el| {
                 if (el.kind == .rest_element or el.kind == .spread) {
@@ -704,34 +735,62 @@ pub const Compiler = struct {
                     const arr = self.allocReg();
                     _ = try self.emit(.{ .op = .new_array, .a = arr, .b = 0 });
                     const top = self.here();
+                    const jexit = try self.emit(.{ .op = .jump_if_true, .a = done });
+                    _ = try self.emit(.{ .op = .load_true, .a = done }); // pessimistic (see emitIterStep)
                     const res = self.allocReg();
                     _ = try self.emit(.{ .op = .iter_next, .a = res, .b = iter });
-                    const done = self.allocReg();
-                    _ = try self.emit(.{ .op = .get_prop, .a = done, .b = res, .c = done_name });
-                    const jexit = try self.emit(.{ .op = .jump_if_true, .a = done });
+                    const d = self.allocReg();
+                    _ = try self.emit(.{ .op = .get_prop, .a = d, .b = res, .c = done_name });
+                    const jexit2 = try self.emit(.{ .op = .jump_if_true, .a = d });
                     const val = self.allocReg();
                     _ = try self.emit(.{ .op = .get_prop, .a = val, .b = res, .c = value_name });
+                    _ = try self.emit(.{ .op = .load_false, .a = done });
                     _ = try self.emit(.{ .op = .arr_push, .a = arr, .b = val });
                     _ = try self.emit(.{ .op = .jump, .a = top });
                     self.patchTarget(jexit, self.here());
+                    self.patchTarget(jexit2, self.here());
                     self.freeTo(res);
                     try self.compilePatternBind(target, arr, mode);
                     self.freeTo(arr);
                     break;
                 }
-                const res = self.allocReg();
-                _ = try self.emit(.{ .op = .iter_next, .a = res, .b = iter });
                 const val = self.allocReg();
-                _ = try self.emit(.{ .op = .get_prop, .a = val, .b = res, .c = value_name });
+                try self.emitIterStep(iter, done, val, value_name, done_name);
                 try self.compilePatternBind(el, val, mode);
-                self.freeTo(res);
+                self.freeTo(val);
             } else {
                 // Elision: consume one iterator result, bind nothing.
-                const res = self.allocReg();
-                _ = try self.emit(.{ .op = .iter_next, .a = res, .b = iter });
-                self.freeTo(res);
+                const val = self.allocReg();
+                try self.emitIterStep(iter, done, val, value_name, done_name);
+                self.freeTo(val);
             }
         }
+        const hend = self.here();
+
+        // Normal completion: close the iterator unless it is already exhausted.
+        const jskip = try self.emit(.{ .op = .jump_if_true, .a = done });
+        _ = try self.emit(.{ .op = .iter_close, .a = iter });
+        self.patchTarget(jskip, self.here());
+        const jover = try self.emit(.{ .op = .jump });
+
+        // Abrupt completion within the binding: best-effort close, then rethrow.
+        const catch_reg = self.allocReg();
+        try self.fs.handlers.append(self.gpa, .{
+            .try_start = hstart,
+            .try_end = hend,
+            .target_pc = self.here(),
+            .catch_reg = catch_reg,
+            .kind = .catch_clause,
+        });
+        // Only close when the record is not already done (an iterator/value
+        // error marks it done, so the close is skipped).
+        const jskip_q = try self.emit(.{ .op = .jump_if_true, .a = done });
+        _ = try self.emit(.{ .op = .iter_close_quiet, .a = iter });
+        self.patchTarget(jskip_q, self.here());
+        _ = try self.emit(.{ .op = .throw, .a = catch_reg });
+        self.freeTo(catch_reg);
+        self.patchTarget(jover, self.here());
+
         self.freeTo(iter);
     }
 

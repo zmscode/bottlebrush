@@ -971,6 +971,8 @@ pub const Vm = struct {
             .arr_spread => try self.spreadInto(regs[inst.a].asObject(), regs[inst.b]),
             .iter_init => regs[inst.a] = try self.getIterator(regs[inst.b]),
             .iter_next => regs[inst.a] = try self.iteratorNext(regs[inst.b]),
+            .iter_close => try self.iteratorClose(regs[inst.a], false),
+            .iter_close_quiet => try self.iteratorClose(regs[inst.a], true),
             .enum_keys => regs[inst.a] = Value.fromObject(try self.enumKeys(regs[inst.b])),
             .copy_rest => try self.copyRestProperties(regs[inst.a].asObject(), regs[inst.b], regs[inst.c]),
             .gen_yield => return Step{ .yielded = regs[inst.b] },
@@ -1554,6 +1556,34 @@ pub const Vm = struct {
         const r = try self.callValue(next, iter, &.{});
         if (!r.isObject()) return self.throwTypeError("iterator result is not an object");
         return r;
+    }
+
+    /// IteratorClose (spec 7.4.11). `quiet` (an abrupt completion is already in
+    /// flight) swallows any error from `return`, so the original completion
+    /// wins; otherwise a throwing / non-object `return` result propagates.
+    pub fn iteratorClose(self: *Vm, iter: Value, quiet: bool) Error!void {
+        if (!iter.isObject()) return;
+        const ret = self.getProperty(iter, "return") catch |e| {
+            if (quiet and e == error.JsThrow) {
+                self.pending_exception = null;
+                return;
+            }
+            return e;
+        };
+        if (ret.isNullish()) return;
+        if (!isCallable(ret)) {
+            if (quiet) return;
+            return self.throwTypeError("iterator 'return' is not callable");
+        }
+        const r = self.callValue(ret, iter, &.{}) catch |e| {
+            if (quiet and e == error.JsThrow) {
+                self.pending_exception = null;
+                return;
+            }
+            return e;
+        };
+        if (quiet) return;
+        if (!r.isObject()) return self.throwTypeError("iterator 'return' must return an object");
     }
 
     pub fn iterPair(self: *Vm, a: Value, b: Value) Error!Value {
