@@ -7,17 +7,17 @@
 ---
 
 ## 0. Prerequisites
-- [ ] Phase 4 iteration protocol + library in place (async iterators build on it).
+- [x] Phase 4 iteration protocol + library in place (async iterators build on it). **DONE (Phase 4).**
 
 ## 1. Resumable frames (the enabling primitive)
-- [ ] Design a **suspendable call frame**: a generator/async frame must be heap-allocated (a GC object), capturing register file + instruction pointer + environment so it can be parked and resumed.
-- [ ] Bytecode support: `Suspend`/`Resume` (or `Yield`), `Await`, saving/restoring the operand state at a suspend point. The compiler must split functions at suspend points and know which registers are live across them.
-- [ ] `trace` the parked frame's registers as GC roots while suspended.
+- [x] Design a **suspendable call frame**: a generator/async frame must be heap-allocated (a GC object), capturing register file + instruction pointer + environment so it can be parked and resumed. **DONE for generators: `gc.GeneratorState` (heap-owned) holds `regs` + `pc` + `env` + `this`; the generator object references it. (Async frames reuse this once async lands.)**
+- [ ] Bytecode support: `Suspend`/`Resume` (or `Yield`), `Await`, saving/restoring the operand state at a suspend point. The compiler must split functions at suspend points and know which registers are live across them. **PARTIAL: `gen_yield` op + `generatorResume` implement yield/suspend/resume; the whole register file is preserved (no liveness analysis needed). `Await` is not done (Phase 5 §5).**
+- [x] `trace` the parked frame's registers as GC roots while suspended. **DONE: `Object.trace` marks a suspended generator's `env`, `this_value`, and all `regs`.**
 
 ## 2. Generators (`function*`)
-- [ ] Generator objects + `%GeneratorPrototype%` (`next`/`return`/`throw`), generator states (`suspendedStart/suspendedYield/executing/completed`), `GeneratorResume(Abrupt)`.
-- [ ] `yield` and `yield*` (delegation: forwards `next/return/throw` to the inner iterable, `IteratorClose` on early completion).
-- [ ] `for-of`/spread already route through iteration protocol (Phase 4) → generators just work as iterables.
+- [x] Generator objects + `%GeneratorPrototype%` (`next`/`return`/`throw`), generator states (`suspendedStart/suspendedYield/executing/completed`), `GeneratorResume(Abrupt)`. **DONE: `makeGenerator`/`generatorResume` with start/suspended/executing/completed states; next/return/throw modes; enabled in the runner (+415).**
+- [ ] `yield` and `yield*` (delegation: forwards `next/return/throw` to the inner iterable, `IteratorClose` on early completion). **PARTIAL: `yield` and `yield*` value delegation work (for-of/spread over a delegated iterator); `yield*` does NOT yet forward `return`/`throw` into the inner iterator or run `IteratorClose` on early completion. Generator early-errors (yield in labels/params, yield* after newline) are enforced.**
+- [x] `for-of`/spread already route through iteration protocol (Phase 4) → generators just work as iterables. **DONE.**
 
 ## 3. Jobs & the microtask queue (Agent)
 - [ ] `Agent` owns a **job queue** (microtasks). `HostEnqueuePromiseJob`, `RunJobs` drains after each script/module + between turns.
