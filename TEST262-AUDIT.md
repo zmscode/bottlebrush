@@ -5,15 +5,24 @@ grouped by root cause and ranked by payoff. Regenerate the raw data by flipping
 `trace_files = true` in `test262/runner.zig`, rebuilding, and grepping the
 runner's `FAILCASE`/`SKIPCASE` lines (each is `TAG <path> <reason>`).
 
-**As of 2026-07-09** (commit `91fe8d8`):
+**As of 2026-07-09** (commit `e879474`):
 
 | Bucket | Count | % of corpus |
 |--------|------:|------------:|
 | **files** | 5977 | 100% |
-| **pass** | 3327 | 55.7% |
-| **fail** | 990 | 16.6% |
-| **skip** | 1660 | 27.8% |
-| pass of executed (pass+fail) | | **77.1%** |
+| **pass** | 3591 | 60.1% |
+| **fail** | 736 | 12.3% |
+| **skip** | 1650 | 27.6% |
+| pass of executed (pass+fail) | | **83.0%** |
+
+> **Progress since the first audit (was 3327 pass / 990 fail):** F1
+> escaped-keys (+172), F5 RegExp @@split species (+22), and the F2/S1
+> worklist — shorthand-reserved (+46), undeclared-private (+5),
+> per-function strict (+9), for-in head (+2), rest parameters (+8 and
+> `super(...args)` forwarding). Remaining fails are the Proxy invariants
+> (F3, ~104), the direct-eval + brand-ordering class runtime (F4, ~54),
+> the smaller runtime tail (F6), and the fiddlier parse-negatives
+> (cover-init-name, deep dstr-target validation, await/yield labels).
 
 "Executed rate" is the honest correctness signal; "skip" is coverage we
 deliberately or unavoidably decline. The goal of this document is to convert the
