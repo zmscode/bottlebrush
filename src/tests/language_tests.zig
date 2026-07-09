@@ -571,6 +571,17 @@ test "private class members" {
         \\var a = new A(), b = new B();
         \\return (a.getA() === "a" && b.getB() === "b" && B.hasA(b) && !B.hasA(a)) ? 1 : 0;
     ));
+    // A direct eval inside a method sees the class's private members and `this`.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class C { #m() { return 7; } run() { return eval("this.#m()"); } }
+        \\return new C().run() === 7 ? 1 : 0;
+    ));
+    // The private brand check still applies through a direct eval: calling the
+    // method with a non-branded `this` throws TypeError.
+    try std.testing.expectEqual(@as(f64, 1), try evalNumber(
+        \\class C { #m() { return 1; } run() { return eval("this.#m()"); } }
+        \\try { C.prototype.run.call({}); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; }
+    ));
     // Private members are invisible to enumeration and normal access.
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
         \\class C { #hidden = 1; pub = 2; }

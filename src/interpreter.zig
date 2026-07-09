@@ -568,6 +568,35 @@ pub const Vm = struct {
         return self.execute(root, env, Value.fromObject(self.global_object.?));
     }
 
+    /// Direct `eval(src)`: compile `src` against the caller's private-name
+    /// scope and run it with the caller's `this` and a child of the caller's
+    /// environment, so private members and `this` stay visible. Outer locals
+    /// resolved by the fragment fall back to global lookup (a partial model:
+    /// `super` and outer non-global bindings aren't captured yet).
+    pub fn directEval(self: *Vm, arg: Value, caller_env: *gc.Environment, caller_this: Value, code: *const bc.CodeBlock) Error!Value {
+        if (!arg.isString()) return arg; // non-strings pass through unchanged
+        const src8 = try utf16ToUtf8Alloc(self.gpa, arg.asString().units);
+        defer self.gpa.free(src8);
+
+        const parser_mod = @import("parser.zig");
+        const compiler_mod = @import("compiler.zig");
+        const pr = parser_mod.parseWithOptions(self.gpa, src8, .script, code.private_env.len > 0) catch return error.OutOfMemory;
+        var tree = switch (pr) {
+            .syntax_error => return self.throwSyntaxError("eval: invalid or unsupported source"),
+            .ok => |t| t,
+        };
+        defer tree.deinit();
+        const cr = compiler_mod.compileEval(self.gpa, tree.root, src8, code.private_env) catch return error.OutOfMemory;
+        const program = switch (cr) {
+            .compile_error => return self.throwSyntaxError("eval: invalid or unsupported source"),
+            .ok => |p| p,
+        };
+        try self.eval_programs.append(self.gpa, program);
+        const root = self.eval_programs.items[self.eval_programs.items.len - 1].root;
+        const eval_env = try self.createEnv(caller_env, root.num_env_slots);
+        return self.execute(root, eval_env, caller_this);
+    }
+
     /// True once the current `run` has exceeded its wall-clock deadline.
     pub fn overBudget(self: *Vm) bool {
         return std.Io.Clock.now(.awake, self.threaded.io()).nanoseconds > self.deadline_ns;
@@ -773,6 +802,7 @@ pub const Vm = struct {
             .gen_yield => return Step{ .yielded = regs[inst.b] },
 
             .new_closure => regs[inst.a] = try self.makeClosure(code.children[inst.b], env, this_value),
+            .direct_eval => regs[inst.a] = try self.directEval(regs[inst.b], env, this_value, code),
             .set_fn_name => try self.setFunctionName(regs[inst.a], code.constants[inst.b].string),
             .call => {
                 const receiver = regs[inst.b];

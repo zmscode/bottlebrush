@@ -109,6 +109,11 @@ pub const Op = enum(u8) {
     copy_rest, // a=target object (mutated), b=src reg, c=excluded-keys array reg or non-object for none  (CopyDataProperties)
     gen_yield, // a=dst (resumed value), b=yielded value reg
 
+    // Direct eval: a=dst, b=argument reg. Compiles its string argument against
+    // the caller's private-name scope and runs it with the caller's `this` and
+    // environment (private members / locals stay visible).
+    direct_eval,
+
     // Functions
     new_closure, // a=dst, b=child code-block index
     set_fn_name, // a=fn reg, b=name const  (SetFunctionName: sets .name iff currently empty)
@@ -140,6 +145,10 @@ pub const Const = union(enum) {
     string: []const u8, // cooked UTF-8 (Phase 2 cooking is minimal)
     bigint: []const u8,
 };
+
+/// A private name (`#x`) visible in a code block, with its resolved hidden
+/// key. Captured so a direct `eval` can resolve the same private members.
+pub const PrivateBinding = struct { name: []const u8, key: []const u8 };
 
 pub const HandlerKind = enum { catch_clause, finally_clause };
 
@@ -177,6 +186,8 @@ pub const CodeBlock = struct {
     /// from index `rest_from` onward. null when there is no rest parameter.
     rest_slot: ?u32 = null,
     rest_from: u32 = 0,
+    /// Private names in lexical scope here, for direct `eval` to resolve.
+    private_env: []const PrivateBinding = &.{},
     code: []Inst = &.{},
     constants: []Const = &.{},
     children: []*CodeBlock = &.{},

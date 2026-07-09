@@ -1780,6 +1780,13 @@ fn binaryPrec(k: Kind) ?u8 {
 // ---- public entry ----------------------------------------------------------
 
 pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_type: ast.SourceType) ParseError!Result {
+    return parseWithOptions(gpa, source, source_type, false);
+}
+
+/// `allow_private` seeds the private-name depth so a direct `eval`'s source
+/// (compiled inside a class) may reference `#name` even though the fragment
+/// isn't syntactically inside a class body.
+pub fn parseWithOptions(gpa: std.mem.Allocator, source: []const u8, source_type: ast.SourceType, allow_private: bool) ParseError!Result {
     var arena = std.heap.ArenaAllocator.init(gpa);
     var p = Parser{
         .source = source,
@@ -1789,6 +1796,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_type: ast.Source
         .strict = source_type == .module,
         .source_type = source_type,
     };
+    if (allow_private) p.private_depth = 1;
     p.cur = p.lexer.next();
 
     const root = p.parseProgram() catch |e| switch (e) {

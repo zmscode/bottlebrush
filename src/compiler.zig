@@ -66,6 +66,12 @@ const FnState = struct {
     /// touched before initialization. Empty for base constructors (which
     /// install in the prologue) and non-constructors.
     deferred_instance_fields: []const *Node = &.{},
+    /// Private names visible in this function's body (snapshot of the enclosing
+    /// class private scopes), captured so a direct `eval` can resolve them.
+    private_env: []const bc.PrivateBinding = &.{},
+    /// Whether `new.target` is legal here (any real function body; not the
+    /// top-level script/indirect-eval scope).
+    new_target_allowed: bool = false,
     env_slot_count: u32 = 0,
     reg_top: u32 = 0,
     max_regs: u32 = 0,
@@ -99,6 +105,15 @@ pub const Compiler = struct {
     /// Monotonic id giving each class body its own private-name namespace, so
     /// two classes' `#x` never collide.
     private_class_seq: u32 = 0,
+    /// Whether `new.target` is legal at the root (top-level) function. False
+    /// for a script/indirect eval (SyntaxError there), true for a direct eval
+    /// that inherits an enclosing function's new-target.
+    root_new_target_allowed: bool = false,
+    /// True while compiling a direct `eval`'s source. `new.target` is only
+    /// modelled (as undefined) there; elsewhere it stays unsupported so real
+    /// new-target-value code remains a declined compile-gap rather than a
+    /// wrong-answer pass.
+    eval_compile: bool = false,
 
     fn fail(self: *Compiler, comptime msg: []const u8, pos: u32) CompileError {
         if (self.diag == null) self.diag = .{ .message = msg, .pos = pos };
@@ -282,6 +297,13 @@ pub const Compiler = struct {
     ) CompileError!*bc.CodeBlock {
         var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_arrow = is_arrow };
         if (is_derived_ctor) fs.deferred_instance_fields = class_fields;
+        // `new.target` is legal in any non-arrow function body; an arrow
+        // inherits its enclosing function's new-target (so an arrow at the
+        // script / indirect-eval top level has none — a SyntaxError).
+        fs.new_target_allowed = if (is_arrow)
+            (if (parent_fs) |pf| pf.new_target_allowed else self.root_new_target_allowed)
+        else
+            (if (parent_fs == null) self.root_new_target_allowed else true);
         // Strict mode is inherited from the enclosing function, forced by the
         // context (class bodies), or switched on by a "use strict" directive.
         if (parent_fs) |pf| fs.is_strict = pf.is_strict;
@@ -293,6 +315,21 @@ pub const Compiler = struct {
         self.fs = &fs;
         defer self.fs = prev;
         defer self.deinitFnState(&fs);
+
+        // Snapshot the private names in scope so a direct `eval` in this body
+        // can resolve `#name` against the same hidden keys.
+        {
+            var pe: std.ArrayList(bc.PrivateBinding) = .empty;
+            defer pe.deinit(self.gpa);
+            for (self.private_scopes.items) |scope| {
+                var it = scope.names.iterator();
+                while (it.next()) |e| try pe.append(self.gpa, .{
+                    .name = try self.arena.dupe(u8, e.key_ptr.*),
+                    .key = e.value_ptr.*,
+                });
+            }
+            fs.private_env = try self.arena.dupe(bc.PrivateBinding, pe.items);
+        }
 
         try self.pushBlock();
 
@@ -457,6 +494,7 @@ pub const Compiler = struct {
             .arguments_slot = fs.arguments_slot,
             .rest_slot = fs.rest_slot,
             .rest_from = fs.rest_from,
+            .private_env = fs.private_env,
             .code = try self.arena.dupe(Inst, fs.code.items),
             .constants = try self.dupeConstants(fs.constants.items),
             .children = try self.arena.dupe(*bc.CodeBlock, fs.children.items),
@@ -1319,6 +1357,17 @@ pub const Compiler = struct {
             .tagged_template => |tt| try self.compileTaggedTemplate(dst, tt),
             .class => |cls| try self.compileClass(dst, cls, node.start),
             .yield_expr => |y| try self.compileYield(dst, y),
+            // `new.target`. Only modelled inside a direct eval (as undefined,
+            // which is correct for the method/field-initializer contexts these
+            // tests use). Elsewhere it's left unsupported so real new-target
+            // value semantics stay a declined compile-gap, not a wrong pass.
+            // At an eval root that isn't a function (indirect eval) it's a
+            // SyntaxError.
+            .meta_property => {
+                if (!self.eval_compile) return self.fail("new.target value is not supported", node.start);
+                if (!self.fs.new_target_allowed) return self.fail("new.target is only valid inside functions", node.start);
+                _ = try self.emit(.{ .op = .load_undefined, .a = dst });
+            },
             else => return self.fail("unsupported expression", node.start),
         }
     }
@@ -1928,6 +1977,23 @@ pub const Compiler = struct {
         var has_spread = false;
         for (c.args) |arg| {
             if (arg.kind == .spread) has_spread = true;
+        }
+
+        // Direct eval: `eval(x)` where `eval` is not a local binding runs `x`
+        // in this scope (private members, `this`, and the local environment
+        // stay visible). Only the plain single-argument, non-spread form.
+        if (c.callee.kind == .ident and std.mem.eql(u8, c.callee.kind.ident, "eval") and
+            self.resolve("eval") == null and !has_spread and c.args.len <= 1)
+        {
+            if (c.args.len == 0) {
+                _ = try self.emit(.{ .op = .load_undefined, .a = dst });
+                return;
+            }
+            const argr = self.allocReg();
+            try self.compileExprInto(argr, c.args[0]);
+            _ = try self.emit(.{ .op = .direct_eval, .a = dst, .b = argr });
+            self.freeTo(argr);
+            return;
         }
 
         // Call layout: base=receiver (this), base+1=callee.
@@ -2548,6 +2614,56 @@ pub fn compile(gpa: std.mem.Allocator, program: *Node, source: []const u8) Compi
     dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
 
     const root = c.compileFunction("<script>", &.{}, dummy_body, false, false, false, false, &.{}, false, null) catch |e| switch (e) {
+        error.OutOfMemory => {
+            arena.deinit();
+            return error.OutOfMemory;
+        },
+        else => {
+            const diag = c.diag orelse Diagnostic{ .message = "compile error", .pos = program.start };
+            arena.deinit();
+            return .{ .compile_error = diag };
+        },
+    };
+
+    return .{ .ok = .{ .arena = arena, .root = root } };
+}
+
+/// Compile a direct `eval`'s source, seeding the private-name scope with the
+/// caller's visible private members so `this.#x` resolves to the same keys.
+pub fn compileEval(gpa: std.mem.Allocator, program: *Node, source: []const u8, private_env: []const bc.PrivateBinding) CompileError!Result {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    var c = Compiler{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .source = source,
+        .fs = undefined,
+        // A direct eval sits inside some function, so `new.target` is legal
+        // (evaluates to undefined) rather than a top-level SyntaxError.
+        .root_new_target_allowed = true,
+        .eval_compile = true,
+    };
+    defer c.private_scopes.deinit(gpa);
+
+    // Seed a private-name scope from the caller's captured bindings.
+    if (private_env.len > 0) {
+        var scope: PrivateScope = .{};
+        for (private_env) |pb| {
+            scope.names.put(c.arena, pb.name, pb.key) catch {
+                arena.deinit();
+                return error.OutOfMemory;
+            };
+        }
+        c.private_scopes.append(gpa, scope) catch {
+            arena.deinit();
+            return error.OutOfMemory;
+        };
+    }
+
+    const body = program.kind.program.body;
+    const dummy_body = try c.arena.create(Node);
+    dummy_body.* = .{ .start = program.start, .end = program.end, .kind = .{ .block_stmt = body } };
+
+    const root = c.compileFunction("<eval>", &.{}, dummy_body, false, false, false, false, &.{}, false, null) catch |e| switch (e) {
         error.OutOfMemory => {
             arena.deinit();
             return error.OutOfMemory;
