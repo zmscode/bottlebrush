@@ -48,12 +48,12 @@
 - [x] **`finally` correctness:** `break`/`continue`/`return`/`throw` crossing a `finally` must run it first, then resume the pending completion. Model completion as a small runtime value the `finally` epilogue re-dispatches. This is the one place literal-ish completion handling is worth it. *(FIXED 2026-07-08: finalizers inline on return/break/continue and run+rethrow via a catch-all handler on the throw path; a finalizer's own abrupt completion replaces the pending one)*
 
 ## 5. Minimal runtime to run tests (`runtime/`)
-- [ ] `Realm` + global object; wire `$262`/`print` from the harness. **← GAP: `$262`/`print` not wired**
+- [x] `Realm` + global object; wire `$262`/`print` from the harness. **DONE: `runtime/realm.zig` builds the global object + prototype chain; `print`/`console.*` wired (`global.zig`); `$262` installed via `installHostHooks`. (Remaining `$262.createRealm`/`.agent` methods tracked in phase-0 §4 and phase-3.)**
 - [x] Minimal `Object`, `Function.prototype`, `Array` (literal + indexing + `length`), the error constructors (`TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`) so thrown errors classify correctly in Test262.
 - [x] `%prototype%` chain wiring (proper object model is Phase 3, but the plumbing starts here).
 
 ## 6. Testing
-- [ ] Disassembler snapshot tests for representative functions. **← GAP: one smoke test, no snapshots**
+- [ ] Disassembler snapshot tests for representative functions. **STILL OUTSTANDING: `CodeBlock.disassemble` exists with one smoke test (`bytecode.zig`); no per-function golden snapshots. (Low priority.)**
 - [x] Unit tests: arithmetic/coercion edge cases, closures, TDZ, `finally` unwinding.
 - [x] **Test262 `language/**`** now runs for real. Track the number; drive up `expressions`, `statements`, `types`.
 - [x] Run everything under `GC_STRESS=1`.

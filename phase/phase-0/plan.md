@@ -59,7 +59,7 @@
 - [x] **Frontmatter parser** (`frontmatter.zig`): parse the `/*--- ... ---*/` YAML block → `flags` (`onlyStrict`, `noStrict`, `module`, `raw`, `async`, `CanBlockIsFalse`…), `features`, `includes`, `negative` (`phase`, `type`), `es5id`/`es6id`/`esid`.
 - [x] **Harness file loader:** always prepend `harness/assert.js` + `harness/sta.js` (unless `raw`); load `harness/<include>.js` for each `includes:` (e.g. `propertyHelper.js`, `compareArray.js`, `doneprintHandle.js`).
 - [x] **Runner (`runner.zig`):** for each test file →
-  - [ ] compute the run variants: `onlyStrict` → strict only; `noStrict` → sloppy only; neither → run **both** (prepend `"use strict";` for the strict variant). **← GAP: engine has no strict mode; tests run once (sloppy); `onlyStrict` prepends a directive the engine ignores**
+  - [x] compute the run variants: `onlyStrict` → strict only; `noStrict` → sloppy only; neither → run **both** (prepend `"use strict";` for the strict variant). **DONE: `runVariant(strict)` runs both variants (worst-of), and the engine honors a `"use strict"` directive prologue (`hasUseStrictDirective` → `CodeBlock.is_strict`). Note: strict *semantics* coverage is still partial (assignment/delete/`this` errors gated; not every strict early-error yet).**
   - [x] fresh realm per test (realm is a stub now; interface exists).
   - [x] execute; capture thrown value / uncaught error.
   - [x] **classify:**
@@ -67,12 +67,12 @@
     - normal test → PASS iff it completes with no exception.
     - engine can't-yet-run (unimplemented) → **SKIP** with reason, not FAIL.
   - [ ] `async` flag → wait for `print('Test262:AsyncTestComplete')` sentinel via the `doneprintHandle` harness contract (stub the print hook now). *(deferred with async to Phase 5)*
-- [ ] **`$262` host object** (stub methods, real later): `$262.createRealm`, `$262.evalScript`, `$262.detachArrayBuffer`, `$262.gc`, `$262.global`, `$262.agent`. **← GAP: `$262` absent; dependent tests skip/fail**
+- [ ] **`$262` host object** (stub methods, real later): `$262.createRealm`, `$262.evalScript`, `$262.detachArrayBuffer`, `$262.gc`, `$262.global`, `$262.agent`. **PARTIAL: `$262` is installed (`installHostHooks`) with `.global`, `.evalScript`, `.gc`, `.detachArrayBuffer`. STILL OUTSTANDING: `.createRealm` (needs real fresh realms — see phase-3) and `.agent`.**
 - [x] **Filtering:** CLI flags to run a subdir (`--path language/types`), by feature include/exclude, and an **expected-fail / skip list file** (so known-unimplemented areas don't spam FAIL). *(partial: directory arg ✓; feature denylist is in-code, no skip-list file)*
 - [x] **Reporting (`report.zig`):** totals + per-directory pass/fail/skip counts; machine-readable JSON output for CI to chart over time; non-zero exit on *regression* vs a committed baseline (not on absolute failures). *(partial: totals + JSON + CI regression ✓; no per-directory counts)*
 
 ## 5. CLI & REPL
-- [ ] `main.zig`: `engine run file.js`, `engine` (REPL). Evaluation is a stub that returns `undefined`; wire the plumbing (read → [stub eval] → print). **← GAP: main.zig runs a fixed demo; no file runner/REPL**
+- [x] `main.zig`: `engine run file.js`, `engine` (REPL). Evaluation is a stub that returns `undefined`; wire the plumbing (read → [stub eval] → print). **DONE: `bottlebrush file.js` reads + runs a script (`Dir.cwd().readFileAlloc`); no-arg starts a REPL (`takeDelimiter('\n')`, completion-value echo). Real eval, not a stub.**
 
 ## 6. CI
 - [x] GitHub Actions (or chosen CI): build, `zig build test`, `zig build test262 --path <small slice>`, upload the JSON scoreboard as an artifact, fail on regression against baseline.

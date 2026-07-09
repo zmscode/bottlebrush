@@ -39,21 +39,21 @@
 
 ## 3. AST (`ast.zig`)
 - [x] Node union with source spans on every node (needed for `Function.prototype.toString`, errors).
-- [ ] Keep a **strict-mode flag** threaded through scopes. **← GAP: strict mode is not tracked anywhere (parser, compiler, or VM)**
+- [x] Keep a **strict-mode flag** threaded through scopes. **DONE: `Parser.strict` (module/directive), compiler `FnState.is_strict` (inherited from parent, forced by class bodies, or a `"use strict"` prologue), and `CodeBlock.is_strict` consumed by the VM.**
 - [x] Store enough to reconstruct source text ranges verbatim (for `toString`).
 - [x] Consider an arena allocator for AST nodes (freed after bytecode compile).
 
 ## 4. Testing
-- [ ] Unit: golden AST snapshots for a curated set of tricky inputs (arrows, destructuring, ASI edge cases, template nesting, regex-vs-div). **← GAP: unit tests exist but no golden-snapshot corpus**
+- [ ] Unit: golden AST snapshots for a curated set of tricky inputs (arrows, destructuring, ASI edge cases, template nesting, regex-vs-div). **STILL OUTSTANDING: parser has `expectParses`/behavioral unit tests but no golden-AST-snapshot corpus. (Low priority — Test262 parse-negatives cover the surface.)**
 - [x] **Test262 parse mode:** run `language/**` with "parse only"; PASS negatives that should be `SyntaxError` at parse phase; PASS positives that parse cleanly. Ignore runtime semantics for now (skip).
-- [ ] Fuzz the lexer/parser with random byte strings for crash-safety. **← GAP: never fuzzed**
+- [ ] Fuzz the lexer/parser with random byte strings for crash-safety. **STILL OUTSTANDING: never fuzzed. (Crash-safety is exercised indirectly by the ~6k-file Test262 corpus, but no dedicated random-input fuzzer.)**
 
 ---
 
 ## Exit criteria
 - [x] Parses the overwhelming majority of Test262 `.js` sources without panics.
 - [x] Correctly accepts/rejects `negative: {phase: parse, type: SyntaxError}` tests (target: high pass rate on the parse-phase negative corpus).
-- [ ] AST carries source spans + strict-mode flags; arena lifecycle documented. **← GAP: strict mode is not tracked anywhere (parser, compiler, or VM)**
+- [ ] AST carries source spans + strict-mode flags; arena lifecycle documented. **PARTIAL: source spans on every node ✓ and arena lifecycle ✓; strict mode IS tracked (parser/compiler/VM, see §3) but as parser/compiler state, not as a flag stored on AST nodes. Functionally satisfied; literally a per-node AST flag is not stored.**
 
 ## Notes / risks
 - **Cover grammars (arrows, destructuring) are the classic time sink.** Budget for them explicitly; get them right with snapshot tests before moving on.

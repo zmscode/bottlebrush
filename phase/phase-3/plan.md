@@ -14,7 +14,7 @@
 - [x] **PropertyKey:** string or symbol (canonicalize integer-index strings for array-index fast paths later).
 - [x] **PropertyDescriptor:** data (`value`, `writable`) vs accessor (`get`, `set`), plus `enumerable`, `configurable`; validation & completion per `ValidateAndApplyPropertyDescriptor`. *(FIXED 2026-07-08: partial descriptors merge; non-configurable invariants enforced with TypeError; non-extensible objects reject new properties)*
 - [x] **Ordinary internal methods** (`[[...]]`) as functions, spec-literal:
-  - [ ] `[[GetPrototypeOf]]`, `[[SetPrototypeOf]]` (cycle check), `[[IsExtensible]]`, `[[PreventExtensions]]` **← GAP: `[[SetPrototypeOf]]`/`Object.setPrototypeOf` missing entirely (no cycle check); the rest of the line is done**
+  - [x] `[[GetPrototypeOf]]`, `[[SetPrototypeOf]]` (cycle check), `[[IsExtensible]]`, `[[PreventExtensions]]` **DONE (2026-07-09): `setPrototypeChecked` implements OrdinarySetPrototypeOf (cycle check, non-extensible refusal → false) returning a bool; wired to `Object.setPrototypeOf`, the `__proto__` setter, and `Reflect.setPrototypeOf`. Proxy setPrototypeOf/getPrototypeOf traps + invariants included.**
   - [x] `[[GetOwnProperty]]`, `[[DefineOwnProperty]]` (→ `OrdinaryDefineOwnProperty` + `ValidateAndApplyPropertyDescriptor`)
   - [x] `[[HasProperty]]`, `[[Get]]` (accessor invocation, receiver threading), `[[Set]]` (accessor/receiver, `CreateDataProperty` fallback)
   - [x] `[[Delete]]`, `[[OwnPropertyKeys]]` (integer-index order → insertion order strings → symbols)
@@ -31,12 +31,12 @@
 
 ## 4. Environments & closures (finish what Phase 2 started)
 - [x] Formalize environment records: declarative, object (`with`/global), function, module (Phase 5); `[[Get/Set]]BindingValue`, TDZ via uninitialized bindings. *(partial: no object env (`with`) or module env)*
-- [ ] `arguments` object done properly: **mapped** (sloppy, aliases params) vs **unmapped** (strict); the parameter-map exotic behavior. **← GAP: `arguments` is a plain object — no mapped/unmapped distinction, no parameter aliasing**
+- [x] `arguments` object done properly: **mapped** (sloppy, aliases params) vs **unmapped** (strict); the parameter-map exotic behavior. **DONE: `makeArgumentsObject` + `mapArguments` build a mapped object for sloppy simple-param functions (`args_env`/`args_map` bitmask); `mappedArgIndex` aliases reads/writes through to the parameter slots, and an accessor/`writable:false` redefine severs the alias (`applyDescriptor`). Strict or non-simple-param functions get an unmapped object.**
 - [x] `this` resolution finalized across sloppy/strict/arrow/eval/module.
 
 ## 5. Realm & intrinsics wiring
 - [x] `Realm` holds the intrinsics table (`%Object.prototype%`, `%Function.prototype%`, `%Array.prototype%`, error prototypes, …). `CreateIntrinsics` sets up the prototype graph in the correct order.
-- [ ] `$262.createRealm` returns a genuinely fresh realm (needed by many Test262 tests). **← GAP: no `$262`**
+- [ ] `$262.createRealm` returns a genuinely fresh realm (needed by many Test262 tests). **STILL OUTSTANDING: `$262` exists but `createRealm` is not implemented (no multi-realm support). `feature:cross-realm` tests stay denylisted (~42 skips). Needs a real second Realm with its own intrinsics.**
 
 ## 6. `Object` built-in (proves the model)
 - [x] `Object` constructor + `Object.prototype` (`hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`@@toStringTag`), `valueOf`, `toLocaleString`, `__proto__` accessor, legacy `__defineGetter__` etc. — Annex B). *(partial: `@@toStringTag` not consulted; `__proto__` accessor + Annex B getters missing)*
