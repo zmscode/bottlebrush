@@ -200,6 +200,21 @@ pub const Parser = struct {
     }
 
     /// After `async`, is the next token `function` with no line break between?
+    /// The `[In]` grammar parameter suppresses only a **top-level** `in` in a
+    /// `for` head, where `for (var x = a in b;;)` would be ambiguous with
+    /// for-in. Inside any bracketed construct — parentheses, an array or object
+    /// literal, call arguments, a computed key, a template substitution — the
+    /// ambiguity is gone and `in` is an ordinary relational operator again:
+    ///
+    ///     for (let v = (a in b); v; v++) {}   // legal
+    ///
+    /// Callers save the flag, clear it for the bracketed region, and restore.
+    fn allowIn(self: *Parser) bool {
+        const saved = self.no_in;
+        self.no_in = false;
+        return saved;
+    }
+
     fn peekIsFunctionNoBreak(self: *Parser) bool {
         const s = self.save();
         defer self.restore(s);
@@ -657,6 +672,8 @@ pub const Parser = struct {
     }
 
     fn parseParams(self: *Parser) ParseError![]*Node {
+        const saved_in = self.allowIn();
+        defer self.no_in = saved_in;
         const saved_ifp = self.in_formal_params;
         self.in_formal_params = true;
         defer self.in_formal_params = saved_ifp;
@@ -1112,20 +1129,29 @@ pub const Parser = struct {
         }
     }
 
-    const FnCtx = struct { fi: bool, is_async: bool, is_gen: bool, strict: bool, ifp: bool };
+    const FnCtx = struct { fi: bool, is_async: bool, is_gen: bool, strict: bool, ifp: bool, no_in: bool };
 
     /// Enter a (non-arrow) function body: reset field-init state and set the
     /// await/yield reservation from the function's own async/generator kind.
     /// Strictness is saved so a body-level `"use strict"` doesn't leak out.
     fn enterFn(self: *Parser, flags: ast.FunctionFlags) FnCtx {
-        const saved = FnCtx{ .fi = self.in_field_init, .is_async = self.in_async, .is_gen = self.in_generator, .strict = self.strict, .ifp = self.in_formal_params };
+        const saved = FnCtx{
+            .fi = self.in_field_init,
+            .is_async = self.in_async,
+            .is_gen = self.in_generator,
+            .strict = self.strict,
+            .ifp = self.in_formal_params,
+            .no_in = self.no_in,
+        };
         self.in_field_init = false;
         self.in_formal_params = false;
+        self.no_in = false;
         self.in_async = flags.is_async;
         self.in_generator = flags.is_generator;
         return saved;
     }
     fn exitFn(self: *Parser, saved: FnCtx) void {
+        self.no_in = saved.no_in;
         self.in_field_init = saved.fi;
         self.in_formal_params = saved.ifp;
         self.in_async = saved.is_async;
@@ -1204,6 +1230,8 @@ pub const Parser = struct {
     /// Attempt to parse an arrow function; returns null (and restores state) if
     /// the input is not an arrow.
     fn tryParseArrow(self: *Parser) ParseError!?*Node {
+        const saved_in = self.allowIn();
+        defer self.no_in = saved_in;
         const s = self.save();
         const start = self.cur.start;
         var flags: ast.FunctionFlags = .{ .is_arrow = true };
@@ -1394,7 +1422,9 @@ pub const Parser = struct {
                 },
                 .l_bracket => {
                     self.advance();
+                    const saved_in = self.allowIn();
                     const prop = try self.parseExpression();
+                    self.no_in = saved_in;
                     try self.expect(.r_bracket);
                     expr = try self.node(expr.start, self.prev_end, .{ .member = .{ .object = expr, .property = prop, .computed = true, .optional = false } });
                 },
@@ -1449,6 +1479,8 @@ pub const Parser = struct {
     }
 
     fn parseArguments(self: *Parser) ParseError![]*Node {
+        const saved_in = self.allowIn();
+        defer self.no_in = saved_in;
         try self.expect(.l_paren);
         var args: NodeList = .empty;
         while (!self.at(.r_paren) and !self.at(.eof)) {
@@ -1547,7 +1579,9 @@ pub const Parser = struct {
             },
             .l_paren => {
                 self.advance();
+                const saved_in = self.allowIn();
                 const expr = try self.parseExpression();
+                self.no_in = saved_in;
                 try self.expect(.r_paren);
                 return expr;
             },
@@ -1563,6 +1597,8 @@ pub const Parser = struct {
     }
 
     fn parseTemplate(self: *Parser) ParseError!*Node {
+        const saved_in = self.allowIn();
+        defer self.no_in = saved_in;
         const start = self.cur.start;
         var quasis: std.ArrayList([]const u8) = .empty;
         var exprs: NodeList = .empty;
@@ -1599,6 +1635,8 @@ pub const Parser = struct {
     }
 
     fn parseArrayLiteral(self: *Parser) ParseError!*Node {
+        const saved_in = self.allowIn();
+        defer self.no_in = saved_in;
         const start = self.cur.start;
         try self.expect(.l_bracket);
         var elems: OptNodeList = .empty;
@@ -1623,6 +1661,8 @@ pub const Parser = struct {
     }
 
     fn parseObjectLiteral(self: *Parser) ParseError!*Node {
+        const saved_in = self.allowIn();
+        defer self.no_in = saved_in;
         const start = self.cur.start;
         try self.expect(.l_brace);
         var props: NodeList = .empty;

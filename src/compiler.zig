@@ -565,16 +565,33 @@ pub const Compiler = struct {
     /// `continue` leaves their protected regions. While a finalizer compiles,
     /// the stack is truncated to its own level so abrupt exits *inside* the
     /// finalizer only run the finalizers that enclose it.
+    /// Emit the pending `finally` blocks from the innermost down to `base`, as
+    /// an abrupt completion (`return`/`break`/`continue`) unwinds past them.
+    ///
+    /// Each finalizer is *popped* while it is compiled, not merely hidden by
+    /// shrinking the list's length. Two reasons, and the first is a memory-
+    /// safety bug: compiling a finalizer whose body contains its own
+    /// `try`/`finally` pushes onto this same list, and a push that grows it
+    /// copies only `items.len` entries — so the ones above a shrunk length are
+    /// left `undefined` and then resurrected when the length is restored.
+    /// Second, popping is what the semantics want anyway: an abrupt completion
+    /// inside a finalizer must not re-enter that finalizer, but must still run
+    /// any nested one, which is now correctly on top of the stack.
     fn emitFinalizersDownTo(self: *Compiler, base: usize) CompileError!void {
-        const saved_len = self.fs.finally_stack.items.len;
-        var i = saved_len;
-        while (i > base) {
-            i -= 1;
-            const fin = self.fs.finally_stack.items[i];
-            self.fs.finally_stack.items.len = i;
+        std.debug.assert(base <= self.fs.finally_stack.items.len);
+
+        var unwound: std.ArrayList(*Node) = .empty;
+        defer unwound.deinit(self.gpa);
+
+        while (self.fs.finally_stack.items.len > base) {
+            const fin = self.fs.finally_stack.pop().?;
+            try unwound.append(self.gpa, fin);
             try self.compileStmt(fin);
-            self.fs.finally_stack.items.len = saved_len;
         }
+        // Restore deepest-first, so the stack comes back exactly as it was.
+        var i = unwound.items.len;
+        while (i > 0) : (i -= 1) try self.fs.finally_stack.append(self.gpa, unwound.items[i - 1]);
+        std.debug.assert(self.fs.finally_stack.items.len >= base);
     }
 
     // ---- statements --------------------------------------------------------
@@ -1038,6 +1055,7 @@ pub const Compiler = struct {
 
     fn compileWhile(self: *Compiler, s: anytype) CompileError!void {
         var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
+        defer ctx.deinit(self.gpa);
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -1058,6 +1076,7 @@ pub const Compiler = struct {
 
     fn compileDoWhile(self: *Compiler, s: anytype) CompileError!void {
         var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
+        defer ctx.deinit(self.gpa);
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -1098,6 +1117,7 @@ pub const Compiler = struct {
         }
 
         var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
+        defer ctx.deinit(self.gpa);
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -1144,6 +1164,7 @@ pub const Compiler = struct {
         _ = try self.emit(.{ .op = .load_const, .a = idx_reg, .b = zero });
 
         var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
+        defer ctx.deinit(self.gpa);
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -1200,6 +1221,7 @@ pub const Compiler = struct {
         }
 
         var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
+        defer ctx.deinit(self.gpa);
         const prev_loop = self.loop;
         const prev_break = self.break_target;
         self.loop = &ctx;
@@ -1290,6 +1312,7 @@ pub const Compiler = struct {
         try self.compileExprInto(disc_reg, s.discriminant);
 
         var ctx = LoopCtx{ .finally_base = self.fs.finally_stack.items.len };
+        defer ctx.deinit(self.gpa);
         const prev_break = self.break_target;
         self.break_target = &ctx;
         defer self.break_target = prev_break;
@@ -1406,6 +1429,15 @@ pub const Compiler = struct {
         /// finally_stack depth when this loop/switch began: a break/continue
         /// targeting it inlines the finalizers pushed since.
         finally_base: usize = 0,
+
+        /// Freed by the owner with `defer`, not by `patchBreaks`/`patchContinues`:
+        /// a compile that gives up part-way through a loop body (an unsupported
+        /// construct after a `break`) never reaches the patch, and the pending
+        /// jump lists would leak.
+        fn deinit(ctx: *LoopCtx, gpa: std.mem.Allocator) void {
+            ctx.breaks.deinit(gpa);
+            ctx.continues.deinit(gpa);
+        }
     };
 
     fn emitLoopJump(self: *Compiler, kind: LoopKind, pos: u32) CompileError!void {
@@ -1426,11 +1458,9 @@ pub const Compiler = struct {
     }
     fn patchBreaks(self: *Compiler, ctx: *LoopCtx, target: u32) CompileError!void {
         for (ctx.breaks.items) |pc| self.patchTarget(pc, target);
-        ctx.breaks.deinit(self.gpa);
     }
     fn patchContinues(self: *Compiler, ctx: *LoopCtx, target: u32) CompileError!void {
         for (ctx.continues.items) |pc| self.patchTarget(pc, target);
-        ctx.continues.deinit(self.gpa);
     }
 
     // ---- expressions -------------------------------------------------------

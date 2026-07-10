@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
     //   zig build test-stress    e2e under GC stress (the slow suite)
     //   zig build test-harness   test262 harness self-tests
     //   zig build test-tidy      source lint (bans, reminders, long-line budget)
+    //   zig build test-fuzz      swarm fuzz the lexer/parser/compiler
     //   zig build test262         conformance suite
     //   zig build test262-stress  conformance under GC stress (root-tracing fuzzer)
     //   zig build test           everything above
@@ -81,6 +82,33 @@ pub fn build(b: *std.Build) void {
         step.dependOn(&run_t.step);
         test_step.dependOn(&run_t.step);
     }
+
+    // ---- `test-fuzz`: swarm fuzzing of lexer/parser/compiler ----------------
+    // The seed defaults to the current git commit, so every commit fuzzes with
+    // a different, "random" seed, yet any failure reproduces from the seed the
+    // test prints: `zig build test-fuzz -Dfuzz-seed=<n>`.
+    const fuzz_runs = b.option(u32, "fuzz-runs", "Fuzz iterations per test (default 512)") orelse 512;
+    const fuzz_seed = b.option(u64, "fuzz-seed", "Fuzz seed (default: current git commit)") orelse gitCommitSeed(b);
+
+    const fuzz_options = b.addOptions();
+    fuzz_options.addOption(u64, "seed", fuzz_seed);
+    fuzz_options.addOption(u32, "runs", fuzz_runs);
+
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/fuzz_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "bottlebrush", .module = engine_mod },
+                .{ .name = "fuzz_options", .module = fuzz_options.createModule() },
+            },
+        }),
+    });
+    const run_fuzz = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("test-fuzz", "Swarm-fuzz the lexer, parser and compiler");
+    fuzz_step.dependOn(&run_fuzz.step);
+    test_step.dependOn(&run_fuzz.step);
 
     // ---- `test-tidy`: non-functional properties of the source, as a test ----
     const tidy_tests = b.addTest(.{
@@ -148,4 +176,15 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_stress262.addArgs(args);
     const stress262_step = b.step("test262-stress", "Run Test262 under GC stress (slow; finds missed GC roots)");
     stress262_step.dependOn(&run_stress262.step);
+}
+
+/// The low 64 bits of the current commit hash, or 0 outside a git checkout.
+/// Gives CI a fresh seed per commit while keeping every failure reproducible
+/// from the commit alone.
+fn gitCommitSeed(b: *std.Build) u64 {
+    var code: u8 = undefined;
+    const out = b.runAllowFail(&.{ "git", "rev-parse", "HEAD" }, &code, .ignore) catch return 0;
+    const hash = std.mem.trim(u8, out, " \n\r");
+    if (hash.len < 16) return 0;
+    return std.fmt.parseInt(u64, hash[0..16], 16) catch 0;
 }
