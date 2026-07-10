@@ -32,7 +32,7 @@
 ## 5. async / await
 - [x] `async function` = generator-like machinery over the Promise job queue: `await` suspends, schedules resumption via a promise reaction. **DONE: `await` compiles to the generator suspension; callAsyncFunction drives the frame (Await = PromiseResolve + PerformPromiseThen with no capability); errors before the first await reject the promise; deep sync-prefix recursion raises RangeError.**
 - [x] `async` methods, async arrows. **DONE (async arrows reserve `await` in their bodies; lexical `this`).**
-- [ ] **Async generators** (`async function*`) + `@@asyncIterator` + `for await…of`: the async-iterator queue, `%AsyncGeneratorPrototype%`, `%AsyncIteratorPrototype%`. This is the fiddliest combination — its own sub-milestone. **STILL OUTSTANDING: async generators are rejected at compile time (honest skip); the async-iteration corpus runs but those tests skip.**
+- [x] **Async generators** (`async function*`) + `@@asyncIterator` + `for await…of`: the async-iterator queue, `%AsyncGeneratorPrototype%`, `%AsyncIteratorPrototype%`. This is the fiddliest combination — its own sub-milestone. **DONE: request-queue pump over the shared suspendable frame (gen_yield's c-flag distinguishes await from yield suspensions); next/return/throw return promises; yielded values are awaited; `for await` prefers @@asyncIterator and awaits both step results and sync-wrapped element values. Enabled the async-iteration corpus (+375).**
 
 ## 6. Modules
 - [ ] **Module records:** `SourceTextModuleRecord`, parse (done Phase 1) → `ParseModule`.

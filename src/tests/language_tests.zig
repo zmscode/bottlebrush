@@ -1180,6 +1180,38 @@ test "promise combinators: all/allSettled/any/race" {
     try std.testing.expectEqual(@as(f64, 1), v.asNumber());
 }
 
+test "async generators and for-await-of" {
+    var vm = helpers.Vm.init(helpers.gpa);
+    defer vm.deinit();
+    _ = try eval(&vm,
+        \\out = {};
+        \\async function* g() { yield 1; var x = await Promise.resolve(10); yield x + 1; }
+        \\async function main() {
+        \\  var it = g();
+        \\  var a = await it.next();
+        \\  var b = await it.next();
+        \\  out.proto = a.value === 1 && !a.done && b.value === 11 && !b.done;
+        \\  var sum = 0;
+        \\  for await (var v of g()) sum += v;
+        \\  out.forawait = sum === 12;
+        \\  var s2 = 0;
+        \\  for await (var w of [1, Promise.resolve(2), 3]) s2 += w;
+        \\  out.syncsrc = s2 === 6;
+        \\  var it2 = g(); await it2.next();
+        \\  var r = await it2.return(99);
+        \\  out.ret = r.value === 99 && r.done && (await it2.next()).done;
+        \\  async function* bad() { yield 1; throw new RangeError("x"); }
+        \\  var it3 = bad(); await it3.next();
+        \\  try { await it3.next(); } catch (e) { out.rej = e instanceof RangeError; }
+        \\}
+        \\main();
+    );
+    const v = try eval(&vm,
+        \\return (out.proto && out.forawait && out.syncsrc && out.ret && out.rej) ? 1 : 0;
+    );
+    try std.testing.expectEqual(@as(f64, 1), v.asNumber());
+}
+
 test "object spread/rest copy symbol-keyed properties" {
     try std.testing.expectEqual(@as(f64, 1), try evalNumber(
         \\var s = Symbol('s');

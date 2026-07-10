@@ -834,6 +834,8 @@ pub fn installBuiltins(vm: *Vm) Error!void {
             vm.symbol_split_key = try vm.toPropertyKey(sym);
         } else if (comptime std.mem.eql(u8, name, "species")) {
             vm.symbol_species_key = try vm.toPropertyKey(sym);
+        } else if (comptime std.mem.eql(u8, name, "asyncIterator")) {
+            vm.symbol_async_iterator_key = try vm.toPropertyKey(sym);
         }
     }
 
@@ -849,6 +851,13 @@ pub fn installBuiltins(vm: *Vm) Error!void {
         if (rx_ctor.isObject()) try vm.defineGetter(rx_ctor.asObject(), vm.symbol_species_key, nativeReturnThis);
         // `get Promise[@@species] { return this }` — drives derived promises.
         try vm.defineGetter(vm.promise_ctor.?, vm.symbol_species_key, nativeReturnThis);
+        // %AsyncGeneratorPrototype%: next/return/throw + self @@asyncIterator.
+        const ag_proto = try vm.newObject(vm.object_proto);
+        vm.async_generator_proto = ag_proto;
+        try vm.defineMethod(ag_proto, "next", Vm.nativeAsyncGenNext, 1);
+        try vm.defineMethod(ag_proto, "return", Vm.nativeAsyncGenReturn, 1);
+        try vm.defineMethod(ag_proto, "throw", Vm.nativeAsyncGenThrow, 1);
+        try vm.defineMethod(ag_proto, vm.symbol_async_iterator_key, nativeReturnThis, 0);
     }
     try vm.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 

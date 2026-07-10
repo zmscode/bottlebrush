@@ -164,6 +164,9 @@ pub const Vm = struct {
     bigint_proto: ?*gc.Object = null,
     promise_proto: ?*gc.Object = null,
     promise_ctor: ?*gc.Object = null,
+    async_generator_proto: ?*gc.Object = null,
+    /// The encoded property key for @@asyncIterator (owned per realm).
+    symbol_async_iterator_key: []const u8 = &.{},
     /// Every realm ever built (primary at index 0, plus `$262.createRealm`
     /// results). The active realm's intrinsics live in the flat fields above;
     /// this list keeps the others rooted and lets `evalScript` swap in a realm.
@@ -223,6 +226,8 @@ pub const Vm = struct {
         bigint_proto: ?*gc.Object = null,
         promise_proto: ?*gc.Object = null,
         promise_ctor: ?*gc.Object = null,
+        async_generator_proto: ?*gc.Object = null,
+        symbol_async_iterator_key: []const u8 = &.{},
     };
 
     /// Copy the active realm (flat fields) into a `Realm` snapshot.
@@ -324,6 +329,7 @@ pub const Vm = struct {
         for (self.symbol_registry.items) |r| tracer.mark(&r.sym.gc);
         if (self.promise_proto) |o| tracer.mark(&o.gc);
         if (self.promise_ctor) |o| tracer.mark(&o.gc);
+        if (self.async_generator_proto) |o| tracer.mark(&o.gc);
         // Pending microtasks hold values/promises that must survive collection.
         for (self.jobs.items[self.jobs_cursor..]) |job| switch (job) {
             .reaction => |r| {
@@ -1024,6 +1030,7 @@ pub const Vm = struct {
             .arr_push => try self.arrayAppend(regs[inst.a].asObject(), regs[inst.b]),
             .arr_spread => try self.spreadInto(regs[inst.a].asObject(), regs[inst.b]),
             .iter_init => regs[inst.a] = try self.getIterator(regs[inst.b]),
+            .iter_init_async => regs[inst.a] = try self.getIteratorAsync(regs[inst.b]),
             .iter_next => regs[inst.a] = try self.iteratorNext(regs[inst.b]),
             .iter_close => try self.iteratorClose(regs[inst.a], false),
             .iter_close_quiet => try self.iteratorClose(regs[inst.a], true),
@@ -1162,7 +1169,9 @@ pub const Vm = struct {
             return native(@ptrCast(self), this_value, args);
         }
         const code: *const bc.CodeBlock = @ptrCast(@alignCast(clo.code));
-        // Calling a generator function creates (but does not run) a generator.
+        // Calling an async generator function creates (but does not run) an
+        // async generator; a plain generator likewise.
+        if (code.is_generator and code.is_async) return self.makeAsyncGenerator(code, clo.env, this_value, args);
         if (code.is_generator) return self.makeGenerator(code, clo.env, this_value, args);
         // An async function returns a promise driven by the job queue. Arrows
         // resolve `this` lexically; sloppy functions coerce a nullish receiver.
@@ -1717,6 +1726,207 @@ pub const Vm = struct {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
         try vm.stepAsync(this.asObject(), 2, if (args.len > 0) args[0] else Value.undefined_value);
         return Value.undefined_value;
+    }
+
+    // ---- async generators ---------------------------------------------------
+    //
+    // An async generator drives the same suspendable frame, but through a
+    // request queue: each next/return/throw enqueues {promise, mode, sent} and
+    // the pump feeds the head request into the frame. A suspension whose
+    // gen_yield carries the await flag (c=1) resumes internally; a plain yield
+    // awaits the yielded value and then fulfills the head request.
+
+    pub fn makeAsyncGenerator(self: *Vm, code: *const bc.CodeBlock, closure_env: ?*gc.Environment, this_value: Value, args: []const Value) Error!Value {
+        const genv = try self.makeGenerator(code, closure_env, this_value, args);
+        try self.protect(genv);
+        defer self.unprotect();
+        const obj = genv.asObject();
+        obj.prototype = self.async_generator_proto;
+        const queue = try self.newArray(0);
+        try self.defineData(obj, "\x00agQ", Value.fromObject(queue), false, false, false);
+        try self.defineData(obj, "\x00agBusy", Value.fromBool(false), false, false, false);
+        return genv;
+    }
+
+    fn agIsBusy(genobj: *gc.Object) bool {
+        return toBoolean(genobj.properties.get("\x00agBusy").?.value);
+    }
+    fn agSetBusy(self: *Vm, genobj: *gc.Object, busy: bool) Error!void {
+        try self.defineData(genobj, "\x00agBusy", Value.fromBool(busy), false, false, false);
+    }
+    fn agQueue(genobj: *gc.Object) *gc.Object {
+        return genobj.properties.get("\x00agQ").?.value.asObject();
+    }
+    /// Pop the head request off the (dense) queue array.
+    fn agShift(q: *gc.Object) void {
+        if (q.elements.items.len > 0) _ = q.elements.orderedRemove(0);
+        if (q.array_length > 0) q.array_length -= 1;
+    }
+
+    /// Enqueue a next(0)/return(1)/throw(2) request; returns its promise.
+    pub fn asyncGeneratorEnqueue(self: *Vm, this: Value, mode: u8, sent: Value) Error!Value {
+        const p = try self.newPromise();
+        try self.protect(Value.fromObject(p));
+        defer self.unprotect();
+        if (!this.isObject() or this.asObject().generator == null or !this.asObject().properties.contains("\x00agQ")) {
+            const err = try self.makeError(self.type_error_proto, "not an async generator");
+            try self.settlePromise(p, Value.fromObject(err), false);
+            return Value.fromObject(p);
+        }
+        const genobj = this.asObject();
+        const req = try self.newObject(null);
+        try self.protect(Value.fromObject(req));
+        defer self.unprotect();
+        try self.defineData(req, "\x00p", Value.fromObject(p), false, false, false);
+        try self.defineData(req, "\x00mode", Value.fromNumber(@floatFromInt(mode)), false, false, false);
+        try self.defineData(req, "\x00sent", sent, false, false, false);
+        try self.arrayAppend(agQueue(genobj), Value.fromObject(req));
+        if (!agIsBusy(genobj)) try self.agPump(genobj);
+        return Value.fromObject(p);
+    }
+
+    /// Drain queued requests until the queue empties or a step suspends on an
+    /// inner promise (the resume natives re-enter).
+    fn agPump(self: *Vm, genobj: *gc.Object) Error!void {
+        try self.agSetBusy(genobj, true);
+        while (true) {
+            const q = agQueue(genobj);
+            if (q.elements.items.len == 0) return self.agSetBusy(genobj, false);
+            const req = q.elements.items[0].asObject();
+            const mode: u8 = @intFromFloat(req.properties.get("\x00mode").?.value.asNumber());
+            const sent = req.properties.get("\x00sent").?.value;
+            switch (try self.agStep(genobj, mode, sent)) {
+                .request_done => {}, // loop for the next request
+                .awaiting => return, // a resume native continues the pump
+            }
+        }
+    }
+
+    const AgStepResult = enum { request_done, awaiting };
+
+    /// One resume of the async generator frame for the head request.
+    fn agStep(self: *Vm, genobj: *gc.Object, mode: u8, sent: Value) Error!AgStepResult {
+        try self.protect(Value.fromObject(genobj));
+        defer self.unprotect();
+        const q = agQueue(genobj);
+        const req_promise = q.elements.items[0].asObject().properties.get("\x00p").?.value.asObject();
+
+        const res = self.generatorResume(Value.fromObject(genobj), sent, mode) catch |e| {
+            if (e != error.JsThrow) return e;
+            const exc = self.pending_exception.?;
+            self.pending_exception = null;
+            agShift(q);
+            try self.settlePromise(req_promise, exc, false);
+            return .request_done;
+        };
+        const done = toBoolean(try self.getProperty(res, "done"));
+        const value = try self.getProperty(res, "value");
+        try self.protect(value);
+        defer self.unprotect();
+
+        if (done) {
+            agShift(q);
+            try self.settlePromise(req_promise, try self.makeIterResult(value, true), true);
+            return .request_done;
+        }
+
+        // Suspended: the paused gen_yield's c-flag says await (1) or yield (0).
+        const g = genobj.generator.?;
+        const code: *const bc.CodeBlock = @ptrCast(@alignCast(g.code));
+        const is_await = code.code[g.pc].c == 1;
+        const inner = try self.promiseResolveValue(value);
+        try self.protect(Value.fromObject(inner));
+        defer self.unprotect();
+        const on_f = try self.makeBoundNative("", if (is_await) nativeAgAwaitNext else nativeAgYieldFulfill, genobj);
+        try self.protect(Value.fromObject(on_f));
+        defer self.unprotect();
+        const on_r = try self.makeBoundNative("", if (is_await) nativeAgAwaitThrow else nativeAgYieldReject, genobj);
+        try self.protect(Value.fromObject(on_r));
+        defer self.unprotect();
+        try self.performPromiseThen(inner, Value.fromObject(on_f), Value.fromObject(on_r), Value.undefined_value, Value.undefined_value);
+        return .awaiting;
+    }
+
+    /// Resume after an internal await: the same head request continues.
+    fn agResume(self: *Vm, genobj: *gc.Object, mode: u8, v: Value) Error!void {
+        switch (try self.agStep(genobj, mode, v)) {
+            .request_done => {
+                try self.agSetBusy(genobj, false);
+                try self.agPump(genobj);
+            },
+            .awaiting => {},
+        }
+    }
+
+    fn nativeAgAwaitNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        try vm.agResume(this.asObject(), 0, if (args.len > 0) args[0] else Value.undefined_value);
+        return Value.undefined_value;
+    }
+    fn nativeAgAwaitThrow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        try vm.agResume(this.asObject(), 2, if (args.len > 0) args[0] else Value.undefined_value);
+        return Value.undefined_value;
+    }
+
+    /// The yielded value settled: fulfill the head request with {value, false}.
+    fn nativeAgYieldFulfill(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        const genobj = this.asObject();
+        const q = agQueue(genobj);
+        if (q.elements.items.len > 0) {
+            const req_promise = q.elements.items[0].asObject().properties.get("\x00p").?.value.asObject();
+            agShift(q);
+            const v = if (args.len > 0) args[0] else Value.undefined_value;
+            try vm.settlePromise(req_promise, try vm.makeIterResult(v, false), true);
+        }
+        try vm.agSetBusy(genobj, false);
+        try vm.agPump(genobj);
+        return Value.undefined_value;
+    }
+
+    /// The yielded value rejected: the generator completes; reject the request.
+    fn nativeAgYieldReject(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        const genobj = this.asObject();
+        genobj.generator.?.status = .completed;
+        const q = agQueue(genobj);
+        if (q.elements.items.len > 0) {
+            const req_promise = q.elements.items[0].asObject().properties.get("\x00p").?.value.asObject();
+            agShift(q);
+            try vm.settlePromise(req_promise, if (args.len > 0) args[0] else Value.undefined_value, false);
+        }
+        try vm.agSetBusy(genobj, false);
+        try vm.agPump(genobj);
+        return Value.undefined_value;
+    }
+
+    /// %AsyncGeneratorPrototype% next/return/throw.
+    pub fn nativeAsyncGenNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        return vm.asyncGeneratorEnqueue(this, 0, if (args.len > 0) args[0] else Value.undefined_value);
+    }
+    pub fn nativeAsyncGenReturn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        return vm.asyncGeneratorEnqueue(this, 1, if (args.len > 0) args[0] else Value.undefined_value);
+    }
+    pub fn nativeAsyncGenThrow(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
+        const vm: *Vm = @ptrCast(@alignCast(ctx));
+        return vm.asyncGeneratorEnqueue(this, 2, if (args.len > 0) args[0] else Value.undefined_value);
+    }
+
+    /// GetIterator with the async hint: prefer @@asyncIterator, fall back to
+    /// the sync iterator (the for-await loop awaits each result either way).
+    pub fn getIteratorAsync(self: *Vm, iterable: Value) Error!Value {
+        if (self.symbol_async_iterator_key.len != 0) {
+            const m = try self.getProperty(iterable, self.symbol_async_iterator_key);
+            if (isCallable(m)) {
+                const it = try self.callValue(m, iterable, &.{});
+                if (!it.isObject()) return self.throwTypeError("@@asyncIterator did not return an object");
+                return it;
+            }
+        }
+        return self.getIterator(iterable);
     }
 
     // ---- object model ------------------------------------------------------

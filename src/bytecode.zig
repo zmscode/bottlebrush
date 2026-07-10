@@ -110,7 +110,8 @@ pub const Op = enum(u8) {
     iter_close_quiet, // a=iterator reg  (IteratorClose during an abrupt completion — swallows errors)
     enum_keys, // a=dst array, b=object reg  (enumerable keys, for for-in)
     copy_rest, // a=target object (mutated), b=src reg, c=excluded-keys array reg or non-object for none  (CopyDataProperties)
-    gen_yield, // a=dst (resumed value), b=yielded value reg
+    gen_yield, // a=dst (resumed value), b=yielded value reg, c=1 when this suspension is an `await` (async frames), 0 for a `yield`
+    iter_init_async, // a=dst iterator, b=iterable reg  (GetIterator hint async: @@asyncIterator, else the sync iterator)
 
     // Direct eval: a=dst, b=argument reg. Compiles its string argument against
     // the caller's private-name scope and runs it with the caller's `this` and

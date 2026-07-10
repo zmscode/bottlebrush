@@ -310,8 +310,6 @@ pub const Compiler = struct {
         is_derived_ctor: bool,
         parent_fs: ?*FnState,
     ) CompileError!*bc.CodeBlock {
-        // Async generators need the async-iteration machinery (Phase 5 §5c).
-        if (is_async and is_generator) return self.fail("async generators unsupported", 0);
         var fs = FnState{ .parent = parent_fs, .name = name, .is_generator = is_generator, .is_async = is_async, .is_arrow = is_arrow };
         if (is_derived_ctor) fs.deferred_instance_fields = class_fields;
         // `new.target` is legal in any non-arrow function body; an arrow
@@ -1161,17 +1159,18 @@ pub const Compiler = struct {
     /// `for (LHS of RHS) body` using the iteration protocol: get an iterator
     /// via @@iterator, then loop over `iterator.next()` until `{done: true}`.
     fn compileForOf(self: *Compiler, s: anytype) CompileError!void {
+        if (s.is_await and !self.fs.is_async) return self.fail("'for await' outside an async function", 0);
         try self.pushBlock();
         defer self.popBlock();
 
         const target = try self.forHeadTarget(s.left);
 
-        // iter = GetIterator(RHS)
+        // iter = GetIterator(RHS) — @@asyncIterator-first for `for await`.
         const iter_reg = self.allocReg();
         {
             const src_reg = self.allocReg();
             try self.compileExprInto(src_reg, s.right);
-            _ = try self.emit(.{ .op = .iter_init, .a = iter_reg, .b = src_reg });
+            _ = try self.emit(.{ .op = if (s.is_await) .iter_init_async else .iter_init, .a = iter_reg, .b = src_reg });
             self.freeTo(src_reg + 1); // free src_reg, keep iter_reg
         }
 
@@ -1187,6 +1186,9 @@ pub const Compiler = struct {
         // result = iter.next(); if (result.done) break
         const result_reg = self.allocReg();
         _ = try self.emit(.{ .op = .iter_next, .a = result_reg, .b = iter_reg });
+        // `for await`: the step result is awaited (an async iterator's next()
+        // returns a promise of { value, done }).
+        if (s.is_await) _ = try self.emit(.{ .op = .gen_yield, .a = result_reg, .b = result_reg, .c = 1 });
         const done_reg = self.allocReg();
         const done_name = try self.addConst(.{ .string = "done" });
         _ = try self.emit(.{ .op = .get_prop, .a = done_reg, .b = result_reg, .c = done_name });
@@ -1197,6 +1199,9 @@ pub const Compiler = struct {
         const value_reg = self.allocReg();
         const value_name = try self.addConst(.{ .string = "value" });
         _ = try self.emit(.{ .op = .get_prop, .a = value_reg, .b = result_reg, .c = value_name });
+        // `for await` over a sync iterable: the element itself is awaited
+        // (CreateAsyncFromSyncIterator); a plain value passes through.
+        if (s.is_await) _ = try self.emit(.{ .op = .gen_yield, .a = value_reg, .b = value_reg, .c = 1 });
         try self.emitAssignTarget(target, value_reg);
         self.freeTo(result_reg);
 
@@ -1467,7 +1472,7 @@ pub const Compiler = struct {
                 if (!self.fs.is_async) return self.fail("await outside an async function", node.start);
                 const val_reg = self.allocReg();
                 try self.compileExprInto(val_reg, operand);
-                _ = try self.emit(.{ .op = .gen_yield, .a = dst, .b = val_reg });
+                _ = try self.emit(.{ .op = .gen_yield, .a = dst, .b = val_reg, .c = 1 });
                 self.freeTo(val_reg);
             },
             // `new.target`. Only modelled inside a direct eval (as undefined,
