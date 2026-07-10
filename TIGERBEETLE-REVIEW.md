@@ -314,19 +314,24 @@ language runtime, must not use a value after collecting it.
 
 Two of those three concerns map cleanly onto TigerStyle. One does not.
 
-## Where we stand today, measured
+## Where we stood, measured
 
-| | bottlebrush | TigerBeetle |
-|---|---:|---:|
-| assertions | **4** | 8,245 |
-| functions | 877 | 4,223 |
-| assertions per function | **0.005** | 1.95 |
-| functions over 70 lines | 24 (2.7%) | — (enforced at 0) |
-| lines over 100 columns | 836 | 0 (enforced) |
+| | bottlebrush (before) | bottlebrush (after) | TigerBeetle |
+|---|---:|---:|---:|
+| assertions | **4** | 34 | 8,245 |
+| functions | 877 | 877 | 4,223 |
+| assertions per function | **0.005** | 0.04 | 1.95 |
+| functions over 70 lines | 24 (2.7%) | 24 | — (enforced at 0) |
+| lines over 100 columns | 849, unenforced | 849, ratcheted | 0 (enforced) |
 
-All four of our assertions are in `bilby/src/regex.zig`, the vendored regex engine. `interpreter.zig`
-(3,500 lines), `compiler.zig` (2,900), `parser.zig` (2,100) and `gc.zig` (570) contained, until this
-week, **zero**.
+All four of the original assertions were in `bilby/src/regex.zig`, the vendored regex engine.
+`interpreter.zig` (3,500 lines), `compiler.zig` (2,900), `parser.zig` (2,100) and `gc.zig` (570)
+contained **zero**.
+
+We are still two orders of magnitude below their density, and closing that is not a sprint. But the
+first thirty assertions were not chosen at random — they went on the invariants that had just cost a
+week — and they are already load-bearing: deleting one `freeTo` in the compiler, or sweeping a
+reachable cell in the GC, each trips one immediately.
 
 Our longest functions: `installBuiltins` 611 lines, `scanTemplateBody` 375, `compileClass` 198, `exec`
 189, `compileFunction` 184.
@@ -403,29 +408,60 @@ The next candidates, in order of expected yield:
   count and constant-pool index. If a `u8` operand can't address the registers a function may
   allocate, that is a design bug we should learn about at compile time, not from a corrupted `regs[]`.
 
-### 3. `tidy.zig`-style lint as a test — *cheap, and we have accumulating drift*
+### 3. `tidy.zig`-style lint as a test — *done*
 
-836 lines over 100 columns and no enforcement. More usefully than line length, a ban list would let us
-encode the project's hard-won knowledge as a failing test rather than tribal memory. Ours would start:
+`src/tidy.zig`, run by `zig build test-tidy`. The bans encode knowledge we had already paid for once,
+mostly Zig 0.16 std drift: `posix.getenv` (removed; env arrives on `init.environ_map`, and reaching for
+it left `zig build` failing while a stale `zig-out/bin/test262` silently kept running the previous
+build), `GeneralPurposeAllocator`, `refAllDeclsRecursive`, `ArrayListUnmanaged`, `trimRight`/`trimLeft`,
+`std.time.Timer`. Plus `heap.stress = true` outside the stress suite, which shipped to main as a
+hard-coded debug hack once already. `FIXME`, `TODO(now)` and `// DEBUG` are *reminders* in
+TigerBeetle's sense: fine while iterating, never on main.
 
-- `std.posix.getenv` → `init.environ_map.get` (removed in Zig 0.16; it cost me a stale-binary detour
-  this session, because the runner failed to compile while `zig-out/bin/test262` silently kept running
-  the previous build).
-- `DEBUG` / `TODO(now)` / `heap.stress = true` outside `stress_tests.zig` — reminders, in TigerBeetle's
-  sense, that block a merge.
-- Dead-declaration detection over `src/runtime/builtins/` in particular, where natives get orphaned
-  when a spec path is rewritten.
+Each ban names its replacement, because a ban without one is a puzzle.
 
-### 4. Swarm testing for the parser fuzzer — *a small change with real upside*
+Two of their bans we deliberately did **not** take. `== error.` / `!= error.` is banned at TigerBeetle
+to avoid a silent `anyerror` upcast; our error sets are small and explicit, so `e != error.JsThrow` is
+idiomatic and a `switch` would be noise. And `std.debug.print` is load-bearing in our disassembler and
+test runner.
 
-We have a lexer/parser fuzz test that feeds 4k random inputs. It is a uniform fuzzer, which means it
-mostly generates garbage that fails in the first hundred bytes. `random_enum_weights` applied to a
-token-level generator — disable a random subset of token kinds per run, skew the rest — would generate
-inputs that are *plausible JavaScript with one weird feature over-represented*, which is where parser
-bugs actually live. Seeding from the commit hash gives us CI-wide seed diversity with reproducibility
-from the hash alone.
+The 100-column rule is a **ratchet** rather than a big-bang reformat. We had 849 long lines; rewriting
+them all would bury the history of every file. So the budget is per-file and exact: new code must fit,
+existing debt can only shrink, and paying some down fails the test with the corrected table printed.
+The number only goes one way. It has already earned its keep — it caught three over-long lines in the
+fuzzer and one in the parser the same day it landed.
 
-### 5. Bounded recursion — *we have a live bug here, found while writing this*
+### 4. Swarm testing for the parser fuzzer — *done, and it found three bugs*
+
+Our old fuzzer fed 4k uniformly random byte strings. Measured: **2% of them survived the lexer.** It
+proved the lexer does not crash on line noise and essentially nothing else.
+
+Two changes, both from TigerBeetle. First, `random_enum_weights`: each run disables a random subset of
+grammar productions outright and weights the survivors over two orders of magnitude, so one run is all
+nested arrows and the next is all classes and private fields. Second — and this turned out to matter
+more — generate from the *grammar* rather than from bytes, tracking context (inside a function? a
+generator? a parameter list?) so the output is **valid by construction**. That converts the oracle
+from "did not crash" into "a syntax error is a parser bug", which is a different class of test. The
+seed defaults to the low 64 bits of `git rev-parse HEAD`, so CI fuzzes differently every commit while
+any failure replays from `-Dfuzz-seed`.
+
+It found three real bugs within a few hundred runs:
+
+- **`for (let v = (a in b); v; v++)` was a SyntaxError.** The `[In]` grammar parameter suppresses only
+  a *top-level* `in` in a for-head, where it is ambiguous with for-in. `no_in` was a sticky parser
+  flag, so it killed `in` at every depth — inside parentheses, array and object literals, call
+  arguments, computed keys, template substitutions, parameter lists and function bodies.
+- **A compiler memory leak**: a loop's pending break/continue jump lists were freed only at the end of
+  a *successful* compile, so any declined construct after a `break` leaked them.
+- **A segfault in the compiler.** `emitFinalizersDownTo` temporarily shrank the `finally_stack`
+  length while compiling a finalizer; if that finalizer's body pushed enough of its own
+  `try`/`finally` to grow the list, the reallocation copied only the shrunk length, and restoring the
+  length resurrected `undefined` pointers.
+
+Note the shape of the last two: the fuzzer reached the state, and the leak checker and the `undefined`
+fill pattern noticed it was wrong. Neither is a fuzzer feature. That is the interlock again.
+
+### 5. Bounded recursion — *a live bug, found while writing this; now fixed*
 
 TigerStyle bans recursion outright, "to ensure that all executions that should be bounded are
 bounded." We cannot follow that literally: a recursive-descent parser and a tree-walking mark phase
@@ -493,13 +529,30 @@ Adding one deterministic stress mode and one poison pattern — a day's work —
 use-after-collect bugs and, incidentally, two real language bugs (`async function` expressions never
 parsed; declarations were accepted as nested statement bodies).
 
+Ten bugs so far, from adopting three of their techniques: six missed GC roots (deterministic stress +
+poison), one reachable collector crash (their no-recursion rule), and three parser/compiler bugs
+including a segfault and a leak (grammar-aware swarm fuzzing). Every one of them predates this work
+and none was visible to 174 unit tests and 6,706 conformance files.
+
 Concretely, in order:
 
 1. **Done:** `zig build test262-stress` as a permanent gate, dead-cell poisoning, root-stack pair
    assertion, six root fixes, regression tests.
 2. **Done:** `Tracer.mark`'s unbounded recursion replaced with an intrusive gray stack.
-3. **Then:** assertions in `gc.zig` and the compiler's register allocator; comptime assertions on
-   bytecode operand widths.
-4. **Then:** `tidy.zig`-style ban-list test; swarm-weighted parser fuzzing seeded by commit hash.
+3. **Done:** assertions in `gc.zig`, the interpreter's frame discipline and the compiler's register
+   allocator; comptime contracts on the bytecode's layout. 4 assertions → 34.
+4. **Done:** `zig build test-tidy` (bans, reminders, long-line ratchet); `zig build test-fuzz`
+   (grammar-aware swarm fuzzing seeded by commit hash).
+
+Still open, in rough order of value:
+
+- **Bound the remaining recursion.** The parser is recursive descent and `callValue` recurses into
+  `execute`; the `tail-call-optimization` denylist is a workaround for the latter. The tracer is fixed,
+  which was the reachable one. The policy worth adopting, short of TigerBeetle's outright ban: every
+  recursion carries an explicit depth counter and an asserted bound.
+- **More assertions, where the bugs are.** 34 across 877 functions is 0.04/fn, against their 1.95. The
+  next tranche belongs in `interpreter.zig`'s object model and the proxy invariant checks.
+- **Extend the swarm fuzzer past the compiler into the VM**, running what it generates. That needs a
+  reference oracle (differential testing against another engine) to be worth much.
 
 Everything else is style, and style is worth much less than the interlock.
