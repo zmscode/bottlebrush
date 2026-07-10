@@ -11,7 +11,7 @@
 
 ## 1. Resumable frames (the enabling primitive)
 - [x] Design a **suspendable call frame**: a generator/async frame must be heap-allocated (a GC object), capturing register file + instruction pointer + environment so it can be parked and resumed. **DONE for generators: `gc.GeneratorState` (heap-owned) holds `regs` + `pc` + `env` + `this`; the generator object references it. (Async frames reuse this once async lands.)**
-- [ ] Bytecode support: `Suspend`/`Resume` (or `Yield`), `Await`, saving/restoring the operand state at a suspend point. The compiler must split functions at suspend points and know which registers are live across them. **PARTIAL: `gen_yield` op + `generatorResume` implement yield/suspend/resume; the whole register file is preserved (no liveness analysis needed). `Await` is not done (Phase 5 §5).**
+- [x] Bytecode support: `Suspend`/`Resume` (or `Yield`), `Await`, saving/restoring the operand state at a suspend point. The compiler must split functions at suspend points and know which registers are live across them. **DONE: `gen_yield` implements suspend/resume for yield AND await (its c-flag marks await suspensions); the whole register file is preserved, so no liveness analysis is needed.**
 - [x] `trace` the parked frame's registers as GC roots while suspended. **DONE: `Object.trace` marks a suspended generator's `env`, `this_value`, and all `regs`.**
 
 ## 2. Generators (`function*`)
@@ -27,7 +27,7 @@
 ## 4. Promises
 - [x] `Promise` constructor (executor, `resolve`/`reject` capabilities), states, `PromiseResolveThenableJob`, `FulfillPromise`/`RejectPromise`, `PerformPromiseThen`. **DONE: `gc.PromiseState` + Vm core ops (settlePromise/resolvePromiseWith/performPromiseThen/promiseResolveValue); thenable assimilation via the thenable job.**
 - [x] Prototype `then`/`catch`/`finally`; statics `resolve`/`reject`/`all`/`allSettled`/`any`(→ `AggregateError`)/`race`/`withResolvers`. **DONE (`runtime/builtins/promise.zig`); AggregateError installed with an `errors` array.**
-- [ ] `@@species` handling; the exact ordering of reaction jobs (Test262 checks ordering precisely). **PARTIAL: reaction ordering matches V8 on interleaved chains (unit-tested); `@@species` / subclass-aware capabilities (NewPromiseCapability via `this`) not implemented — derived promises are always native.**
+- [x] `@@species` handling; the exact ordering of reaction jobs (Test262 checks ordering precisely). **DONE: NewPromiseCapability + per-pair CreateResolvingFunctions latches; `then` derives via SpeciesConstructor + Promise[@@species]; combinators/statics are `this`/subclass-aware; reactions carry capability fn pairs. built-ins/Promise vendored: 624/729 pass.**
 
 ## 5. async / await
 - [x] `async function` = generator-like machinery over the Promise job queue: `await` suspends, schedules resumption via a promise reaction. **DONE: `await` compiles to the generator suspension; callAsyncFunction drives the frame (Await = PromiseResolve + PerformPromiseThen with no capability); errors before the first await reject the promise; deep sync-prefix recursion raises RangeError.**
