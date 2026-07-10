@@ -5,15 +5,27 @@ grouped by root cause and ranked by payoff. Regenerate the raw data by flipping
 `trace_files = true` in `test262/runner.zig`, rebuilding, and grepping the
 runner's `FAILCASE`/`SKIPCASE` lines (each is `TAG <path> <reason>`).
 
-**As of 2026-07-10** (commit `5ef1bdd`):
+**As of 2026-07-10** (commit `57ad3df`):
 
 | Bucket | Count | % of corpus |
 |--------|------:|------------:|
-| **files** | 5977 | 100% |
-| **pass** | 4512 | 75.5% |
-| **fail** | 587 | 9.8% |
-| **skip** | 878 | 14.7% |
-| pass of executed (pass+fail) | | **88.5%** |
+| **files** | 6706 | 100% |
+| **pass** | 5519 | 82.3% |
+| **fail** | 821 | 12.2% |
+| **skip** | 366 | 5.5% |
+| pass of executed (pass+fail) | | **87.1%** |
+
+> **GC stress is clean (2026-07-10).** `zig build test262-stress` runs the whole
+> corpus with a collection at every allocation safe-point and dead cells
+> poisoned. It produces an identical pass/fail set to the ordinary run (the one
+> difference is `Math/sqrt/results.js`, which exceeds the time budget at ~100x
+> slowdown). Getting there fixed six missed-GC-root bugs the ordinary suite
+> could not see: the string/entries iterator element, the arguments a native
+> passes when calling back into JS, `makeDataDescriptor`'s value,
+> `RegExp.prototype[@@split]`'s exec record, promise capability functions, and
+> an async generator's queued request. It also turned up two real language
+> bugs: `async function` expressions did not parse at all, and declarations
+> were accepted as the body of a nested statement.
 
 > **Phase 5 core landed (2026-07-10, +365):** destructuring cluster closed
 > (NamedEvaluation, RequireObjectCoercible, IteratorClose, target validation,

@@ -31,7 +31,7 @@
 
 ## 5. async / await
 - [x] `async function` = generator-like machinery over the Promise job queue: `await` suspends, schedules resumption via a promise reaction. **DONE: `await` compiles to the generator suspension; callAsyncFunction drives the frame (Await = PromiseResolve + PerformPromiseThen with no capability); errors before the first await reject the promise; deep sync-prefix recursion raises RangeError.**
-- [x] `async` methods, async arrows. **DONE (async arrows reserve `await` in their bodies; lexical `this`).**
+- [x] `async` methods, async arrows, async function **expressions**. **DONE (async arrows reserve `await` in their bodies; lexical `this`). `async function` in expression position was missing entirely — `async` lexes as an identifier, so `parsePrimary` returned it before the `async function` check could run.**
 - [x] **Async generators** (`async function*`) + `@@asyncIterator` + `for await…of`: the async-iterator queue, `%AsyncGeneratorPrototype%`, `%AsyncIteratorPrototype%`. This is the fiddliest combination — its own sub-milestone. **DONE: request-queue pump over the shared suspendable frame (gen_yield's c-flag distinguishes await from yield suspensions); next/return/throw return promises; yielded values are awaited; `for await` prefers @@asyncIterator and awaits both step results and sync-wrapped element values. Enabled the async-iteration corpus (+375).**
 
 ## 6. Modules
@@ -46,9 +46,9 @@
 - [ ] `with` (sloppy) object-environment records finalized; direct `eval` scope injection finalized.
 
 ## 8. Testing
-- [ ] `built-ins/Promise/**` (ordering-sensitive), `language/statements/generators`, `language/expressions/async-*`, `built-ins/AsyncGeneratorFunction`, `language/module-code/**`.
-- [ ] Async harness path validated end-to-end (a failing async test must report, not hang — add a job-queue watchdog/timeout).
-- [ ] `GC_STRESS=1` with special attention to parked frames and pending promise reactions (classic root-tracing bugs).
+- [x] `built-ins/Promise/**` (ordering-sensitive), `language/statements/generators`, `language/expressions/async-*`, `built-ins/AsyncGeneratorFunction`. **DONE — all vendored and running (built-ins/Promise 611/729). `language/module-code/**` waits on §6.**
+- [x] Async harness path validated end-to-end (a failing async test must report, not hang — add a job-queue watchdog/timeout). **DONE: the runner scores async tests by the `Test262:AsyncTestComplete` sentinel, and the VM's step budget turns a non-terminating job chain into a `timeout` skip rather than a hang.**
+- [x] `GC_STRESS=1` with special attention to parked frames and pending promise reactions (classic root-tracing bugs). **DONE: `zig build test262-stress` (env `GC_STRESS=1`) collects at every allocation safe-point, and `Heap.destroy` poisons dead cells so a surviving reference faults at the use instead of reading whatever the allocator recycles into the slot. The full 6706-file corpus now produces an identical pass/fail set with stress on. Six missed roots found and fixed: iterator elements (`makeIterResult`), a native's callback arguments (now rooted at the `callValue`/`constructValue` boundary), `makeDataDescriptor`'s value, `RegExp[@@split]`'s exec record, promise capability functions + their environments, and an async generator's queued request (shifted off its only root before allocating). Regression tests in `src/tests/stress_tests.zig`; run with `zig build test-stress`.**
 
 ---
 

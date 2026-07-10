@@ -207,6 +207,35 @@ pub const Parser = struct {
         return self.at(.kw_function) and !self.cur.newline_before;
     }
 
+    /// At `function`: is it `function*`?
+    fn peekIsGeneratorFunction(self: *Parser) bool {
+        const s = self.save();
+        defer self.restore(s);
+        self.advance();
+        return self.at(.star);
+    }
+
+    /// The body of an iteration or `with` statement, or an `if` branch: the
+    /// grammar's `Statement`, which is *not* a Declaration. Annex B B.3.4
+    /// re-admits a plain FunctionDeclaration as an `if` branch in sloppy mode;
+    /// generators, async functions and classes are never allowed anywhere here.
+    fn parseNestedStatement(self: *Parser, annexb_fn: bool) ParseError!*Node {
+        switch (self.cur.kind) {
+            .kw_class => return self.fail("class declaration cannot be the body of a statement"),
+            .kw_function => {
+                if (self.peekIsGeneratorFunction()) return self.fail("generator declaration cannot be the body of a statement");
+                if (self.strict or !annexb_fn) return self.fail("function declaration cannot be the body of a statement");
+            },
+            .identifier => {
+                if (self.atContextual("async") and self.peekIsFunctionNoBreak()) {
+                    return self.fail("async function declaration cannot be the body of a statement");
+                }
+            },
+            else => {},
+        }
+        return self.parseStatement();
+    }
+
     fn parseStatement(self: *Parser) ParseError!*Node {
         switch (self.cur.kind) {
             .l_brace => return self.parseBlock(),
@@ -306,9 +335,9 @@ pub const Parser = struct {
         try self.expect(.l_paren);
         const cond = try self.parseExpression();
         try self.expect(.r_paren);
-        const then_branch = try self.parseStatement();
+        const then_branch = try self.parseNestedStatement(true);
         var else_branch: ?*Node = null;
-        if (self.eat(.kw_else)) else_branch = try self.parseStatement();
+        if (self.eat(.kw_else)) else_branch = try self.parseNestedStatement(true);
         return self.node(start, self.prev_end, .{ .if_stmt = .{
             .cond = cond,
             .then_branch = then_branch,
@@ -412,7 +441,7 @@ pub const Parser = struct {
             self.advance();
             const right = if (is_of) try self.parseAssignment() else try self.parseExpression();
             try self.expect(.r_paren);
-            const body = try self.parseStatement();
+            const body = try self.parseNestedStatement(false);
             const left = init_node.?;
             if (is_of) {
                 return self.node(start, self.prev_end, .{ .for_of_stmt = .{
@@ -437,7 +466,7 @@ pub const Parser = struct {
         var update: ?*Node = null;
         if (!self.at(.r_paren)) update = try self.parseExpression();
         try self.expect(.r_paren);
-        const body = try self.parseStatement();
+        const body = try self.parseNestedStatement(false);
         return self.node(start, self.prev_end, .{ .for_stmt = .{
             .init = init_node,
             .cond = cond,
@@ -452,14 +481,14 @@ pub const Parser = struct {
         try self.expect(.l_paren);
         const cond = try self.parseExpression();
         try self.expect(.r_paren);
-        const body = try self.parseStatement();
+        const body = try self.parseNestedStatement(false);
         return self.node(start, self.prev_end, .{ .while_stmt = .{ .cond = cond, .body = body } });
     }
 
     fn parseDoWhile(self: *Parser) ParseError!*Node {
         const start = self.cur.start;
         self.advance();
-        const body = try self.parseStatement();
+        const body = try self.parseNestedStatement(false);
         if (!self.eat(.kw_while)) return self.fail("expected 'while'");
         try self.expect(.l_paren);
         const cond = try self.parseExpression();
@@ -568,7 +597,7 @@ pub const Parser = struct {
         try self.expect(.l_paren);
         const obj = try self.parseExpression();
         try self.expect(.r_paren);
-        const body = try self.parseStatement();
+        const body = try self.parseNestedStatement(false);
         return self.node(start, self.prev_end, .{ .with_stmt = .{ .object = obj, .body = body } });
     }
 
@@ -584,7 +613,9 @@ pub const Parser = struct {
                 // A LabelIdentifier obeys IdentifierReference rules: `yield` in a
                 // generator / strict code and `await` in async are reserved.
                 try self.checkIdentifierName(tok);
-                const body = try self.parseStatement();
+                // `LabelledItem : FunctionDeclaration` — a plain function is a
+                // legal labelled item in sloppy mode (never a generator/async).
+                const body = try self.parseNestedStatement(true);
                 return self.node(start, self.prev_end, .{ .labeled_stmt = .{ .label = label, .body = body } });
             }
             self.restore(s);
@@ -1438,7 +1469,15 @@ pub const Parser = struct {
     fn parsePrimary(self: *Parser) ParseError!*Node {
         const start = self.cur.start;
         switch (self.cur.kind) {
-            .identifier => return self.parseIdentifier(),
+            .identifier => {
+                // `async function ...` in expression position. `async` lexes as
+                // an identifier, so this must precede the plain-identifier case
+                // (the `else` arm below can never see it).
+                if (self.atContextual("async") and self.peekIsFunctionNoBreak()) {
+                    return self.parseFunctionDeclaration(true);
+                }
+                return self.parseIdentifier();
+            },
             .private_identifier => {
                 // `#x in obj` ergonomic brand check.
                 if (self.private_depth == 0) return self.fail("private name referenced outside a class body");
