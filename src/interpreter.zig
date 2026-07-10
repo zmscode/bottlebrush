@@ -163,6 +163,7 @@ pub const Vm = struct {
     generator_proto: ?*gc.Object = null,
     bigint_proto: ?*gc.Object = null,
     promise_proto: ?*gc.Object = null,
+    promise_ctor: ?*gc.Object = null,
     /// Every realm ever built (primary at index 0, plus `$262.createRealm`
     /// results). The active realm's intrinsics live in the flat fields above;
     /// this list keeps the others rooted and lets `evalScript` swap in a realm.
@@ -172,9 +173,10 @@ pub const Vm = struct {
 
     /// One queued microtask.
     pub const Job = union(enum) {
-        /// PromiseReactionJob: call `handler(arg)` and settle `derived` with
-        /// the result (or pass `arg` through when the handler isn't callable).
-        reaction: struct { handler: Value, arg: Value, derived: ?*gc.Object, on_fulfill: bool },
+        /// PromiseReactionJob: call `handler(arg)` and hand the result to the
+        /// capability's resolve/reject (or pass `arg` through when the handler
+        /// isn't callable). Capability fns are `undefined` for Await.
+        reaction: struct { handler: Value, arg: Value, cap_resolve: Value, cap_reject: Value, on_fulfill: bool },
         /// PromiseResolveThenableJob: `then_fn.call(thenable, resolve, reject)`
         /// for `promise`.
         thenable: struct { promise: *gc.Object, thenable: Value, then_fn: Value },
@@ -220,6 +222,7 @@ pub const Vm = struct {
         generator_proto: ?*gc.Object = null,
         bigint_proto: ?*gc.Object = null,
         promise_proto: ?*gc.Object = null,
+        promise_ctor: ?*gc.Object = null,
     };
 
     /// Copy the active realm (flat fields) into a `Realm` snapshot.
@@ -320,12 +323,14 @@ pub const Vm = struct {
         if (self.bigint_proto) |o| tracer.mark(&o.gc);
         for (self.symbol_registry.items) |r| tracer.mark(&r.sym.gc);
         if (self.promise_proto) |o| tracer.mark(&o.gc);
+        if (self.promise_ctor) |o| tracer.mark(&o.gc);
         // Pending microtasks hold values/promises that must survive collection.
         for (self.jobs.items[self.jobs_cursor..]) |job| switch (job) {
             .reaction => |r| {
                 r.handler.mark(tracer);
                 r.arg.mark(tracer);
-                if (r.derived) |d| tracer.mark(&d.gc);
+                r.cap_resolve.mark(tracer);
+                r.cap_reject.mark(tracer);
             },
             .thenable => |t| {
                 tracer.mark(&t.promise.gc);
@@ -1455,7 +1460,7 @@ pub const Vm = struct {
         st.value = value;
         for (st.reactions.items) |r| {
             if (r.on_fulfill == fulfilled) {
-                try self.enqueueJob(.{ .reaction = .{ .handler = r.handler, .arg = value, .derived = r.derived, .on_fulfill = fulfilled } });
+                try self.enqueueJob(.{ .reaction = .{ .handler = r.handler, .arg = value, .cap_resolve = r.cap_resolve, .cap_reject = r.cap_reject, .on_fulfill = fulfilled } });
             }
         }
         st.reactions.clearAndFree(self.gpa);
@@ -1483,16 +1488,17 @@ pub const Vm = struct {
     }
 
     /// PerformPromiseThen: register (or immediately schedule) the reaction pair
-    /// settling `derived`.
-    pub fn performPromiseThen(self: *Vm, p: *gc.Object, on_f: Value, on_r: Value, derived: ?*gc.Object) Error!void {
+    /// feeding the capability's resolve/reject (pass `undefined` for both when
+    /// there is no capability — an async function's Await).
+    pub fn performPromiseThen(self: *Vm, p: *gc.Object, on_f: Value, on_r: Value, cap_resolve: Value, cap_reject: Value) Error!void {
         const st = p.promise.?;
         switch (st.status) {
             .pending => {
-                try st.reactions.append(self.gpa, .{ .handler = on_f, .derived = derived, .on_fulfill = true });
-                try st.reactions.append(self.gpa, .{ .handler = on_r, .derived = derived, .on_fulfill = false });
+                try st.reactions.append(self.gpa, .{ .handler = on_f, .cap_resolve = cap_resolve, .cap_reject = cap_reject, .on_fulfill = true });
+                try st.reactions.append(self.gpa, .{ .handler = on_r, .cap_resolve = cap_resolve, .cap_reject = cap_reject, .on_fulfill = false });
             },
-            .fulfilled => try self.enqueueJob(.{ .reaction = .{ .handler = on_f, .arg = st.value, .derived = derived, .on_fulfill = true } }),
-            .rejected => try self.enqueueJob(.{ .reaction = .{ .handler = on_r, .arg = st.value, .derived = derived, .on_fulfill = false } }),
+            .fulfilled => try self.enqueueJob(.{ .reaction = .{ .handler = on_f, .arg = st.value, .cap_resolve = cap_resolve, .cap_reject = cap_reject, .on_fulfill = true } }),
+            .rejected => try self.enqueueJob(.{ .reaction = .{ .handler = on_r, .arg = st.value, .cap_resolve = cap_resolve, .cap_reject = cap_reject, .on_fulfill = false } }),
         }
     }
 
@@ -1506,31 +1512,46 @@ pub const Vm = struct {
         return p;
     }
 
-    /// The `resolve` function handed to executors/thenables: `this` is the
-    /// promise (via the bound-native trick); first call wins.
+    /// One resolve/reject function pair sharing a fresh AlreadyResolved latch
+    /// (spec: each CreateResolvingFunctions call gets its own record — the
+    /// executor's pair and each thenable job's pair latch independently).
+    pub const ResolvingPair = struct { holder: *gc.Object, resolve: *gc.Object, reject: *gc.Object };
+
+    pub fn makeResolvingPair(self: *Vm, p: *gc.Object) Error!ResolvingPair {
+        const holder = try self.newObject(null);
+        try self.protect(Value.fromObject(holder));
+        defer self.unprotect();
+        try self.defineData(holder, "\x00p", Value.fromObject(p), false, false, false);
+        const resolve_fn = try self.makeBoundNative("", nativePromiseResolveFn, holder);
+        try self.protect(Value.fromObject(resolve_fn));
+        defer self.unprotect();
+        const reject_fn = try self.makeBoundNative("", nativePromiseRejectFn, holder);
+        return .{ .holder = holder, .resolve = resolve_fn, .reject = reject_fn };
+    }
+
+    /// True (and latches) if this pair has already been used.
+    pub fn resolvingPairUsed(self: *Vm, holder: *gc.Object) Error!bool {
+        if (holder.properties.contains("\x00called")) return true;
+        try self.defineData(holder, "\x00called", Value.fromBool(true), false, false, false);
+        return false;
+    }
+
+    /// The `resolve` half of a resolving pair: `this` is the holder.
     pub fn nativePromiseResolveFn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
-        if (this.isObject()) {
-            if (this.asObject().promise) |st| {
-                if (!st.already_resolved) {
-                    st.already_resolved = true;
-                    try vm.resolvePromiseWith(this.asObject(), if (args.len > 0) args[0] else Value.undefined_value);
-                }
-            }
-        }
+        const holder = this.asObject();
+        if (try vm.resolvingPairUsed(holder)) return Value.undefined_value;
+        const p = holder.properties.get("\x00p").?.value.asObject();
+        try vm.resolvePromiseWith(p, if (args.len > 0) args[0] else Value.undefined_value);
         return Value.undefined_value;
     }
 
     pub fn nativePromiseRejectFn(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {
         const vm: *Vm = @ptrCast(@alignCast(ctx));
-        if (this.isObject()) {
-            if (this.asObject().promise) |st| {
-                if (!st.already_resolved) {
-                    st.already_resolved = true;
-                    try vm.settlePromise(this.asObject(), if (args.len > 0) args[0] else Value.undefined_value, false);
-                }
-            }
-        }
+        const holder = this.asObject();
+        if (try vm.resolvingPairUsed(holder)) return Value.undefined_value;
+        const p = holder.properties.get("\x00p").?.value.asObject();
+        try vm.settlePromise(p, if (args.len > 0) args[0] else Value.undefined_value, false);
         return Value.undefined_value;
     }
 
@@ -1562,33 +1583,44 @@ pub const Vm = struct {
                             if (e != error.JsThrow) return e;
                             const exc = self.pending_exception.?;
                             self.pending_exception = null;
-                            if (r.derived) |d| try self.settlePromise(d, exc, false);
+                            if (isCallable(r.cap_reject)) {
+                                _ = self.callValue(r.cap_reject, Value.undefined_value, &.{exc}) catch |e2| {
+                                    if (e2 != error.JsThrow) return e2;
+                                    self.pending_exception = null;
+                                };
+                            }
                             continue;
                         };
-                        if (r.derived) |d| try self.resolvePromiseWith(d, result);
-                    } else if (r.derived) |d| {
+                        if (isCallable(r.cap_resolve)) {
+                            _ = self.callValue(r.cap_resolve, Value.undefined_value, &.{result}) catch |e| {
+                                if (e != error.JsThrow) return e;
+                                self.pending_exception = null;
+                            };
+                        }
+                    } else {
                         // No handler: the completion passes through unchanged.
-                        if (r.on_fulfill) {
-                            try self.resolvePromiseWith(d, r.arg);
-                        } else {
-                            try self.settlePromise(d, r.arg, false);
+                        const cap = if (r.on_fulfill) r.cap_resolve else r.cap_reject;
+                        if (isCallable(cap)) {
+                            _ = self.callValue(cap, Value.undefined_value, &.{r.arg}) catch |e| {
+                                if (e != error.JsThrow) return e;
+                                self.pending_exception = null;
+                            };
                         }
                     }
                 },
                 .thenable => |t| {
-                    const resolve_fn = try self.makeBoundNative("resolve", nativePromiseResolveFn, t.promise);
-                    try self.protect(Value.fromObject(resolve_fn));
+                    const pair = try self.makeResolvingPair(t.promise);
+                    try self.protect(Value.fromObject(pair.holder));
                     defer self.unprotect();
-                    const reject_fn = try self.makeBoundNative("reject", nativePromiseRejectFn, t.promise);
-                    try self.protect(Value.fromObject(reject_fn));
+                    try self.protect(Value.fromObject(pair.resolve));
                     defer self.unprotect();
-                    _ = self.callValue(t.then_fn, t.thenable, &.{ Value.fromObject(resolve_fn), Value.fromObject(reject_fn) }) catch |e| {
+                    try self.protect(Value.fromObject(pair.reject));
+                    defer self.unprotect();
+                    _ = self.callValue(t.then_fn, t.thenable, &.{ Value.fromObject(pair.resolve), Value.fromObject(pair.reject) }) catch |e| {
                         if (e != error.JsThrow) return e;
                         const exc = self.pending_exception.?;
                         self.pending_exception = null;
-                        const st = t.promise.promise.?;
-                        if (!st.already_resolved) {
-                            st.already_resolved = true;
+                        if (!try self.resolvingPairUsed(pair.holder)) {
                             try self.settlePromise(t.promise, exc, false);
                         }
                     };
@@ -1672,7 +1704,7 @@ pub const Vm = struct {
         defer self.unprotect();
         const on_f = genobj.properties.get("\x00asyncF").?.value;
         const on_r = genobj.properties.get("\x00asyncR").?.value;
-        try self.performPromiseThen(inner, on_f, on_r, null);
+        try self.performPromiseThen(inner, on_f, on_r, Value.undefined_value, Value.undefined_value);
     }
 
     fn nativeAsyncResumeNext(ctx: *anyopaque, this: Value, args: []const Value) Error!Value {

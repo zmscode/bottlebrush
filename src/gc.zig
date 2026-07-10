@@ -103,19 +103,17 @@ pub const PromiseState = struct {
     status: enum(u8) { pending, fulfilled, rejected } = .pending,
     /// The fulfillment value or rejection reason once settled.
     value: Value = Value.undefined_value,
-    /// Set once the executor's resolve/reject (or a thenable's) has been
-    /// called; later calls are no-ops.
-    already_resolved: bool = false,
     reactions: std.ArrayList(PromiseReaction) = .empty,
 };
 
 /// One registered reaction: the handler to call with the settled value (or
-/// `undefined` for pass-through), and the derived promise its result settles.
+/// `undefined` for pass-through), and the capability functions its result
+/// settles (both `undefined` for internal capability-less reactions — an
+/// async function's Await).
 pub const PromiseReaction = struct {
     handler: Value,
-    /// The promise settled by this reaction's result; null for internal
-    /// reactions with no capability (an async function's Await).
-    derived: ?*Object,
+    cap_resolve: Value,
+    cap_reject: Value,
     on_fulfill: bool,
 };
 
@@ -215,7 +213,8 @@ pub const Object = struct {
             p.value.mark(t);
             for (p.reactions.items) |r| {
                 r.handler.mark(t);
-                if (r.derived) |d| t.mark(&d.gc);
+                r.cap_resolve.mark(t);
+                r.cap_reject.mark(t);
             }
         }
         if (self.bound_target) |bt| bt.mark(t);

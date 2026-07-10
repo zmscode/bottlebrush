@@ -660,6 +660,7 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(promise_proto, "catch", promise_mod.nativePromiseCatch, 1);
     try vm.defineMethod(promise_proto, "finally", promise_mod.nativePromiseFinally, 1);
     const promise_ctor = asCtor(try vm.makeNative("Promise", promise_mod.nativePromise, 1));
+    vm.promise_ctor = promise_ctor;
     try vm.defineData(promise_ctor, "prototype", Value.fromObject(promise_proto), false, false, false);
     try vm.defineData(promise_proto, "constructor", Value.fromObject(promise_ctor), true, false, true);
     try vm.defineMethod(promise_ctor, "resolve", promise_mod.nativePromiseResolve, 1);
@@ -669,6 +670,7 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     try vm.defineMethod(promise_ctor, "allSettled", promise_mod.nativePromiseAllSettled, 1);
     try vm.defineMethod(promise_ctor, "any", promise_mod.nativePromiseAny, 1);
     try vm.defineMethod(promise_ctor, "race", promise_mod.nativePromiseRace, 1);
+    try vm.defineMethod(promise_ctor, "try", promise_mod.nativePromiseTry, 1);
     try vm.defineData(global, "Promise", Value.fromObject(promise_ctor), true, false, true);
     try vm.defineMethod(global, "queueMicrotask", promise_mod.nativeQueueMicrotask, 1);
 
@@ -845,6 +847,8 @@ pub fn installBuiltins(vm: *Vm) Error!void {
     {
         const rx_ctor = try vm.getProperty(Value.fromObject(global), "RegExp");
         if (rx_ctor.isObject()) try vm.defineGetter(rx_ctor.asObject(), vm.symbol_species_key, nativeReturnThis);
+        // `get Promise[@@species] { return this }` — drives derived promises.
+        try vm.defineGetter(vm.promise_ctor.?, vm.symbol_species_key, nativeReturnThis);
     }
     try vm.defineData(global, "Symbol", Value.fromObject(symbol_ctor), true, false, true);
 
