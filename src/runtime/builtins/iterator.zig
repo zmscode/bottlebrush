@@ -95,6 +95,11 @@ pub fn nativeIteratorNext(ctx: *anyopaque, this: Value, args: []const Value) Err
         try vm.setProperty(this, "\x00itT", Value.undefined_value);
         return vm.makeIterResult(Value.undefined_value, true);
     }
+    // For strings (a fresh code-point string) and `entries` (a fresh pair
+    // array), `value` is the only reference to a brand-new cell, and
+    // `makeIterResult` allocates. Root it across that safe-point.
+    try vm.protect(value);
+    defer vm.unprotect();
     try vm.setProperty(this, "\x00itI", Value.fromNumber(@floatFromInt(idx + 1)));
     return vm.makeIterResult(value, false);
 }

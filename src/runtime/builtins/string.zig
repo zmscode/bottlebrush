@@ -1033,6 +1033,9 @@ fn splitExecImpl(vm: *Vm, rx: Value, sv: Value, lim: u32) Error!Value {
             q = advanceStringIndex(units, q, unicode);
             continue;
         }
+        // `z` is read again below, after `makeStringFromUtf16` has collected.
+        try vm.protect(z);
+        defer vm.unprotect();
         const li = try toIntegerOrInfinity(vm, try vm.getProperty(splitter, "lastIndex"));
         const e = @min(@as(usize, @intFromFloat(@max(0, li))), size);
         if (e == p) {

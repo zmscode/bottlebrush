@@ -14,14 +14,22 @@ pub fn main(init: std.process.Init) !void {
 
     var arg_it = std.process.Args.Iterator.init(init.minimal.args);
     _ = arg_it.next(); // argv[0]
-    if (arg_it.next()) |path| {
-        return runFile(gpa, io, path);
+
+    // `--gc-stress` collects at every allocation safe-point. Any value held
+    // across an allocation without being rooted is swept immediately, which
+    // turns latent root-tracing bugs into deterministic, local failures.
+    var stress = false;
+    var script: ?[]const u8 = null;
+    while (arg_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--gc-stress")) stress = true else script = a;
     }
+
+    if (script) |path| return runFile(gpa, io, path, stress);
     return repl(gpa, io);
 }
 
 /// Run one script file to completion, with real parse/compile diagnostics.
-fn runFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+fn runFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, stress: bool) !void {
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, max_file_bytes) catch |err| {
         std.debug.print("bottlebrush: cannot read '{s}': {s}\n", .{ path, @errorName(err) });
         std.process.exit(1);
@@ -45,6 +53,7 @@ fn runFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
                 .ok => |*program| {
                     defer program.deinit();
                     var vm = bb.Vm.init(gpa);
+                    vm.heap.stress = stress;
                     defer vm.deinit();
                     _ = vm.run(program) catch |e| {
                         reportRunError(&vm, gpa, e);

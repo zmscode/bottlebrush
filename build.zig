@@ -49,6 +49,8 @@ pub fn build(b: *std.Build) void {
     //   zig build test-lang      e2e: newer language features
     //   zig build test-stress    e2e under GC stress (the slow suite)
     //   zig build test-harness   test262 harness self-tests
+    //   zig build test262         conformance suite
+    //   zig build test262-stress  conformance under GC stress (root-tracing fuzzer)
     //   zig build test           everything above
     const test_step = b.step("test", "Run all test suites");
 
@@ -115,4 +117,18 @@ pub fn build(b: *std.Build) void {
     }
     const test262_step = b.step("test262", "Run the Test262 conformance suite");
     test262_step.dependOn(&run_test262.step);
+
+    // ---- `test262-stress`: the corpus as a root-tracing fuzzer ---------------
+    // Collects at every allocation safe-point, so any value the VM holds across
+    // an allocation without rooting it is swept immediately and the run dies at
+    // the use. Dead cells are poisoned, making a stale reference deterministic
+    // rather than dependent on what the allocator happens to recycle into the
+    // slot. ~100x slower, so aim it at a slice:
+    //   zig build test262-stress -- test262/fixtures/vendored/built-ins/Promise
+    const run_stress262 = b.addRunArtifact(test262);
+    run_stress262.step.dependOn(b.getInstallStep());
+    run_stress262.setEnvironmentVariable("GC_STRESS", "1");
+    if (b.args) |args| run_stress262.addArgs(args);
+    const stress262_step = b.step("test262-stress", "Run Test262 under GC stress (slow; finds missed GC roots)");
+    stress262_step.dependOn(&run_stress262.step);
 }

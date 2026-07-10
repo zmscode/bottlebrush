@@ -133,3 +133,122 @@ test "weak collections drop dead entries under GC stress" {
     );
     try testing.expectEqual(@as(f64, 1), v.asNumber());
 }
+
+// ---- Regressions found by running the Test262 corpus under GC stress -------
+//
+// Each of these passed the ordinary suite and the whole 6706-file conformance
+// run; only stress (collect at every allocation safe-point) exposed the missed
+// root. They are the cheapest possible guard against reintroducing the bug.
+
+// The per-character string a string iterator produces is the only reference to
+// a brand-new cell, and `makeIterResult` allocates.
+test "string iterator elements survive GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var out = [];
+        \\for (var ch of 'xyz') out.push(ch);
+        \\return out.join(",") + "/" + [...'ab'].join(",");
+    );
+    const s = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("x,y,z/a,b", s);
+}
+
+// `entries()` builds a fresh pair array, then `makeIterResult` allocates.
+test "Map/Object entries pairs survive GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var m = new Map([["a", 1], ["b", 2]]);
+        \\var out = [];
+        \\for (var e of m) out.push(e[0] + "=" + e[1]);
+        \\return out.join(",");
+    );
+    const s = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("a=1,b=2", s);
+}
+
+// A native calling back into JS with a freshly allocated argument (the proxy
+// trap's key string) — callee setup allocates the `arguments` object.
+test "proxy trap arguments survive GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var p = new Proxy({}, {
+        \\  ownKeys: function() { return ["a", "b"]; },
+        \\  getOwnPropertyDescriptor: function(t, k) {
+        \\    return { value: k, enumerable: true, configurable: true, writable: true };
+        \\  },
+        \\  get: function(t, k) { return "v" + k; }
+        \\});
+        \\var o = { ...p };
+        \\return o.a + "," + o.b;
+    );
+    const s = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("va,vb", s);
+}
+
+// `makeDataDescriptor(try makeStringFromUtf16(..))`: the value is allocated,
+// then the descriptor object allocation collects it.
+test "String-object property descriptor survives GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var d = Object.getOwnPropertyDescriptor(new String("123"), "2");
+        \\return d.value + ":" + d.writable + ":" + d.enumerable;
+    );
+    const s = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("3:false:true", s);
+}
+
+// RegExp.prototype[@@split] reads the exec result *after* appending a freshly
+// built substring to the output array.
+test "RegExp @@split species path survives GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\function MyRe() {}
+        \\MyRe[Symbol.species] = function(s, f) { return new RegExp(s, f); };
+        \\var re = /-/;
+        \\re.constructor = MyRe;
+        \\return "a-b-c".split(re).join("|");
+    );
+    const s = try utf16ToUtf8Alloc(testing.allocator, v.asString().units);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("a|b|c", s);
+}
+
+// Promise capability functions (resolve/reject) and their environments are
+// created unrooted by NewPromiseCapability; async generators shift a request
+// off its queue — its only root — before allocating the iterator result.
+test "promise capabilities and async generators survive GC stress" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    vm.heap.stress = true;
+    const v = try eval(&vm,
+        \\var log = [];
+        \\var P = function(ex) { return new Promise(function() { ex(function() {}, function() {}); }); };
+        \\Promise.reject.call(P);
+        \\async function* gen() { yield "a"; yield await Promise.resolve("b"); }
+        \\(async function() {
+        \\  for await (var x of gen()) log.push(x);
+        \\  log.push((await Promise.any('xy')) + (await Promise.race('pq')));
+        \\})();
+        \\return log;
+    );
+    _ = v;
+    try vm.runJobs();
+    const out = try eval(&vm, "return log.join(',');");
+    const s = try utf16ToUtf8Alloc(testing.allocator, out.asString().units);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("a,b,xp", s);
+}

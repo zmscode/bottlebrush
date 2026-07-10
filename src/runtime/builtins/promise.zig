@@ -28,7 +28,27 @@ fn thisPromise(vm: *Vm, this: Value) Error!*gc.Object {
 // ---- NewPromiseCapability ----------------------------------------------------
 
 /// A PromiseCapability record: the promise plus its resolve/reject functions.
-pub const Capability = struct { promise: Value, resolve: Value, reject: Value };
+///
+/// All three fields are returned *unrooted*: a caller that allocates before
+/// using them (calling `resolve`/`reject` builds a frame, which allocates) must
+/// `protect` each one first. `protect_all` does that.
+pub const Capability = struct {
+    promise: Value,
+    resolve: Value,
+    reject: Value,
+
+    /// Root all three; the caller must `unprotect` three times.
+    fn protect_all(cap: Capability, vm: *Vm) Error!void {
+        try vm.protect(cap.promise);
+        try vm.protect(cap.resolve);
+        try vm.protect(cap.reject);
+    }
+    fn unprotect_all(vm: *Vm) void {
+        vm.unprotect();
+        vm.unprotect();
+        vm.unprotect();
+    }
+};
 
 /// GetCapabilitiesExecutor: `this` is the capture holder; called by the
 /// constructor with (resolve, reject). Calling it twice is a TypeError.
@@ -151,12 +171,8 @@ pub fn nativePromiseThen(ctx: *anyopaque, this: Value, args: []const Value) Erro
     const vm = castVm(ctx);
     const p = try thisPromise(vm, this);
     const cap = try newPromiseCapability(vm, try speciesConstructor(vm, this));
-    try vm.protect(cap.promise);
-    defer vm.unprotect();
-    try vm.protect(cap.resolve);
-    defer vm.unprotect();
-    try vm.protect(cap.reject);
-    defer vm.unprotect();
+    try cap.protect_all(vm);
+    defer Capability.unprotect_all(vm);
     try vm.performPromiseThen(p, argAt(args, 0), argAt(args, 1), cap.resolve, cap.reject);
     return cap.promise;
 }
@@ -215,8 +231,8 @@ pub fn nativePromiseResolve(ctx: *anyopaque, this: Value, args: []const Value) E
         if (xc.isObject() and this.isObject() and xc.asObject() == this.asObject()) return x;
     }
     const cap = try newPromiseCapability(vm, this);
-    try vm.protect(cap.promise);
-    defer vm.unprotect();
+    try cap.protect_all(vm);
+    defer Capability.unprotect_all(vm);
     _ = try vm.callValue(cap.resolve, Value.undefined_value, &.{x});
     return cap.promise;
 }
@@ -225,8 +241,8 @@ pub fn nativePromiseReject(ctx: *anyopaque, this: Value, args: []const Value) Er
     const vm = castVm(ctx);
     if (!this.isObject()) return vm.throwTypeError("Promise.reject called on a non-object");
     const cap = try newPromiseCapability(vm, this);
-    try vm.protect(cap.promise);
-    defer vm.unprotect();
+    try cap.protect_all(vm);
+    defer Capability.unprotect_all(vm);
     _ = try vm.callValue(cap.reject, Value.undefined_value, &.{argAt(args, 0)});
     return cap.promise;
 }
@@ -236,8 +252,8 @@ pub fn nativePromiseWithResolvers(ctx: *anyopaque, this: Value, args: []const Va
     const vm = castVm(ctx);
     _ = args;
     const cap = try newPromiseCapability(vm, this);
-    try vm.protect(cap.promise);
-    defer vm.unprotect();
+    try cap.protect_all(vm);
+    defer Capability.unprotect_all(vm);
     const result = try vm.newObject(vm.object_proto);
     try vm.protect(Value.fromObject(result));
     defer vm.unprotect();
@@ -253,8 +269,8 @@ pub fn nativePromiseTry(ctx: *anyopaque, this: Value, args: []const Value) Error
     const vm = castVm(ctx);
     if (!this.isObject()) return vm.throwTypeError("Promise.try called on a non-object");
     const cap = try newPromiseCapability(vm, this);
-    try vm.protect(cap.promise);
-    defer vm.unprotect();
+    try cap.protect_all(vm);
+    defer Capability.unprotect_all(vm);
     const f = argAt(args, 0);
     const rest = if (args.len > 1) args[1..] else &[_]Value{};
     const result = vm.callValue(f, Value.undefined_value, rest) catch |e| {
@@ -379,12 +395,8 @@ fn nativeAnyRejected(ctx: *anyopaque, this: Value, args: []const Value) Error!Va
 fn runCombinator(vm: *Vm, ctor: Value, iterable: Value, kind: Kind) Error!Value {
     if (!ctor.isObject()) return vm.throwTypeError("promise combinator called on a non-object");
     const cap = try newPromiseCapability(vm, ctor);
-    try vm.protect(cap.promise);
-    defer vm.unprotect();
-    try vm.protect(cap.resolve);
-    defer vm.unprotect();
-    try vm.protect(cap.reject);
-    defer vm.unprotect();
+    try cap.protect_all(vm);
+    defer Capability.unprotect_all(vm);
 
     // The observable `C.resolve` used for every element.
     const promise_resolve = vm.getProperty(ctor, "resolve") catch |e| return rejectWithPending(vm, cap, e);

@@ -20,8 +20,16 @@ const parser = bottlebrush.parser;
 const compiler = bottlebrush.compiler;
 
 const default_path = "test262/fixtures";
-const trace_files = false; // set true to print FAIL paths when debugging
-const trace_skips = false; // set true to print a reason tag for each SKIP
+var trace_files: bool = false; // TRACE_FAILS=1: print a FAILCASE line per failure
+var trace_skips: bool = false; // TRACE_SKIPS=1: print a reason tag for each SKIP
+var trace_run: bool = false; // TRACE_RUN=1: print each file before running it (crash attribution)
+
+/// `GC_STRESS=1 test262 [dir]` collects at *every* allocation safe-point, which
+/// turns the conformance corpus into a root-tracing fuzzer: any value the VM
+/// holds across an allocation without rooting it is swept out from under us and
+/// the run dies immediately rather than years later on a rare heap layout.
+/// It costs ~100x, so run it over a slice (`test262 test262/fixtures/vendored/built-ins/Promise`).
+var gc_stress: bool = false;
 const harness_path = "test262/harness";
 const max_file_bytes = std.Io.Limit.limited(64 * 1024 * 1024);
 
@@ -166,6 +174,7 @@ const Runner = struct {
 
         var vm = bottlebrush.Vm.init(self.gpa);
         defer vm.deinit();
+        vm.heap.stress = gc_stress;
         vm.installHost262() catch return .skip;
 
         // Async tests: divert `print` and score by the completion sentinel.
@@ -326,6 +335,7 @@ fn workerMain(w: *Worker) void {
         };
         defer meta.deinit(gpa);
 
+        if (trace_run) std.debug.print("RUNNING\t{s}\n", .{rel});
         const outcome = runner.classify(source, meta);
         if (trace_files and (outcome == .fail or outcome == .skip)) {
             const tag = if (outcome == .fail) "FAILCASE" else "SKIPCASE";
@@ -347,6 +357,19 @@ pub fn main(init: std.process.Init) !void {
     var arg_it = std.process.Args.Iterator.init(init.minimal.args);
     _ = arg_it.next(); // skip argv[0]
     const path: []const u8 = if (arg_it.next()) |p| p else default_path;
+
+    // Zig 0.16: env vars arrive on `init.environ_map`; `std.posix.getenv` is gone.
+    // GC_STRESS=1 turns the corpus into a root-tracing fuzzer (see `gc_stress`).
+    const envFlag = struct {
+        fn get(map: *std.process.Environ.Map, name: []const u8) bool {
+            const v = map.get(name) orelse return false;
+            return !std.mem.eql(u8, v, "0");
+        }
+    }.get;
+    gc_stress = envFlag(init.environ_map, "GC_STRESS");
+    trace_files = envFlag(init.environ_map, "TRACE_FAILS");
+    trace_skips = envFlag(init.environ_map, "TRACE_SKIPS");
+    trace_run = envFlag(init.environ_map, "TRACE_RUN");
 
     // Open the harness directory and load the always-prepended helpers.
     var harness_dir = std.Io.Dir.cwd().openDir(io, harness_path, .{ .iterate = true }) catch |err| {
@@ -412,7 +435,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cpu = std.Thread.getCpuCount() catch 4;
-    const nthreads = @max(1, @min(cpu, @min(@as(usize, 16), @max(1, paths.items.len))));
+    // THREADS=1 makes a crashing run reproducible/attributable to one file.
+    const want: usize = if (init.environ_map.get("THREADS")) |v|
+        std.fmt.parseInt(usize, v, 10) catch cpu
+    else
+        cpu;
+    const nthreads = @max(1, @min(want, @min(@as(usize, 16), @max(1, paths.items.len))));
 
     var cursor = std.atomic.Value(usize).init(0);
     const workers = try gpa.alloc(Worker, nthreads);

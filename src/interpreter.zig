@@ -118,6 +118,19 @@ pub const Vm = struct {
     /// When set, `print` (and console.log) append here instead of stdout — the
     /// Test262 async runner captures the `Test262:AsyncTestComplete` sentinel.
     print_capture: ?*std.ArrayList(u8) = null,
+    /// Environments that are live but not yet reachable from a frame or a
+    /// rooted object (the window between `createEnv` and pushing the frame,
+    /// during which parameter setup can allocate and therefore collect).
+    temp_env_roots: std.ArrayList(*gc.Environment) = .empty,
+
+    /// The (callee, this, args) triple of every in-flight call.
+    ///
+    /// A native that synthesizes an argument — `callValue(trap, h, &.{try
+    /// self.makeString(key)})` — hands the VM the only reference to a
+    /// brand-new cell, and callee setup allocates (the `arguments` object, the
+    /// environment). Rooting at the call boundary makes all ~100 such sites
+    /// correct by construction rather than each having to remember.
+    temp_call_roots: std.ArrayList(CallRoots) = .empty,
     /// The microtask job queue (promise reactions, thenables, queueMicrotask).
     /// Drained (FIFO, via `jobs_cursor`) after the top-level script completes.
     jobs: std.ArrayList(Job) = .empty,
@@ -285,6 +298,8 @@ pub const Vm = struct {
         }
         self.realms.deinit(self.gpa);
         self.jobs.deinit(self.gpa);
+        self.temp_env_roots.deinit(self.gpa);
+        self.temp_call_roots.deinit(self.gpa);
         // Programs compiled by eval/Function() live as long as the VM: closures
         // created inside them keep pointing at their bytecode arenas.
         for (self.eval_programs.items) |*p| p.deinit();
@@ -349,6 +364,12 @@ pub const Vm = struct {
         // fields above; the rest are only reachable here).
         for (self.realms.items) |*rlm| markRealm(rlm, tracer);
         for (self.temp_roots.items) |v| v.mark(tracer);
+        for (self.temp_env_roots.items) |e| tracer.mark(&e.gc);
+        for (self.temp_call_roots.items) |c| {
+            c.callee.mark(tracer);
+            c.this_value.mark(tracer);
+            for (c.args) |a| a.mark(tracer);
+        }
         for (self.frames.items) |f| {
             tracer.mark(&f.env.gc);
             f.this_value.mark(tracer);
@@ -359,8 +380,28 @@ pub const Vm = struct {
     pub fn protect(self: *Vm, v: Value) Error!void {
         try self.temp_roots.append(self.gpa, v);
     }
+
     pub fn unprotect(self: *Vm) void {
         _ = self.temp_roots.pop();
+    }
+
+    /// Root a freshly-created environment across allocating setup, before any
+    /// frame or object references it.
+    const CallRoots = struct { callee: Value, this_value: Value, args: []const Value };
+
+    fn protectCall(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!void {
+        try self.temp_call_roots.append(self.gpa, .{ .callee = callee, .this_value = this_value, .args = args });
+    }
+    fn unprotectCall(self: *Vm) void {
+        _ = self.temp_call_roots.pop();
+    }
+
+    pub fn protectEnv(self: *Vm, e: *gc.Environment) Error!void {
+        try self.temp_env_roots.append(self.gpa, e);
+    }
+
+    pub fn unprotectEnv(self: *Vm) void {
+        _ = self.temp_env_roots.pop();
     }
 
     /// Allocation safe-point: under stress, collect every time; otherwise
@@ -1135,6 +1176,9 @@ pub const Vm = struct {
     }
 
     pub fn callValue(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!Value {
+        try self.protectCall(callee, this_value, args);
+        defer self.unprotectCall();
+
         // Callable proxy: dispatch to the `apply` trap, else forward to target.
         if (callee.isObject()) {
             if (callee.asObject().proxy_target) |target| {
@@ -1191,6 +1235,10 @@ pub const Vm = struct {
         }
         defer if (args_obj != null) self.unprotect();
         const env = try self.createEnv(clo.env, code.num_env_slots);
+        // `buildRestParam` allocates, so the env must be rooted before it can
+        // be reached from a frame.
+        try self.protectEnv(env);
+        defer self.unprotectEnv();
         var i: u32 = 0;
         while (i < code.num_params) : (i += 1) {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
@@ -1260,6 +1308,9 @@ pub const Vm = struct {
     /// constructor's `prototype`, run the constructor with it as `this`, and
     /// return the constructor's object result or that object.
     pub fn constructValue(self: *Vm, callee: Value, args: []const Value) Error!Value {
+        try self.protectCall(callee, Value.undefined_value, args);
+        defer self.unprotectCall();
+
         // Constructor proxy: dispatch to the `construct` trap, else forward.
         if (callee.isObject()) {
             if (callee.asObject().proxy_target) |target| {
@@ -1310,6 +1361,9 @@ pub const Vm = struct {
         }
         defer if (args_obj != null) self.unprotect();
         const env = try self.createEnv(closure_env, code.num_env_slots);
+        // Rooted until `obj.generator` (itself protected) references the env.
+        try self.protectEnv(env);
+        defer self.unprotectEnv();
         var i: u32 = 0;
         while (i < code.num_params) : (i += 1) {
             env.slots[i] = if (i < args.len) args[i] else Value.undefined_value;
@@ -1825,8 +1879,11 @@ pub const Vm = struct {
         defer self.unprotect();
 
         if (done) {
+            // Build the result *before* shifting: the queued request is the
+            // only root for `req_promise`, and makeIterResult can collect.
+            const result = try self.makeIterResult(value, true);
             agShift(q);
-            try self.settlePromise(req_promise, try self.makeIterResult(value, true), true);
+            try self.settlePromise(req_promise, result, true);
             return .request_done;
         }
 
@@ -1876,9 +1933,12 @@ pub const Vm = struct {
         const q = agQueue(genobj);
         if (q.elements.items.len > 0) {
             const req_promise = q.elements.items[0].asObject().properties.get("\x00p").?.value.asObject();
-            agShift(q);
             const v = if (args.len > 0) args[0] else Value.undefined_value;
-            try vm.settlePromise(req_promise, try vm.makeIterResult(v, false), true);
+            // makeIterResult can collect; keep the request queued (its root)
+            // until the result exists.
+            const result = try vm.makeIterResult(v, false);
+            agShift(q);
+            try vm.settlePromise(req_promise, result, true);
         }
         try vm.agSetBusy(genobj, false);
         try vm.agPump(genobj);
@@ -2093,6 +2153,9 @@ pub const Vm = struct {
     // ---- iteration protocol ------------------------------------------------
 
     pub fn makeIterResult(self: *Vm, value: Value, done: bool) Error!Value {
+        // Same hazard as `makeDataDescriptor`: `value` is often brand new.
+        try self.protect(value);
+        defer self.unprotect();
         const o = try self.newObject(self.object_proto);
         try self.protect(Value.fromObject(o));
         defer self.unprotect();
@@ -2324,6 +2387,10 @@ pub const Vm = struct {
     /// Build a `{value, writable, enumerable, configurable}` descriptor object
     /// (as returned by `Object.getOwnPropertyDescriptor`).
     pub fn makeDataDescriptor(self: *Vm, value: Value, w: bool, e: bool, c: bool) Error!Value {
+        // Callers routinely pass a value they just allocated (`makeDataDescriptor(
+        // try vm.makeStringFromUtf16(..))`), and `newObject` below collects.
+        try self.protect(value);
+        defer self.unprotect();
         const result = try self.newObject(self.object_proto);
         try self.protect(Value.fromObject(result));
         defer self.unprotect();

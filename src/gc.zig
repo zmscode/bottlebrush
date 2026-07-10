@@ -486,34 +486,54 @@ pub const Heap = struct {
         return freed;
     }
 
+    /// Overwrite a dead cell with a pattern that is neither a valid `Kind` nor
+    /// a canonical pointer, so that a surviving reference faults *here*, at the
+    /// use, rather than silently reading whatever the allocator later puts in
+    /// this slot. Only under `stress`: recycled memory is otherwise the sole
+    /// thing hiding a missed GC root, and the reuse is timing-dependent (a
+    /// single-threaded run happens to leave the bytes intact, a parallel one
+    /// does not).
+    fn poison(self: *Heap, comptime T: type, cell: *T) void {
+        if (self.stress) @memset(std.mem.asBytes(cell), 0xAA);
+    }
+
     fn destroy(self: *Heap, header: *GcHeader) void {
         switch (header.kind) {
             .string => {
                 const s = cellFromHeader(String, header);
                 if (s.units.len != 0) self.gpa.free(s.units);
+                self.poison(String, s);
                 self.gpa.destroy(s);
             },
             .object => {
                 const o = cellFromHeader(Object, header);
                 o.deinitCell(self.gpa);
+                self.poison(Object, o);
                 self.gpa.destroy(o);
             },
             .symbol => {
                 const s = cellFromHeader(Symbol, header);
                 if (s.description) |d| self.gpa.free(d);
+                self.poison(Symbol, s);
                 self.gpa.destroy(s);
             },
             .bigint => {
                 const bi = cellFromHeader(BigInt, header);
                 if (bi.limbs.len > 0) self.gpa.free(bi.limbs);
+                self.poison(BigInt, bi);
                 self.gpa.destroy(bi);
             },
             .environment => {
                 const e = cellFromHeader(Environment, header);
                 e.deinitCell(self.gpa);
+                self.poison(Environment, e);
                 self.gpa.destroy(e);
             },
-            .closure => self.gpa.destroy(cellFromHeader(Closure, header)),
+            .closure => {
+                const c = cellFromHeader(Closure, header);
+                self.poison(Closure, c);
+                self.gpa.destroy(c);
+            },
         }
     }
 };
