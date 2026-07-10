@@ -451,10 +451,13 @@ But their *reason* applies exactly, and we have already been bitten by it twice:
 
   This is not a synthetic concern: deep linked lists, long prototype chains and long scope chains are
   ordinary JavaScript. Any page that builds one can crash the engine, and it is reachable from
-  untrusted input. The fix is the TigerBeetle one — replace the recursion with an explicit, bounded
-  mark stack — and it should be treated as a correctness bug rather than a hardening nicety.
+  untrusted input. It is a correctness bug, not a hardening nicety.
 
-  (Filed as a follow-up; it is out of scope for the GC-root work already committed.)
+  **Fixed.** `Tracer.mark` now only colours a cell and pushes it onto a gray stack; `Tracer.drain`
+  pops and traces to fixpoint. The stack is threaded through the cells themselves (`GcHeader.gray`),
+  so a collection allocates nothing and cannot fail — the TigerBeetle answer, which is to make the
+  bound structural rather than hoped-for. A 1,000,000-deep list now traverses cleanly. Costs one
+  pointer per cell.
 
 The general policy I'd adopt, short of "no recursion": **every recursion must have an explicit depth
 counter and a bound, and the bound must be asserted.** The parser already has a nesting budget; the
@@ -494,7 +497,7 @@ Concretely, in order:
 
 1. **Done:** `zig build test262-stress` as a permanent gate, dead-cell poisoning, root-stack pair
    assertion, six root fixes, regression tests.
-2. **Next:** fix `Tracer.mark`'s unbounded recursion — it is a reachable crash.
+2. **Done:** `Tracer.mark`'s unbounded recursion replaced with an intrusive gray stack.
 3. **Then:** assertions in `gc.zig` and the compiler's register allocator; comptime assertions on
    bytecode operand widths.
 4. **Then:** `tidy.zig`-style ban-list test; swarm-weighted parser fuzzing seeded by commit hash.

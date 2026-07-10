@@ -39,6 +39,11 @@ pub const GcHeader = struct {
     marked: bool = false,
     /// Intrusive link through the heap's list of all live cells.
     next: ?*GcHeader = null,
+    /// Intrusive link through the collector's gray stack (the mark worklist).
+    /// Meaningful only while the cell is gray — between `Tracer.mark` pushing
+    /// it and `Tracer.drain` popping it. `marked` guards the push, so a cell is
+    /// on the stack at most once and this link is never overwritten in place.
+    gray: ?*GcHeader = null,
 };
 
 // ---- Cell types ------------------------------------------------------------
@@ -327,20 +332,45 @@ pub const BigInt = struct {
 
 /// Marks reachable cells during the mark phase. Root providers and cell
 /// `trace` methods drive marking through `mark`.
+///
+/// Marking is **iterative, not recursive**. `mark` only colours a cell and
+/// pushes it onto a gray stack; `drain` pops and traces until the stack is
+/// empty. Recursing over the object graph would put its depth on the native
+/// stack, and that depth is chosen by the program under test: a long linked
+/// list, prototype chain or scope chain is ordinary JavaScript, and a few
+/// hundred thousand links used to segfault the collector.
+///
+/// The gray stack is threaded through the cells themselves (`GcHeader.gray`),
+/// so a collection allocates nothing and cannot fail. A cell is pushed at most
+/// once, because `marked` is set before the push.
 pub const Tracer = struct {
     heap: *Heap,
+    gray: ?*GcHeader = null,
 
-    /// Mark a cell reachable and recursively trace its children. Idempotent.
+    /// Colour a cell reachable and enqueue it for tracing. Idempotent.
     pub fn mark(self: *Tracer, header: *GcHeader) void {
+        std.debug.assert(@intFromEnum(header.kind) <= @intFromEnum(Kind.closure));
         if (header.marked) return;
         header.marked = true;
-        switch (header.kind) {
-            .string => cellFromHeader(String, header).trace(self),
-            .object => cellFromHeader(Object, header).trace(self),
-            .symbol => cellFromHeader(Symbol, header).trace(self),
-            .bigint => cellFromHeader(BigInt, header).trace(self),
-            .environment => cellFromHeader(Environment, header).trace(self),
-            .closure => cellFromHeader(Closure, header).trace(self),
+        std.debug.assert(header.gray == null);
+        header.gray = self.gray;
+        self.gray = header;
+    }
+
+    /// Trace every gray cell, and everything they reach, to fixpoint.
+    pub fn drain(self: *Tracer) void {
+        while (self.gray) |header| {
+            self.gray = header.gray;
+            header.gray = null;
+            std.debug.assert(header.marked);
+            switch (header.kind) {
+                .string => cellFromHeader(String, header).trace(self),
+                .object => cellFromHeader(Object, header).trace(self),
+                .symbol => cellFromHeader(Symbol, header).trace(self),
+                .bigint => cellFromHeader(BigInt, header).trace(self),
+                .environment => cellFromHeader(Environment, header).trace(self),
+                .closure => cellFromHeader(Closure, header).trace(self),
+            }
         }
     }
 };
@@ -402,6 +432,7 @@ pub const Heap = struct {
         // Mark.
         var tracer = Tracer{ .heap = self };
         root_provider.markRoots(&tracer);
+        tracer.drain();
 
         // Ephemeron fixpoint: a WeakMap entry's value is reachable only while
         // its key is. Marking a value can make further keys reachable, so
@@ -426,7 +457,11 @@ pub const Heap = struct {
                     }
                 }
             }
+            // Tracing a newly-live value can reach further weak-map keys, which
+            // is why the outer loop iterates; drain before re-scanning.
+            tracer.drain();
         }
+        std.debug.assert(tracer.gray == null);
 
         // Clear dead weak entries and WeakRef targets on survivors (their key
         // pointers dangle once the sweep frees the cells).
@@ -587,4 +622,58 @@ test "mark is idempotent across duplicate roots" {
     const freed = heap.collect(FixedRoots{ .headers = &.{ &keep.gc, &keep.gc } });
     try std.testing.expectEqual(@as(usize, 0), freed);
     try std.testing.expectEqual(@as(usize, 1), heap.live_count);
+}
+
+test "marking a deep object graph does not use the native stack" {
+    // A recursive `Tracer.mark` put the *object graph's* depth on the native
+    // stack, and that depth is chosen by the program under test: a long linked
+    // list, prototype chain or scope chain is ordinary JavaScript. 200k links
+    // reliably segfaulted the collector before the mark worklist landed. Debug
+    // stack frames are fat, so this is a generous margin over any plausible
+    // recursive implementation.
+    const depth = 200_000;
+
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    // A chain of environments, each the parent of the next: env[0] <- env[1] <- …
+    var head = try heap.create(Environment);
+    var i: usize = 1;
+    while (i < depth) : (i += 1) {
+        const child = try heap.create(Environment);
+        child.parent = head;
+        head = child;
+    }
+    // Plus one unrooted cell, so the sweep has something to do.
+    _ = try heap.create(Environment);
+    try std.testing.expectEqual(@as(usize, depth + 1), heap.live_count);
+
+    // Rooting only the tail must keep the whole chain alive.
+    const roots = [_]*GcHeader{&head.gc};
+    const freed = heap.collect(FixedRoots{ .headers = &roots });
+    try std.testing.expectEqual(@as(usize, 1), freed);
+    try std.testing.expectEqual(@as(usize, depth), heap.live_count);
+
+    // And the chain is intact, link for link.
+    var n: usize = 0;
+    var p: ?*Environment = head;
+    while (p) |e| : (p = e.parent) n += 1;
+    try std.testing.expectEqual(depth, n);
+}
+
+test "gray stack is empty between collections" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const a = try heap.create(Environment);
+    const b = try heap.create(Environment);
+    b.parent = a;
+
+    const roots = [_]*GcHeader{&b.gc};
+    _ = heap.collect(FixedRoots{ .headers = &roots });
+    // `drain` must pop every cell it pushes, and clear the link on the way out.
+    try std.testing.expect(a.gc.gray == null);
+    try std.testing.expect(b.gc.gray == null);
+    _ = heap.collect(FixedRoots{ .headers = &roots });
+    try std.testing.expectEqual(@as(usize, 2), heap.live_count);
 }
