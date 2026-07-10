@@ -393,6 +393,7 @@ pub const Vm = struct {
         try self.temp_call_roots.append(self.gpa, .{ .callee = callee, .this_value = this_value, .args = args });
     }
     fn unprotectCall(self: *Vm) void {
+        std.debug.assert(self.temp_call_roots.items.len > 0);
         _ = self.temp_call_roots.pop();
     }
 
@@ -401,6 +402,7 @@ pub const Vm = struct {
     }
 
     pub fn unprotectEnv(self: *Vm) void {
+        std.debug.assert(self.temp_env_roots.items.len > 0);
         _ = self.temp_env_roots.pop();
     }
 
@@ -1176,6 +1178,12 @@ pub const Vm = struct {
     }
 
     pub fn callValue(self: *Vm, callee: Value, this_value: Value, args: []const Value) Error!Value {
+        // Pair assertion: every `protect` inside this call — including inside a
+        // native, and including on the throw path — must have its `unprotect`.
+        // An unbalanced stack is how a rooted value silently stops being rooted.
+        const roots_depth = self.temp_roots.items.len;
+        defer std.debug.assert(self.temp_roots.items.len == roots_depth);
+
         try self.protectCall(callee, this_value, args);
         defer self.unprotectCall();
 
