@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
     //   zig build test-lang      e2e: newer language features
     //   zig build test-stress    e2e under GC stress (the slow suite)
     //   zig build test-harness   test262 harness self-tests
+    //   zig build test-tidy      source lint (bans, reminders, long-line budget)
     //   zig build test262         conformance suite
     //   zig build test262-stress  conformance under GC stress (root-tracing fuzzer)
     //   zig build test           everything above
@@ -80,6 +81,22 @@ pub fn build(b: *std.Build) void {
         step.dependOn(&run_t.step);
         test_step.dependOn(&run_t.step);
     }
+
+    // ---- `test-tidy`: non-functional properties of the source, as a test ----
+    const tidy_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tidy.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_tidy = b.addRunArtifact(tidy_tests);
+    // `tidy` reads the source tree, so it must run from the project root.
+    run_tidy.setCwd(b.path("."));
+    run_tidy.has_side_effects = true; // re-run when sources change
+    const tidy_step = b.step("test-tidy", "Lint the source: bans, reminders, long-line budget");
+    tidy_step.dependOn(&run_tidy.step);
+    test_step.dependOn(&run_tidy.step);
 
     const harness_tests = b.addTest(.{
         .root_module = b.createModule(.{
