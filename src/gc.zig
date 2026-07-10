@@ -416,12 +416,19 @@ pub const Heap = struct {
     /// survive a collection. The `gc` header is initialized here; the caller
     /// fills the remaining payload fields.
     pub fn create(self: *Heap, comptime T: type) !*T {
+        const live_before = self.live_count;
         const cell = try self.gpa.create(T);
         cell.* = T{ .gc = .{ .kind = T.gc_kind } };
+        // A cell is born white and off the gray stack. If either were true of a
+        // fresh cell, the very next collection would skip tracing it (already
+        // "marked") or corrupt the worklist.
+        std.debug.assert(!cell.gc.marked);
+        std.debug.assert(cell.gc.gray == null);
         cell.gc.next = self.all;
         self.all = &cell.gc;
         self.live_count += 1;
         self.total_allocated += 1;
+        std.debug.assert(self.live_count == live_before + 1);
         return cell;
     }
 
@@ -429,10 +436,13 @@ pub const Heap = struct {
     /// `markRoots(*Tracer)` which marks every root (VM stack, call frames,
     /// active handle scopes). Returns the number of cells freed.
     pub fn collect(self: *Heap, root_provider: anytype) usize {
+        const live_before = self.live_count;
+
         // Mark.
         var tracer = Tracer{ .heap = self };
         root_provider.markRoots(&tracer);
         tracer.drain();
+        std.debug.assert(tracer.gray == null);
 
         // Ephemeron fixpoint: a WeakMap entry's value is reachable only while
         // its key is. Marking a value can make further keys reachable, so
@@ -506,10 +516,14 @@ pub const Heap = struct {
         // Sweep: walk the intrusive list, freeing unmarked cells and clearing
         // mark bits on survivors.
         var freed: usize = 0;
+        var survivors: usize = 0;
         var link: *?*GcHeader = &self.all;
         while (link.*) |header| {
+            // Every cell must have been popped off the gray stack by `drain`.
+            std.debug.assert(header.gray == null);
             if (header.marked) {
                 header.marked = false;
+                survivors += 1;
                 link = &header.next;
             } else {
                 link.* = header.next;
@@ -518,6 +532,11 @@ pub const Heap = struct {
                 freed += 1;
             }
         }
+        // Pair the sweep's own counting against the heap's running total: an
+        // `all` list that has drifted from `live_count` means a cell was
+        // created or destroyed behind the heap's back.
+        std.debug.assert(freed + survivors == live_before);
+        std.debug.assert(survivors == self.live_count);
         return freed;
     }
 
@@ -533,6 +552,11 @@ pub const Heap = struct {
     }
 
     fn destroy(self: *Heap, header: *GcHeader) void {
+        // Pairs with the sweep: a marked cell is reachable, and freeing one is
+        // the single worst thing this file can do. Assert it here too, so the
+        // property is checked on the path that would cause the damage.
+        std.debug.assert(!header.marked);
+        std.debug.assert(header.gray == null);
         switch (header.kind) {
             .string => {
                 const s = cellFromHeader(String, header);

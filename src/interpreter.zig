@@ -794,20 +794,35 @@ pub const Vm = struct {
         }
         const base = slab.top;
         slab.top += need;
+        std.debug.assert(slab.top <= slab.mem.len);
         const regs = slab.mem[base .. base + need];
+        std.debug.assert(regs.len == need);
         @memset(regs, Value.undefined_value);
         return .{ .slab = idx, .base = base, .regs = regs };
     }
 
     pub fn execute(self: *Vm, code: *const bc.CodeBlock, env: *gc.Environment, this_value: Value) Error!Value {
+        std.debug.assert(code.num_registers <= bc.max_registers);
+
         // Registers come from the segmented slab stack (no per-call allocation).
         const r = try self.pushRegs(code.num_registers);
-        defer self.reg_slabs.items[r.slab].top = r.base;
+        defer {
+            // Strict LIFO: every nested frame that carved registers out of this
+            // slab must have given them back. Otherwise this `top` reset hands
+            // the same registers to two live frames at once.
+            std.debug.assert(self.reg_slabs.items[r.slab].top == r.base + code.num_registers);
+            self.reg_slabs.items[r.slab].top = r.base;
+        }
         const regs = r.regs;
 
+        const frames_depth = self.frames.items.len;
         var frame = Frame{ .code = code, .env = env, .regs = regs, .this_value = this_value };
         try self.frames.append(self.gpa, &frame);
-        defer _ = self.frames.pop();
+        defer {
+            std.debug.assert(self.frames.items.len == frames_depth + 1);
+            std.debug.assert(self.frames.items[frames_depth] == &frame);
+            _ = self.frames.pop();
+        }
 
         return switch (try self.runLoop(&frame)) {
             .returned => |v| v,

@@ -131,18 +131,29 @@ pub const Compiler = struct {
     // ---- registers ---------------------------------------------------------
 
     fn allocReg(self: *Compiler) u32 {
+        // A register leak is silent: the compiler keeps handing out fresh
+        // indices, `max_regs` grows, and the first call to the function
+        // allocates the slab. Fail here instead, where the culprit is on the
+        // stack.
+        std.debug.assert(self.fs.reg_top < bc.max_registers);
         const r = self.fs.reg_top;
         self.fs.reg_top += 1;
         if (self.fs.reg_top > self.fs.max_regs) self.fs.max_regs = self.fs.reg_top;
+        std.debug.assert(self.fs.max_regs >= self.fs.reg_top);
         return r;
     }
     fn freeTo(self: *Compiler, top: u32) void {
+        // Registers are a stack: `freeTo` only ever releases. Growing the file
+        // through `freeTo` would hand out indices `max_regs` never saw, and the
+        // interpreter would index past the frame's slice.
+        std.debug.assert(top <= self.fs.reg_top);
         self.fs.reg_top = top;
     }
 
     // ---- emit / patch ------------------------------------------------------
 
     fn emit(self: *Compiler, inst: Inst) CompileError!u32 {
+        std.debug.assert(self.fs.code.items.len < bc.max_code_len);
         const pc: u32 = @intCast(self.fs.code.items.len);
         try self.fs.code.append(self.gpa, inst);
         return pc;
@@ -151,6 +162,9 @@ pub const Compiler = struct {
         return @intCast(self.fs.code.items.len);
     }
     fn patchTarget(self: *Compiler, pc: u32, target: u32) void {
+        std.debug.assert(pc < self.fs.code.items.len);
+        // A jump may target one-past-the-end (fallthrough off the block's tail).
+        std.debug.assert(target <= self.fs.code.items.len);
         // Jump target lives in operand `a` for `jump`, `b` for conditional jumps.
         const op = self.fs.code.items[pc].op;
         switch (op) {
@@ -565,7 +579,18 @@ pub const Compiler = struct {
 
     // ---- statements --------------------------------------------------------
 
+    /// Compiling a statement must leave the register file exactly as it found
+    /// it: registers are a stack of temporaries, and a leak inflates every
+    /// frame of the enclosing function forever. The postcondition is checked
+    /// only on success — an abandoned compile (a `fail`) unwinds without
+    /// restoring, and its code block is discarded.
     fn compileStmt(self: *Compiler, stmt: *Node) CompileError!void {
+        const reg_base = self.fs.reg_top;
+        try self.compileStmtInner(stmt);
+        std.debug.assert(self.fs.reg_top == reg_base);
+    }
+
+    fn compileStmtInner(self: *Compiler, stmt: *Node) CompileError!void {
         switch (stmt.kind) {
             .empty_stmt, .debugger_stmt => {},
             .function_decl => {}, // handled by emitHoistedFunctions

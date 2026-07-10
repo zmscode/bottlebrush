@@ -143,6 +143,33 @@ pub const Inst = struct {
     c: u32 = 0,
 };
 
+comptime {
+    // The instruction stream is the interpreter's hottest data. A fourth
+    // operand, or an `Op` that outgrows its `u8`, silently doubles the
+    // bytecode's cache footprint — so state the layout as a contract the
+    // compiler checks, rather than a property nobody is watching.
+    std.debug.assert(@sizeOf(Op) == 1);
+    std.debug.assert(@sizeOf(Inst) == 16);
+
+    // Operands index registers, constants, child blocks and jump targets, all
+    // of which the compiler counts in `u32`. Narrowing an operand narrows
+    // every one of those limits with it, and the overflow would be silent:
+    // `@intCast` in `emit`/`allocReg` would trap only in safe builds.
+    std.debug.assert(@typeInfo(@TypeOf(@as(Inst, undefined).a)).int.bits == 32);
+    std.debug.assert(max_registers <= std.math.maxInt(u32));
+    std.debug.assert(max_code_len <= std.math.maxInt(u32));
+}
+
+/// Registers a single code block may use. Far above any real function (the
+/// worst in the Test262 corpus is in the low hundreds), but finite: a compiler
+/// bug that leaks registers in a loop should fail fast rather than allocate a
+/// multi-gigabyte slab at the first call.
+pub const max_registers: u32 = 1 << 20;
+
+/// Instructions a single code block may contain. `emit` returns the pc as a
+/// `u32` and jump targets are `u32` operands.
+pub const max_code_len: u32 = 1 << 28;
+
 /// Constant-pool entry. Strings/bigints hold raw source text and are
 /// materialized into heap cells at run time; numbers are immediate.
 pub const Const = union(enum) {
